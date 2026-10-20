@@ -1,0 +1,49 @@
+# Dependencies and build output
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# OS cruft
+.DS_Store
+._*
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Environment / secrets (never commit)
+.env
+.env.local
+.env.*.local
+
+# Certificates and keys. This is an intercepting proxy that generates its own
+# root CA at runtime; never commit an exported CA, leaf cert, or private key.
+*.pem
+*.crt
+*.cer
+*.der
+*.key
+*.p12
+*.pfx
+
+# Project files (the saved sessions, incl. stress-test output); .cegat is the old name
+*.ngintip
+*.cegat
+
+# Per-project persistent browser profiles (generated at runtime, can be large)
+ngintip_browser/
+
+# Python caches / virtualenvs from extension scripts
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Test coverage and logs
+coverage/
+*.log
+npm-debug.log*

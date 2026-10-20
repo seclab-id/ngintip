@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ngintip</title>
+    <!--
+      Instant startup splash. It is inline (no JS, no app.css) so the webview paints
+      it the moment index.html loads, instead of a blank white window while the app
+      modules download and Svelte mounts (most noticeable in `tauri dev`). main.js
+      removes it as soon as the UI has mounted.
+
+      NOTE: this block loads before src/app.css and src/components/Logo.svelte, so it
+      cannot use their tokens/component and keeps its OWN copy of a few colours
+      (#0d0f14 / #e4e7ef / #8b7bff / light #f5f6f9 / #5b4bff) and of the logo mark +
+      gradient. If you retheme or change the logo, update this block to match.
+    -->
+    <style>
+      :root { color-scheme: dark; }
+      html, body { margin: 0; height: 100%; }
+      body {
+        background: #0d0f14;
+        color: #e4e7ef;
+        font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', system-ui, sans-serif;
+      }
+      #splash {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        display: grid;
+        place-items: center;
+        background: #0d0f14;
+        transition: opacity 0.25s ease;
+      }
+      #splash.hide { opacity: 0; pointer-events: none; }
+      .splash-inner {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 14px;
+      }
+      .splash-logo {
+        display: grid;
+        place-items: center;
+        width: 52px;
+        height: 52px;
+        border-radius: 14px;
+        background: linear-gradient(135deg, #8b7bff, #4f46e5);
+      }
+      .splash-logo svg {
+        width: 28px;
+        fill: none;
+        stroke: #fff;
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+      .splash-name { font-size: 17px; font-weight: 600; letter-spacing: 0.02em; }
+      .splash-bar {
+        width: 132px;
+        height: 3px;
+        border-radius: 3px;
+        background: rgba(255, 255, 255, 0.08);
+        overflow: hidden;
+      }
+      .splash-bar span {
+        display: block;
+        width: 40%;
+        height: 100%;
+        border-radius: 3px;
+        background: #8b7bff;
+        animation: splash-slide 1.1s ease-in-out infinite;
+      }
+      @keyframes splash-slide {
+        0% { transform: translateX(-120%); }
+        100% { transform: translateX(320%); }
+      }
+      @media (prefers-color-scheme: light) {
+        :root { color-scheme: light; }
+        body, #splash { background: #f5f6f9; }
+        body { color: #1b1f2a; }
+        .splash-bar { background: rgba(0, 0, 0, 0.08); }
+        .splash-bar span { background: #5b4bff; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .splash-bar span { animation: none; width: 100%; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="splash" role="status" aria-label="Loading Ngintip">
+      <div class="splash-inner">
+        <div class="splash-logo">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" />
+            <circle cx="12" cy="12" r="3" />
+          </svg>
+        </div>
+        <div class="splash-name">Ngintip</div>
+        <div class="splash-bar"><span></span></div>
+      </div>
+    </div>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

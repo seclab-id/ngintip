@@ -1,0 +1,80 @@
+[package]
+name = "ngintip"
+version = "0.1.0"
+description = "Intercepting HTTP(S) proxy"
+edition = "2021"
+
+[lib]
+name = "ngintip_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+# proxy core
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1", "http2"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+tower-service = "0.3"
+bytes = "1"
+flate2 = "1"
+# zstd for the project file: faster to save and smaller than gzip, and (with long
+# distance matching) catches bodies repeated across flows that gzip's small window
+# misses. `zstdmt` enables multithreaded compression. gzip is still read for projects
+# saved by older versions.
+zstd = { version = "0.13", features = ["zstdmt"] }
+
+# TLS / MITM
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2", "tls12", "logging"] }
+rcgen = { version = "0.13", features = ["x509-parser"] }
+time = { version = "0.3", features = ["formatting"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+tauri-plugin-dialog = "2"
+base64 = "0.23.1"
+if-addrs = "0.15.0"
+brotli-decompressor = "6.0.0"
+ruzstd = "0.7"
+regex = "1"
+# Cross-platform process/system stats for the Settings > Usage panel and crash dumps.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+# Native clipboard access, so "Copy image" works in the webview (where the browser
+# async clipboard image API is unreliable). Takes raw RGBA pixels from the canvas.
+arboard = "3"
+# Kill a launched browser's whole process group on exit (Unix), so helper processes
+# go down with it and nothing lingers after the app closes.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-tungstenite = "0.30"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+# Saving a project runs zstd (compression) and SQLite's VACUUM (snapshot), both of which
+# are C libraries built by their own build scripts at THIS crate's opt-level. In a dev
+# build (`./run.sh` = tauri dev) that is 0, so the C ran unoptimized and saving a big
+# project was ~3x slower than release (measured: ~18s vs ~5.5s to compress a 1.2 GB
+# project). Build just these C deps optimized, even in dev, so saving is release-fast
+# while our own Rust stays unoptimized for quick rebuilds. (ring is the TLS crypto,
+# optimized here too so live proxying is fast under `tauri dev` as well.)
+[profile.dev.package.zstd-sys]
+opt-level = 3
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+[profile.dev.package.ring]
+opt-level = 3

@@ -1,0 +1,344 @@
+/* ============================================================================
+ *  DESIGN TOKENS - the single source of truth for every colour in the app.
+ *  ----------------------------------------------------------------------------
+ *  Edit a value here and it changes everywhere that uses var(--name).
+ *
+ *  Themes:
+ *   - :root                  -> DARK palette (also the default before JS runs).
+ *   - :root[data-theme=light]-> LIGHT palette (the ONLY place light is defined).
+ *  The theme is chosen in JS: store.applyTheme() always sets <html data-theme>,
+ *  resolving "system" to the live OS preference (see src/lib/store.svelte.js),
+ *  so there is NO prefers-color-scheme duplication to keep in sync here.
+ *
+ *  Two copies live OUTSIDE this file because they paint before it loads and
+ *  cannot read these vars - keep them in sync by hand when retheming:
+ *   - index.html         -> the startup splash colours + logo gradient.
+ *   - Logo.svelte uses --logo-from/--logo-to below for the badge gradient.
+ *
+ *  Want to tweak colours visually? Open delete_later/color-editor.html - it
+ *  mirrors this palette, lets you edit every token for light & dark, previews
+ *  the UI, and copies a ready-to-paste replacement for the two blocks below.
+ * ============================================================================ */
+:root {
+  /* --- Surfaces (dark) ------------------------------------------------------ */
+  --bg: #0d0f14;        /* App background, the deepest layer */
+  --bg-elev: #13161d;   /* Elevated surfaces: panels, toolbars, menus, popovers */
+  --bg-soft: #1a1e27;   /* Soft fills: default buttons, segmented groups */
+  --bg-hover: #1d2230;  /* Hover background for rows and ghost buttons */
+  --row-alt: rgb(255 255 255 / 0.015); /* Zebra tint for alternate table rows */
+  --border: #232836;    /* Borders, dividers, scrollbar thumb */
+
+  /* --- Text (dark) --------------------------------------------------------- */
+  --text: #e4e7ef;      /* Primary text */
+  --text-dim: #8a92a6;  /* Secondary text, labels, inactive icons */
+  --text-faint: #5a6275;/* Faint text, placeholders, disabled */
+
+  /* --- Accent (dark) ------------------------------------------------------- */
+  --accent: #8b7bff;        /* Primary accent: links, focus, primary buttons, active */
+  --accent-strong: #6f5cff; /* Accent hover / pressed */
+  --accent-soft: rgb(139 123 255 / 0.14); /* Soft wash: focus ring, selected row bg */
+  --selection: rgb(139 123 255 / 0.35);   /* Text selection highlight */
+
+  /* --- Semantic / syntax (dark) -------------------------------------------- *
+   * Also drive status codes, HTTP methods and the code highlighter below.     */
+  --green: #3ecf8e;  /* Success / 2xx / GET / JSON strings */
+  --blue: #5eb1ff;   /* Info / 3xx / PUT·PATCH / JSON keys */
+  --amber: #f5b454;  /* Warning / 4xx / POST / numbers */
+  --red: #ff6b7a;    /* Error / 5xx / DELETE / danger */
+  --pink: #f472b6;   /* Literals, XML/HTML tags */
+  --cyan: #4fd1c5;   /* XML/HTML attributes */
+
+  /* --- Brand (theme-independent) ------------------------------------------- */
+  --logo-from: #8b7bff; /* Logo badge gradient start (see Logo.svelte) */
+  --logo-to: #4f46e5;   /* Logo badge gradient end */
+
+  /* --- Shape & type (not colours) ------------------------------------------ */
+  --radius: 7px;
+  --radius-lg: 11px;
+  --sans: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', system-ui, sans-serif;
+  --mono: 'JetBrains Mono', 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
+
+  color-scheme: dark;
+}
+
+/* LIGHT palette - the only light definition (applied by JS via data-theme). */
+:root[data-theme='light'] {
+  /* Surfaces */
+  --bg: #f5f6f9;
+  --bg-elev: #ffffff;
+  --bg-soft: #eef0f5;
+  --bg-hover: #eceef4;
+  --row-alt: rgb(0 0 0 / 0.018);
+  --border: #e1e4ec;
+  /* Text */
+  --text: #1b1f2a;
+  --text-dim: #5f6679;
+  --text-faint: #9aa1b2;
+  /* Accent */
+  --accent: #5b4bff;
+  --accent-strong: #4a39f0;
+  --accent-soft: rgb(91 75 255 / 0.1);
+  --selection: rgb(91 75 255 / 0.22);
+  /* Semantic / syntax */
+  --green: #0f9f6e;
+  --blue: #1f7ae0;
+  --amber: #c27c0e;
+  --red: #e0344a;
+  --pink: #c02d86;
+  --cyan: #0e8f86;
+  /* --logo-from / --logo-to are shared with dark (brand badge stays the same). */
+  color-scheme: light;
+}
+
+/* ---------- Base ---------- */
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.4 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  -webkit-user-select: none;
+}
+::selection {
+  background: var(--selection);
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 99px;
+  background: var(--border) padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint) padding-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ---------- Utilities ---------- */
+.mono {
+  font-family: var(--mono);
+  font-size: 0.95em;
+}
+.dim {
+  color: var(--text-dim);
+}
+.spacer {
+  flex: 1;
+}
+
+/* ---------- Controls ---------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-soft);
+  color: var(--text);
+  font: 500 12.5px var(--sans);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+}
+.btn:hover:not(:disabled) {
+  border-color: var(--text-faint);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.btn.sm {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+.btn.ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-dim);
+}
+.btn.ghost:hover:not(:disabled) {
+  border-color: transparent;
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.btn.primary {
+  border-color: transparent;
+  background: var(--accent);
+  color: #fff;
+}
+.btn.primary:hover:not(:disabled) {
+  border-color: transparent;
+  background: var(--accent-strong);
+}
+kbd {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgb(255 255 255 / 0.18);
+  font: 10.5px var(--sans);
+}
+
+.input {
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  outline: none;
+  background: var(--bg);
+  color: var(--text);
+  font: 12.5px var(--sans);
+  transition: border-color 0.15s, box-shadow 0.15s;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.input.mono {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.input::placeholder {
+  color: var(--text-faint);
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 46px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ---------- Panels & code ---------- */
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elev);
+}
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 36px;
+  padding: 0 6px 0 12px;
+  border-bottom: 1px solid var(--border);
+}
+.panel-title {
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+.code {
+  padding: 12px 14px;
+  font: 12.5px/1.6 var(--mono);
+  white-space: pre-wrap;
+  word-break: break-all;
+  tab-size: 4;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* Syntax colours (see src/lib/highlight.js) */
+.hl-dim {
+  color: var(--text-faint);
+}
+.hl-method {
+  font-weight: 600;
+}
+.hl-path {
+  color: var(--text);
+}
+.hl-hname {
+  color: var(--accent);
+}
+.hl-hval {
+  color: var(--text);
+}
+.hl-status {
+  font-weight: 600;
+}
+.hl-key {
+  color: var(--blue);
+}
+.hl-str {
+  color: var(--green);
+}
+.hl-num {
+  color: var(--amber);
+}
+.hl-lit {
+  color: var(--pink);
+}
+.hl-tag {
+  color: var(--pink);
+}
+.hl-attr {
+  color: var(--cyan);
+}
+
+/* ---------- Status & method colours ---------- */
+.s-2xx { color: var(--green); }
+.s-3xx { color: var(--blue); }
+.s-4xx { color: var(--amber); }
+.s-5xx,
+.s-err { color: var(--red); }
+
+.m-get { color: var(--green); }
+.m-post { color: var(--amber); }
+.m-put,
+.m-patch { color: var(--blue); }
+.m-delete { color: var(--red); }
+.m-options,
+.m-head { color: var(--text-dim); }
+
+.method {
+  font: 600 11.5px var(--mono);
+}
+.badge {
+  display: inline-block;
+  min-width: 38px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  /* Tinted from the badge's own status colour. */
+  background: color-mix(in srgb, currentColor 14%, transparent);
+  font: 600 11px var(--mono);
+  text-align: center;
+}
+
+/* ---------- Row highlight colours ----------
+ * The manual highlight swatches (History right-click -> Highlight). These are
+ * the same in light and dark on purpose (they must pop on any row). Keep the
+ * names/order in sync with the list in src/lib/colors.js. */
+.c-red { --hl: #ff5c6c; }
+.c-orange { --hl: #ff9345; }
+.c-yellow { --hl: #f2c94c; }
+.c-green { --hl: #3ecf8e; }
+.c-cyan { --hl: #38c7d6; }
+.c-blue { --hl: #4f9dff; }
+.c-purple { --hl: #9b7bff; }
+.c-pink { --hl: #f06bb8; }
+.c-gray { --hl: #8a92a6; }
