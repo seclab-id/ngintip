@@ -2,10 +2,11 @@
 //! (HTTP or SOCKS5: corporate proxy, Tor, another intercepting tool).
 
 use std::{
+    collections::HashMap,
     future::Future,
     io,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, RwLock},
     task::{Context, Poll},
     time::Duration,
 };
@@ -35,6 +36,11 @@ use tower_service::Service;
 use crate::proxy::Body;
 
 pub type HttpClient = Client<HttpsConnector<Connector>, Body>;
+
+/// Hostname (lowercased) -> IP string the proxy connects to instead, for direct
+/// connections. Shared between the owning `Ctx` and every `Connector` so edits are
+/// picked up on the next connection without rebuilding the client.
+pub type Overrides = Arc<RwLock<HashMap<String, String>>>;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -136,11 +142,11 @@ fn percent_decode(s: &str) -> Vec<u8> {
 /// TLS offers `h2` via ALPN (falling back to HTTP/1.1 if the server doesn't
 /// take it); otherwise only HTTP/1.1 is spoken. Upstream certificates are not
 /// validated (see [`AcceptAnyCert`]).
-pub fn client(proxy: Option<Arc<UpstreamProxy>>, http2: bool) -> Result<HttpClient> {
+pub fn client(proxy: Option<Arc<UpstreamProxy>>, http2: bool, overrides: Overrides) -> Result<HttpClient> {
     let builder = HttpsConnectorBuilder::new()
         .with_tls_config(insecure_tls_config()?)
         .https_or_http();
-    let connector = Connector { proxy };
+    let connector = Connector { proxy, overrides };
     let https = if http2 {
         builder.enable_all_versions().wrap_connector(connector)
     } else {
@@ -167,6 +173,8 @@ pub fn insecure_tls_config() -> Result<ClientConfig> {
 #[derive(Clone)]
 pub struct Connector {
     proxy: Option<Arc<UpstreamProxy>>,
+    /// Shared hostname -> IP overrides for direct connections (see [`Overrides`]).
+    overrides: Overrides,
 }
 
 impl Service<Uri> for Connector {
@@ -180,6 +188,7 @@ impl Service<Uri> for Connector {
 
     fn call(&mut self, dst: Uri) -> Self::Future {
         let proxy = self.proxy.clone();
+        let overrides = self.overrides.clone();
         Box::pin(async move {
             let host = dst
                 .host()
@@ -191,10 +200,17 @@ impl Service<Uri> for Connector {
             let port = dst.port_u16().unwrap_or(if https { 443 } else { 80 });
 
             let stream = match proxy.as_deref() {
-                None => Stream {
-                    tcp: connect(&host, port).await?,
-                    proxied: false,
-                },
+                // Direct: a hostname override (if any) rewrites only the TCP target, so
+                // the TLS SNI and forged cert the caller derives from `dst` stay the real
+                // hostname -- exactly hosts-file semantics.
+                None => {
+                    let overridden = overrides.read().unwrap().get(&host.to_ascii_lowercase()).cloned();
+                    let dial = overridden.as_deref().unwrap_or(host.as_str());
+                    Stream {
+                        tcp: connect(dial, port).await?,
+                        proxied: false,
+                    }
+                }
                 // SOCKS5 tunnels straight to the target, so requests are origin-form
                 // (proxied = false) and TLS, when needed, is layered on top by the caller.
                 Some(p) if p.kind == crate::upstream::Kind::Socks5 => {

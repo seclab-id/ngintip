@@ -16,8 +16,10 @@ pub struct Config {
     /// Auto-add / recompute Content-Length on Repeater & Intruder sends. Turn off
     /// to send the Content-Length exactly as written (e.g. request smuggling).
     pub auto_content_length: bool,
-    /// MCP server (lets an LLM drive Cegat) on/off, its port (0 = 8082) and the
-    /// docs path served for the LLM.
+    /// MCP server (lets an LLM drive Cegat): the last on/off state, its port
+    /// (0 = 8082) and the docs path served for the LLM. On/off is informational only:
+    /// whether the server runs is a per-project switch (project setting `mcp`), never
+    /// carried over to another or a new project.
     pub mcp: bool,
     pub mcp_port: u16,
     pub mcp_docs_path: String,
@@ -42,6 +44,45 @@ pub struct Config {
     /// Read at startup (see lib.rs), so a change takes effect on the next app launch.
     #[serde(default)]
     pub threads: u16,
+    /// Proxy listeners (bind addresses). Several can run at once; each is started and
+    /// stopped independently. A missing key (old config) falls back to one default
+    /// listener via the container-level `default`; an explicit empty list means none.
+    pub listeners: Vec<Listener>,
+    /// Force a hostname to connect to a given IP for direct outbound connections, like
+    /// an app-scoped hosts file. The TLS SNI and forged cert keep the real hostname.
+    pub host_overrides: Vec<HostOverride>,
+}
+
+/// One proxy listener bind address. `id` is stable so the UI can start, stop, edit or
+/// remove a specific one.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Listener {
+    pub id: String,
+    pub host: String,
+    pub port: u16,
+    pub enabled: bool,
+}
+
+impl Default for Listener {
+    fn default() -> Self {
+        Self { id: String::new(), host: "127.0.0.1".to_string(), port: 8080, enabled: true }
+    }
+}
+
+/// Force `host` to resolve to `ip` on direct connections (like a hosts-file entry).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HostOverride {
+    pub host: String,
+    pub ip: String,
+    pub enabled: bool,
+}
+
+impl Default for HostOverride {
+    fn default() -> Self {
+        Self { host: String::new(), ip: String::new(), enabled: true }
+    }
 }
 
 impl Default for Config {
@@ -61,6 +102,8 @@ impl Default for Config {
             extensions: Vec::new(),
             extensions_enabled: false,
             threads: 0,
+            listeners: vec![Listener { id: "default".to_string(), host: "127.0.0.1".to_string(), port: 8080, enabled: true }],
+            host_overrides: Vec::new(),
         }
     }
 }

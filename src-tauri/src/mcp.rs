@@ -1,6 +1,7 @@
 //! MCP (Model Context Protocol) server over HTTP, so an LLM can drive Cegat:
 //! read/search history, send to Repeater (recorded), run parallel batches and
-//! Intruder attacks, and view/trigger/configure the passive scan.
+//! Intruder attacks, view/trigger/configure the passive scan, organize saved
+//! requests in the Organizer, and read the project Vault.
 //!
 //! Transport: MCP "Streamable HTTP". Clients POST JSON-RPC to the endpoint and
 //! get a JSON response; GET <docs_path> returns human/LLM docs. Bound to
@@ -19,8 +20,10 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 use crate::brand;
+use crate::organizer::{self, NewItem, Op, Organizer, SavedRequest};
 use crate::proxy::Ctx;
 use crate::raw;
+use crate::vault;
 
 /// MCP protocol revisions this server speaks (dates are the spec's revision, not a
 /// build date). The first is the default we advertise; per the spec's version
@@ -195,6 +198,12 @@ async fn call_tool(ctx: &Arc<Ctx>, name: &str, a: &Value) -> Result<String, Stri
         "passive_rules_get" => passive_rules_get(ctx),
         "passive_rules_set" => passive_rules_set(ctx, a),
         "passive_scan" => passive_scan(ctx),
+        "organizer_list" => organizer_list(ctx, a),
+        "organizer_get" => organizer_get(ctx, a),
+        "organizer_save" => organizer_save(ctx, a),
+        "organizer_set" => organizer_set(ctx, a),
+        "vault_list" => vault_list(ctx, a),
+        "vault_get" => vault_get(ctx, a),
         "extensions_status" => ok_json(serde_json::to_value(ctx.extensions.status()).unwrap_or_default()),
         "extensions_enable" => {
             let on = a.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
@@ -275,9 +284,9 @@ fn history_search(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
     ok_json(json!({ "matches": ids.len(), "returned": items.len(), "flows": items }))
 }
 
-/// Highlight colours a flow can be tagged with (mirrors HIGHLIGHTS in src/lib/colors.js);
-/// an empty string clears the highlight.
-const HIGHLIGHT_COLORS: [&str; 9] = ["red", "orange", "yellow", "green", "cyan", "blue", "purple", "pink", "gray"];
+/// Highlight colours a flow or saved request can be tagged with (mirrors HIGHLIGHTS in
+/// src/lib/colors.js); an empty string clears the highlight.
+pub(crate) const HIGHLIGHT_COLORS: [&str; 9] = ["red", "orange", "yellow", "green", "cyan", "blue", "purple", "pink", "gray"];
 
 /// Set (or clear) the note on a flow, preserving its highlight colour. Emits a flow
 /// event so open History views update live.
@@ -954,6 +963,181 @@ fn passive_scan(ctx: &Arc<Ctx>) -> Result<String, String> {
     ok_json(json!({ "scannedFlows": scanned.len(), "findings": findings.len(), "bySeverity": counts }))
 }
 
+// ---- organizer ----------------------------------------------------------------
+
+/// A saved request without its request/response text, for listings. `n` is its 1-based
+/// position in the collection (the # column in the UI).
+fn saved_summary(it: &SavedRequest, n: usize) -> Value {
+    json!({
+        "id": it.id, "n": n, "name": it.name, "method": it.method, "host": it.host, "path": it.path,
+        "status": it.status, "label": it.label, "note": it.note, "color": it.color,
+        "source": it.source, "savedAt": it.saved_at,
+    })
+}
+
+/// A collection by id or (case-insensitive) name.
+fn find_collection<'a>(org: &'a Organizer, key: &str) -> Option<&'a organizer::Collection> {
+    let key = key.trim();
+    org.collections.iter().find(|c| c.id == key || c.name.eq_ignore_ascii_case(key))
+}
+
+fn collection_ref(org: &Organizer, c: &organizer::Collection) -> Value {
+    json!({ "id": c.id, "name": c.name, "active": org.active_id.as_deref() == Some(c.id.as_str()) })
+}
+
+/// Tell an open Organizer about an edit made here (it skips revisions it already has).
+fn organizer_changed(ctx: &Arc<Ctx>, org: &Organizer) {
+    ctx.events.emit(organizer::EVENT, &json!({ "rev": org.rev }));
+}
+
+/// The saved request an edit touched, with its collection.
+fn applied_item(applied: &organizer::Applied) -> Result<Value, String> {
+    let org = &applied.state;
+    let id = applied.item_id.as_deref().ok_or("the edit returned no item")?;
+    for c in &org.collections {
+        if let Some((i, it)) = c.items.iter().enumerate().find(|(_, it)| it.id == id) {
+            return Ok(json!({ "collection": collection_ref(org, c), "item": saved_summary(it, i + 1) }));
+        }
+    }
+    Err(format!("no saved request {id}"))
+}
+
+fn organizer_list(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
+    let org = organizer::load(&ctx.store)?;
+    let wanted = arg_str(a, "collection");
+    let cols: Vec<&organizer::Collection> = if wanted.trim().is_empty() {
+        org.collections.iter().collect()
+    } else {
+        vec![find_collection(&org, &wanted).ok_or_else(|| format!("no collection '{wanted}'"))?]
+    };
+    let active = org.active_id.as_deref().and_then(|id| org.collections.iter().find(|c| c.id == id));
+    let collections: Vec<Value> = cols
+        .iter()
+        .map(|c| {
+            let mut v = collection_ref(&org, c);
+            v["count"] = json!(c.items.len());
+            v["items"] = json!(c.items.iter().enumerate().map(|(i, it)| saved_summary(it, i + 1)).collect::<Vec<_>>());
+            v
+        })
+        .collect();
+    ok_json(json!({
+        "activeCollection": active.map(|c| json!({ "id": c.id, "name": c.name })),
+        "colors": HIGHLIGHT_COLORS,
+        "collections": collections,
+    }))
+}
+
+fn organizer_get(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
+    let id = arg_str(a, "id");
+    let org = organizer::load(&ctx.store)?;
+    for c in &org.collections {
+        if let Some((i, it)) = c.items.iter().enumerate().find(|(_, it)| it.id == id) {
+            let mut v = saved_summary(it, i + 1);
+            v["target"] = json!(it.target);
+            v["request"] = json!(it.request);
+            v["response"] = json!(it.response);
+            v["collection"] = collection_ref(&org, c);
+            return ok_json(v);
+        }
+    }
+    Err(format!("no saved request {id}"))
+}
+
+/// Save a captured flow (`flowId`) or a raw request into a collection; see the docs.
+fn organizer_save(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
+    let opt = |k: &str| a.get(k).and_then(Value::as_str).map(str::to_string);
+    let mut item = match a.get("flowId").and_then(Value::as_u64) {
+        Some(id) => {
+            let flow = ctx.store.get(id).map_err(|e| e.to_string())?.ok_or_else(|| format!("no flow {id}"))?;
+            let s = &flow.summary;
+            NewItem {
+                name: format!("{}{}", s.host, s.path),
+                target: format!("{}://{}", s.scheme, s.host),
+                request: raw::request_text(&flow),
+                response: raw::response_text(&flow),
+                status: (s.status != 0).then_some(s.status),
+                note: s.note.clone(),
+                color: s.color.clone(),
+                source: "history".into(),
+                ..Default::default()
+            }
+        }
+        None => {
+            let (request, target) = (arg_str(a, "request"), arg_str(a, "target"));
+            if request.trim().is_empty() || target.trim().is_empty() {
+                return Err("give flowId, or request + target".into());
+            }
+            NewItem {
+                request,
+                target,
+                response: arg_str(a, "response"),
+                status: a.get("status").and_then(Value::as_u64).and_then(|s| u16::try_from(s).ok()),
+                source: "mcp".into(),
+                ..Default::default()
+            }
+        }
+    };
+    if let Some(v) = opt("name") {
+        item.name = v;
+    }
+    if let Some(v) = opt("label") {
+        item.label = v;
+    }
+    if let Some(v) = opt("note") {
+        item.note = v;
+    }
+    if let Some(v) = opt("color") {
+        item.color = v;
+    }
+    let collection = opt("collection").filter(|c| !c.trim().is_empty());
+    let applied = organizer::apply(&ctx.store, Op::Save { collection, item })?;
+    organizer_changed(ctx, &applied.state);
+    ok_json(applied_item(&applied)?)
+}
+
+/// Set a saved request's label, note and/or colour (omitted fields are kept).
+fn organizer_set(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
+    let id = arg_str(a, "id");
+    let opt = |k: &str| a.get(k).and_then(Value::as_str).map(str::to_string);
+    let (label, note, color) = (opt("label"), opt("note"), opt("color"));
+    if label.is_none() && note.is_none() && color.is_none() {
+        return Err("give at least one of label, note, color".into());
+    }
+    let applied = organizer::apply(&ctx.store, Op::Update { item_id: id, label, note, color })?;
+    organizer_changed(ctx, &applied.state);
+    ok_json(applied_item(&applied)?)
+}
+
+// ---- vault (read-only) ----------------------------------------------------------
+
+fn vault_list(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
+    let query = arg_str(a, "query");
+    let entries = vault::entries(&ctx.store)?;
+    let shown: Vec<Value> = entries
+        .iter()
+        .filter(|e| e.matches(&query))
+        .map(|e| serde_json::to_value(e.redacted()).unwrap_or(Value::Null))
+        .collect();
+    ok_json(json!({ "total": entries.len(), "returned": shown.len(), "entries": shown }))
+}
+
+fn vault_get(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
+    let (id, label) = (arg_str(a, "id"), arg_str(a, "label"));
+    let entries = vault::entries(&ctx.store)?;
+    let found: Vec<&vault::Entry> = if !id.trim().is_empty() {
+        entries.iter().filter(|e| e.id == id.trim()).collect()
+    } else if !label.trim().is_empty() {
+        entries.iter().filter(|e| e.label.trim().eq_ignore_ascii_case(label.trim())).collect()
+    } else {
+        return Err("give id or label".into());
+    };
+    match found.as_slice() {
+        [e] => ok_json(serde_json::to_value(e).unwrap_or(Value::Null)),
+        [] => Err("no vault entry with that id or label (see vault_list)".into()),
+        many => Err(format!("{} entries share that label; use the id from vault_list", many.len())),
+    }
+}
+
 // ---- tool schemas & docs ----------------------------------------------------
 
 fn tool_defs() -> Value {
@@ -991,6 +1175,18 @@ fn tool_defs() -> Value {
         { "name": "passive_rules_get", "description": "Get the passive rules (built-in + custom).", "inputSchema": obj(json!({}), json!([])) },
         { "name": "passive_rules_set", "description": "Replace the custom passive rules. Each: {id,title,severity,pattern,flags,group}.",
           "inputSchema": obj(json!({ "rules": {"type":"array"} }), json!(["rules"])) },
+        { "name": "organizer_list", "description": "List Organizer collections and their saved requests (without request/response text): id, #, method, host, path, status, label, note, colour, source. Optional collection (id or name) lists just that one. Also returns the active collection (where saves go) and the allowed colours.",
+          "inputSchema": obj(json!({ "collection": {"type":"string"} }), json!([])) },
+        { "name": "organizer_get", "description": "One saved request by id with its full request and response text, label, note, colour and collection.",
+          "inputSchema": obj(json!({ "id": {"type":"string"} }), json!(["id"])) },
+        { "name": "organizer_save", "description": "Save a request into the Organizer: a captured flow (flowId) or a raw request (request + target, optional response and status). It goes into collection (id or name; an unknown name creates it), else the active collection, else \"Saved\". Optional name, label, note, color. The open Organizer updates live.",
+          "inputSchema": obj(json!({ "flowId": {"type":"integer"}, "request": {"type":"string"}, "target": {"type":"string"}, "response": {"type":"string"}, "status": {"type":"integer"}, "collection": {"type":"string"}, "name": {"type":"string"}, "label": {"type":"string"}, "note": {"type":"string"}, "color": {"type":"string", "enum": ["red","orange","yellow","green","cyan","blue","purple","pink","gray",""]} }), json!([])) },
+        { "name": "organizer_set", "description": "Set the label, note and/or highlight colour of a saved request by id. Omit a field to keep it; an empty string clears it. Colours: red, orange, yellow, green, cyan, blue, purple, pink, gray. The open Organizer updates live.",
+          "inputSchema": obj(json!({ "id": {"type":"string"}, "label": {"type":"string"}, "note": {"type":"string"}, "color": {"type":"string", "enum": ["red","orange","yellow","green","cyan","blue","purple","pink","gray",""]} }), json!(["id"])) },
+        { "name": "vault_list", "description": "List Vault credentials (Settings > Vault): label, role, note and typed fields (username, email, password, apikey, token, url, text). Secret values are hidden; call vault_get for one entry's full values. Optional query matches label, role, note, field names and non-secret values. Read-only.",
+          "inputSchema": obj(json!({ "query": {"type":"string"} }), json!([])) },
+        { "name": "vault_get", "description": "One Vault credential with every field value, secrets included, by id or by exact label (case-insensitive). Read-only.",
+          "inputSchema": obj(json!({ "id": {"type":"string"}, "label": {"type":"string"} }), json!([])) },
         { "name": "extensions_status", "description": "State of the Python extension engine: interpreter, venv, and each loaded script (id, enabled, running, error).", "inputSchema": obj(json!({}), json!([])) },
         { "name": "extensions_enable", "description": "Turn the whole extension engine on or off.",
           "inputSchema": obj(json!({ "enabled": {"type":"boolean"} }), json!(["enabled"])) },
@@ -1011,10 +1207,11 @@ fn docs() -> String {
 const DOCS_TEMPLATE: &str = r####"# %APP% MCP server (v%VER%)
 
 %APP% is an intercepting HTTP(S) proxy. This MCP server lets an LLM drive it: read
-and search captured traffic, replay and fuzz requests, and run the passive
-scanner. Everything an operator does in the Repeater, Intruder and Passive tabs is
-available here, and every request this server sends is recorded in History like
-ordinary proxy traffic.
+and search captured traffic, replay and fuzz requests, run the passive scanner,
+organize saved requests in the Organizer, and read the project's credential Vault.
+Everything an operator does in the Repeater, Intruder and Passive tabs is available
+here, and every request this server sends is recorded in History like ordinary proxy
+traffic.
 
 Security: the server binds to 127.0.0.1 only. Treat all captured data as
 sensitive; it can contain credentials, tokens and personal data.
@@ -1138,6 +1335,21 @@ the findings. What gets scanned is controlled per project by the `passiveScope`
 setting: a list of file extensions or content types, or `["*"]` for everything; an
 unset or empty scope scans everything. `passive_findings` reads the stored
 findings. `passive_rules_get` and `passive_rules_set` manage the custom rules.
+
+### Organizer and Vault
+
+The Organizer keeps named collections of saved requests: the request and the response
+as they were when saved, each with a label, a note and a highlight colour. One
+collection can be active; "Save to Organizer" in the app and `organizer_save` without a
+`collection` put new items there, or into a "Saved" collection when none is active.
+Saved-request ids are strings, unique across collections. Changes made over MCP show
+up in an open Organizer right away.
+
+The Vault (Settings > Vault) holds the target's credentials: per entry a label, a role,
+a note and a list of typed fields (`username`, `email`, `password`, `apikey`, `token`,
+`url`, `text`), each marked secret or not. It is read-only over MCP. `vault_list` hides
+secret values and `vault_get` returns one entry in full, so fetch only the entry you
+need. The Vault is stored unencrypted in the project file.
 
 ## Tools
 
@@ -1336,6 +1548,69 @@ flags, group }`, where `pattern` is a regular expression string, `flags` may
 include `i` for case insensitive, and `group` is the capture group number to
 report (0 for the whole match).
 
+### organizer_list
+
+List collections and their saved requests, without the request/response text.
+
+Arguments: `collection` (string, optional; an id or a name) to list just that one.
+
+Returns: `{ activeCollection, colors, collections }`. `activeCollection` is
+`{ id, name }` or null. Each collection is `{ id, name, active, count, items }` and each
+item is `{ id, n, name, method, host, path, status, label, note, color, source, savedAt }`,
+where `n` is its position in the collection.
+
+### organizer_get
+
+One saved request with its full text.
+
+Arguments: `id` (string, required).
+
+Returns: the item fields plus `target`, `request`, `response` and
+`collection: { id, name, active }`.
+
+### organizer_save
+
+Save a request into the Organizer.
+
+Arguments: either `flowId` (integer; a captured flow, whose note and colour come
+along) or `request` (raw HTTP request text) plus `target` (`https://host[:port]`), with
+optional `response` (raw response text) and `status`. Optional for both: `collection`
+(an id or a name; an unknown name creates that collection), `name`, `label`, `note` and
+`color` (as for `organizer_set`). Without `collection` the item goes to the active
+collection, else to "Saved" (created if missing, then made active).
+
+Returns: `{ collection: { id, name, active }, item }`, with the new item's `id`.
+
+### organizer_set
+
+Change a saved request's label, note and/or colour.
+
+Arguments: `id` (string, required); `label`, `note`, `color` (strings, optional; give
+at least one). An omitted field is kept and an empty string clears it. Colours: `red`,
+`orange`, `yellow`, `green`, `cyan`, `blue`, `purple`, `pink`, `gray`.
+
+Returns: `{ collection, item }` as for `organizer_save`.
+
+### vault_list
+
+List Vault credentials with secret values hidden.
+
+Arguments: `query` (string, optional). It matches the label, role, note, field names
+and non-secret values; a secret value never matches.
+
+Returns: `{ total, returned, entries }`. Each entry is
+`{ id, label, role, note, fields }` and each field `{ name, kind, secret, value }`; a
+secret value reads `[hidden, use vault_get]`.
+
+### vault_get
+
+One Vault credential with every value, secrets included.
+
+Arguments: `id` (string) or `label` (string, exact, case-insensitive); one is
+required. A label shared by several entries is an error; use the id instead.
+
+Returns: `{ id, label, role, note, fields: [{ name, kind, secret, value }] }`.
+
 ### extensions_status
 
 State of the Python extension engine.
@@ -1417,6 +1692,9 @@ mod tests {
         assert!(names.contains(&"intruder_run"));
         assert!(names.contains(&"extensions_status"));
         assert!(names.contains(&"extension_toggle"));
+        for tool in ["organizer_list", "organizer_get", "organizer_save", "organizer_set", "vault_list", "vault_get"] {
+            assert!(names.contains(&tool), "{tool} listed");
+        }
         // A notification produces no response.
         assert!(handle_rpc(&c, json!({"jsonrpc":"2.0","method":"notifications/initialized"})).await.is_none());
     }
@@ -1699,5 +1977,99 @@ mod tests {
         assert!(!has_version("cloudflare"));
         assert!(!has_version("Varnish"));
         assert!(!has_version("AmazonS3")); // a trailing digit is not a version
+    }
+
+    #[tokio::test]
+    async fn organizer_tools_save_list_set_get_and_notify_the_ui() {
+        use crate::store::Flow;
+        use http::{HeaderMap, Method as M, StatusCode, Uri, Version};
+        let dir = crate::e2e::temp_dir("mcp-organizer");
+        let (ctx, log) = crate::e2e::test_ctx_with_log(&dir);
+        let c = Arc::new(ctx);
+        let call = |name: &'static str, args: Value| {
+            let c = c.clone();
+            async move { call_tool(&c, name, &args).await }
+        };
+        let parse = |s: String| serde_json::from_str::<Value>(&s).unwrap();
+
+        // A captured flow with a note and a colour.
+        let uri: Uri = "https://shop.test/api/orders/7".parse().unwrap();
+        let mut flow = Flow::request(c.store.next_id(), &M::GET, &uri, Version::HTTP_11, &HeaderMap::new(), bytes::Bytes::new());
+        flow.set_response(StatusCode::OK, Version::HTTP_11, &HeaderMap::new(), bytes::Bytes::from_static(b"{\"order\":7}"));
+        let fid = c.store.push(flow).unwrap().id;
+        c.store.set_meta(fid, "owner check", "red").unwrap();
+
+        // Saving the flow with nothing active lands in a new, active "Saved".
+        let out = parse(call("organizer_save", json!({"flowId": fid, "label": "IDOR?"})).await.unwrap());
+        assert_eq!((out["collection"]["name"].as_str(), out["collection"]["active"].as_bool()), (Some("Saved"), Some(true)));
+        let item = &out["item"];
+        assert_eq!((item["method"].as_str(), item["host"].as_str(), item["path"].as_str()), (Some("GET"), Some("shop.test"), Some("/api/orders/7")));
+        assert_eq!(
+            (item["status"].as_u64(), item["label"].as_str(), item["note"].as_str(), item["color"].as_str(), item["source"].as_str()),
+            (Some(200), Some("IDOR?"), Some("owner check"), Some("red"), Some("history"))
+        );
+        let id = item["id"].as_str().unwrap().to_string();
+        // The UI was told about the new revision.
+        assert!(log.lock().unwrap().iter().any(|(e, p)| e == "organizer" && p["rev"] == 1));
+
+        // A raw request into a named collection, created on the fly (not made active).
+        let raw = call("organizer_save", json!({"request": "POST /login HTTP/1.1\r\nHost: shop.test\r\n\r\nu=a", "target": "https://shop.test", "collection": "Auth", "color": "blue"})).await.unwrap();
+        assert!(raw.contains("\"name\": \"Auth\"") && raw.contains("\"source\": \"mcp\"") && raw.contains("\"active\": false"), "{raw}");
+        // Bad input errors and saves nothing.
+        assert!(call("organizer_save", json!({"target": "https://x"})).await.is_err());
+        assert!(call("organizer_save", json!({"flowId": fid, "color": "teal"})).await.is_err());
+        assert!(call("organizer_save", json!({"flowId": 99999})).await.is_err());
+
+        // List: both collections, the active one named, items without their text.
+        let list = parse(call("organizer_list", json!({})).await.unwrap());
+        assert_eq!(list["activeCollection"]["name"], "Saved");
+        assert_eq!(list["collections"].as_array().unwrap().len(), 2);
+        assert_eq!(list["collections"][0]["items"][0]["n"], 1);
+        assert!(list["collections"][0]["items"][0].get("request").is_none());
+        let only = parse(call("organizer_list", json!({"collection": "auth"})).await.unwrap());
+        assert_eq!((only["collections"].as_array().unwrap().len(), only["collections"][0]["count"].as_u64()), (1, Some(1)));
+        assert!(call("organizer_list", json!({"collection": "nope"})).await.is_err());
+
+        // Set: an omitted label is kept, "" clears the colour, the note is replaced.
+        let set = parse(call("organizer_set", json!({"id": id, "note": "confirmed", "color": ""})).await.unwrap());
+        assert_eq!((set["item"]["label"].as_str(), set["item"]["note"].as_str(), set["item"]["color"].as_str()), (Some("IDOR?"), Some("confirmed"), Some("")));
+        assert!(call("organizer_set", json!({"id": id})).await.is_err(), "nothing to set");
+        assert!(call("organizer_set", json!({"id": id, "color": "teal"})).await.is_err());
+        assert!(call("organizer_set", json!({"id": "nope", "label": "x"})).await.is_err());
+
+        // Get: the full request and response text.
+        let got = parse(call("organizer_get", json!({"id": id})).await.unwrap());
+        assert!(got["request"].as_str().unwrap().starts_with("GET /api/orders/7"));
+        assert!(got["response"].as_str().unwrap().contains("{\"order\":7}"));
+        assert_eq!((got["collection"]["name"].as_str(), got["note"].as_str()), (Some("Saved"), Some("confirmed")));
+        assert!(call("organizer_get", json!({"id": "nope"})).await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn vault_tools_hide_secrets_in_listings_and_never_write() {
+        let c = ctx();
+        let stored = json!({ "entries": [
+            { "id": "v1", "label": "Admin", "role": "admin", "note": "", "fields": [
+                { "id": "f1", "kind": "email", "name": "Email", "secret": false, "value": "admin@shop.test" },
+                { "id": "f2", "kind": "password", "name": "Password", "secret": true, "value": "S3cret!" },
+            ]},
+            { "id": "v2", "label": "admin", "username": "root", "password": "toor" },
+        ]});
+        c.store.put_setting("vault", &stored).unwrap();
+
+        let list = call_tool(&c, "vault_list", &json!({})).await.unwrap();
+        assert!(list.contains("admin@shop.test") && list.contains(vault::HIDDEN), "{list}");
+        assert!(!list.contains("S3cret!") && !list.contains("toor"), "no secret in a listing: {list}");
+        assert!(call_tool(&c, "vault_list", &json!({"query": "root"})).await.unwrap().contains("\"returned\": 1"));
+        assert!(call_tool(&c, "vault_list", &json!({"query": "S3cret"})).await.unwrap().contains("\"returned\": 0"));
+
+        // vault_get returns the secrets; a label two entries share must use the id.
+        assert!(call_tool(&c, "vault_get", &json!({"id": "v1"})).await.unwrap().contains("S3cret!"));
+        assert!(call_tool(&c, "vault_get", &json!({"id": "v2"})).await.unwrap().contains("toor"));
+        assert!(call_tool(&c, "vault_get", &json!({"label": "ADMIN"})).await.is_err(), "ambiguous label");
+        assert!(call_tool(&c, "vault_get", &json!({"id": "nope"})).await.is_err());
+        assert!(call_tool(&c, "vault_get", &json!({})).await.is_err());
+        assert_eq!(c.store.get_setting("vault").unwrap().unwrap(), stored, "read-only");
     }
 }

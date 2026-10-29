@@ -227,13 +227,13 @@ async fn spawn_tls_origin(ca: &CertAuthority) -> SocketAddr {
 /// A client that uses `proxy` the way a browser would (absolute-form / CONNECT).
 fn client_via(proxy: SocketAddr) -> upstream::HttpClient {
     let p = UpstreamProxy::parse(&proxy.to_string()).unwrap();
-    upstream::client(p.map(Arc::new), false).unwrap()
+    upstream::client(p.map(Arc::new), false, Default::default()).unwrap()
 }
 
 /// Like [`client_via`], but offering HTTP/2 inside the tunnel.
 fn client_via_h2(proxy: SocketAddr) -> upstream::HttpClient {
     let p = UpstreamProxy::parse(&proxy.to_string()).unwrap();
-    upstream::client(p.map(Arc::new), true).unwrap()
+    upstream::client(p.map(Arc::new), true, Default::default()).unwrap()
 }
 
 async fn body_text(res: Response<Incoming>) -> String {

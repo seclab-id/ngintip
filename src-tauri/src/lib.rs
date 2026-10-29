@@ -13,6 +13,7 @@ mod e2e;
 mod har;
 mod intercept;
 mod mcp;
+mod organizer;
 mod scope;
 mod proxy;
 mod raw;
@@ -22,6 +23,7 @@ mod store;
 #[cfg(test)]
 mod testserver;
 mod upstream;
+mod vault;
 mod ws;
 
 use std::sync::{Arc, Mutex};
@@ -30,7 +32,8 @@ use tauri::{Emitter, Manager};
 
 pub struct AppState {
     pub ctx: Arc<proxy::Ctx>,
-    pub server: Mutex<Option<commands::Running>>,
+    /// Running listeners (several can be up at once), each independently stoppable.
+    pub server: Mutex<Vec<commands::Running>>,
     /// App-wide settings and the file they're saved to.
     pub config: Mutex<config::Config>,
     pub config_path: std::path::PathBuf,
@@ -206,6 +209,7 @@ pub fn run() {
                 Ok(proxy) => ctx.set_upstream(proxy)?,
                 Err(e) => eprintln!("[config] upstream proxy ignored: {e:#}"),
             }
+            ctx.set_host_overrides(&config.host_overrides);
 
             // Extensions are fully per-project now: the script list, master on/off,
             // interpreter, custom venv and debug console all live in the project. Migrate
@@ -218,14 +222,9 @@ pub fn run() {
                 commands::load_extensions_into(&ctx);
             }
 
-            let mcp_boot = config.mcp;
-            let mcp_port = if config.mcp_port == 0 { 8082 } else { config.mcp_port };
-            let mcp_docs = config.mcp_docs_path.clone();
-            let ctx_for_mcp = ctx.clone();
-
             app.manage(AppState {
                 ctx,
-                server: Mutex::new(None),
+                server: Mutex::new(Vec::new()),
                 config: Mutex::new(config),
                 config_path,
                 document: Mutex::new(document),
@@ -235,20 +234,9 @@ pub fn run() {
                 sends: Mutex::new(std::collections::HashMap::new()),
             });
 
-            // Start the MCP server on boot when it was left enabled.
-            if mcp_boot {
-                let handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    match commands::start_mcp(ctx_for_mcp, mcp_port, mcp_docs).await {
-                        Ok(r) => {
-                            if let Some(state) = handle.try_state::<AppState>() {
-                                *state.mcp.lock().unwrap() = Some(r);
-                            }
-                        }
-                        Err(e) => eprintln!("[mcp] {e}"),
-                    }
-                });
-            }
+            // The MCP server is NOT started here: it is opt-in per project, so the UI
+            // starts it once the open project turns out to have it enabled (a new
+            // project never does). See #syncMcp in src/lib/store.svelte.js.
 
             build_menu(app)?;
             app.on_menu_event(|app, event| {
@@ -261,9 +249,16 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::start_proxy,
-            commands::stop_proxy,
-            commands::proxy_status,
+            commands::list_listeners,
+            commands::start_listeners,
+            commands::stop_listeners,
+            commands::add_listener,
+            commands::remove_listener,
+            commands::set_listener_enabled,
+            commands::update_listener,
+            commands::set_host_overrides,
+            commands::organizer_state,
+            commands::organizer_op,
             commands::list_flows,
             commands::get_flow,
             commands::flow_image,
@@ -318,6 +313,8 @@ pub fn run() {
             commands::save_binary,
             commands::copy_image,
             commands::save_project_as,
+            commands::default_project_dir,
+            commands::path_exists,
             commands::save_project,
             commands::intercept_status,
             commands::set_intercept,

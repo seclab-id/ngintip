@@ -284,7 +284,8 @@ pub fn terminate(child: &mut std::process::Child) {
 
 /// GET a URL, following up to a few redirects, returning the final response.
 async fn http_get(url: &str) -> Result<hyper::Response<hyper::body::Incoming>, String> {
-    let client = crate::upstream::client(None, true).map_err(|e| e.to_string())?;
+    // Internal binary download: no upstream proxy, no hostname overrides.
+    let client = crate::upstream::client(None, true, Default::default()).map_err(|e| e.to_string())?;
     let mut current = url.to_string();
     for _ in 0..5 {
         let uri: http::Uri = current.parse().map_err(|e| format!("bad url {current:?}: {e}"))?;

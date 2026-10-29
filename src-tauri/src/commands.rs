@@ -1,6 +1,7 @@
 //! Tauri commands invoked from the UI (`src/lib/api.js`).
 
 use std::{
+    net::SocketAddr,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -27,17 +28,23 @@ use crate::{
 type CmdResult<T> = Result<T, String>;
 
 pub struct Running {
-    host: String,
+    id: String,
     port: u16,
+    addr: SocketAddr,
     task: tauri::async_runtime::JoinHandle<()>,
 }
 
+/// One listener's state for the UI: its saved config plus whether it is live.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ProxyStatus {
-    running: bool,
+pub struct ListenerStatus {
+    id: String,
     host: String,
+    /// The port actually bound while running (may differ from the configured one if
+    /// that was busy); the configured port otherwise.
     port: u16,
+    enabled: bool,
+    running: bool,
 }
 
 #[derive(Serialize)]
@@ -86,14 +93,71 @@ pub struct RepeaterResponse {
     pub response_original: Option<String>,
 }
 
-async fn stop(state: &AppState) {
-    state.ctx.set_listener(None);
-    let running = state.server.lock().unwrap().take();
-    if let Some(r) = running {
+/// Every configured listener merged with its live state, for the UI. Locks config
+/// then server (keep that order everywhere to avoid deadlock); holds neither across
+/// an await.
+fn status_list(state: &AppState) -> Vec<ListenerStatus> {
+    let config = state.config.lock().unwrap();
+    let running = state.server.lock().unwrap();
+    config
+        .listeners
+        .iter()
+        .map(|l| {
+            let live = running.iter().find(|r| r.id == l.id);
+            ListenerStatus {
+                id: l.id.clone(),
+                host: l.host.clone(),
+                port: live.map(|r| r.port).unwrap_or(l.port),
+                enabled: l.enabled,
+                running: live.is_some(),
+            }
+        })
+        .collect()
+}
+
+/// Stop and forget one listener by id (no-op if it isn't running).
+async fn stop_one(state: &AppState, id: &str) {
+    let found = {
+        let mut running = state.server.lock().unwrap();
+        running.iter().position(|r| r.id == id).map(|i| running.remove(i))
+    };
+    if let Some(r) = found {
+        state.ctx.remove_listener(&r.addr);
         r.task.abort();
-        // Wait so the listener is dropped before a re-bind on the same port.
+        // Wait so the socket is released before any re-bind on the same port.
         let _ = r.task.await;
     }
+}
+
+/// Stop and forget every running listener.
+async fn stop_all(state: &AppState) {
+    let running: Vec<Running> = std::mem::take(&mut state.server.lock().unwrap());
+    for r in running {
+        state.ctx.remove_listener(&r.addr);
+        r.task.abort();
+        let _ = r.task.await;
+    }
+}
+
+/// Bind + spawn one listener and record it under `id` (restarting it if already up).
+/// Does not touch config; the caller persists. Holds no lock across the bind await.
+async fn start_one(state: &AppState, id: &str, host: &str, port: u16) -> Result<(), String> {
+    stop_one(state, id).await;
+    let (listener, bound) = bind_proxy(host, port).await?;
+    let addr = listener.local_addr().map_err(|e| e.to_string())?;
+    state.ctx.add_listener(addr);
+    let task = tauri::async_runtime::spawn(proxy::serve(listener, state.ctx.clone()));
+    if bound != port {
+        state.ctx.log_info("proxy", format!("port {port} busy; using {host}:{bound} instead (another proxy?)"));
+    }
+    state.ctx.log_info("proxy", format!("listener started on {host}:{bound}"));
+    state.server.lock().unwrap().push(Running {
+        id: id.to_string(),
+        port: bound,
+        addr,
+        task,
+    });
+    Ok(())
 }
 
 /// Bind `port`, or the next free port after it, so a second Ngintip instance (or any
@@ -117,44 +181,139 @@ async fn bind_proxy(host: &str, port: u16) -> Result<(TcpListener, u16), String>
 }
 
 #[tauri::command]
-pub async fn start_proxy(
-    state: State<'_, AppState>,
-    host: String,
-    port: u16,
-) -> CmdResult<ProxyStatus> {
-    stop(&state).await;
-    let (listener, bound) = bind_proxy(&host, port).await?;
-    let task = tauri::async_runtime::spawn(proxy::serve(listener, state.ctx.clone()));
-    if bound != port {
-        state.ctx.log_info("proxy", format!("port {port} busy; using {host}:{bound} instead (another proxy?)"));
+pub fn list_listeners(state: State<AppState>) -> Vec<ListenerStatus> {
+    status_list(&state)
+}
+
+/// Start every enabled listener not already running. Called once on load so the
+/// configured listeners come up; idempotent, so it is safe to call again.
+#[tauri::command]
+pub async fn start_listeners(state: State<'_, AppState>) -> CmdResult<Vec<ListenerStatus>> {
+    let pending: Vec<(String, String, u16)> = {
+        let config = state.config.lock().unwrap();
+        let running = state.server.lock().unwrap();
+        config
+            .listeners
+            .iter()
+            .filter(|l| l.enabled && !running.iter().any(|r| r.id == l.id))
+            .map(|l| (l.id.clone(), l.host.clone(), l.port))
+            .collect()
+    };
+    for (id, host, port) in pending {
+        if let Err(e) = start_one(&state, &id, &host, port).await {
+            state.ctx.log_error("proxy", format!("listener {host}:{port} failed to start: {e}"));
+        }
     }
-    state.ctx.log_info("proxy", format!("proxy started on {host}:{bound}"));
-    *state.server.lock().unwrap() = Some(Running {
-        host: host.clone(),
-        port: bound,
-        task,
-    });
-    Ok(ProxyStatus {
-        running: true,
-        host,
-        port: bound,
-    })
+    Ok(status_list(&state))
 }
 
+/// Stop every running listener (the global Stop). Their saved config is untouched.
 #[tauri::command]
-pub async fn stop_proxy(state: State<'_, AppState>) -> CmdResult<()> {
-    stop(&state).await;
-    state.ctx.log_info("proxy", "proxy stopped");
+pub async fn stop_listeners(state: State<'_, AppState>) -> CmdResult<Vec<ListenerStatus>> {
+    stop_all(&state).await;
+    state.ctx.log_info("proxy", "all listeners stopped");
+    Ok(status_list(&state))
+}
+
+/// Add a listener, persist it, and start it. Rolls the entry back on a bind failure.
+#[tauri::command]
+pub async fn add_listener(state: State<'_, AppState>, host: String, port: u16) -> CmdResult<Vec<ListenerStatus>> {
+    let id = {
+        let mut config = state.config.lock().unwrap();
+        let id = format!("l{}-{}", crate::store::now_ms(), config.listeners.len());
+        config.listeners.push(config::Listener { id: id.clone(), host: host.clone(), port, enabled: true });
+        config::save(&state.config_path, &config).map_err(|e| e.to_string())?;
+        id
+    };
+    if let Err(e) = start_one(&state, &id, &host, port).await {
+        let mut config = state.config.lock().unwrap();
+        config.listeners.retain(|l| l.id != id);
+        let _ = config::save(&state.config_path, &config);
+        return Err(e);
+    }
+    Ok(status_list(&state))
+}
+
+/// Stop and delete a listener.
+#[tauri::command]
+pub async fn remove_listener(state: State<'_, AppState>, id: String) -> CmdResult<Vec<ListenerStatus>> {
+    stop_one(&state, &id).await;
+    {
+        let mut config = state.config.lock().unwrap();
+        config.listeners.retain(|l| l.id != id);
+        config::save(&state.config_path, &config).map_err(|e| e.to_string())?;
+    }
+    Ok(status_list(&state))
+}
+
+/// Enable (start) or disable (stop) one listener without deleting it.
+#[tauri::command]
+pub async fn set_listener_enabled(state: State<'_, AppState>, id: String, enabled: bool) -> CmdResult<Vec<ListenerStatus>> {
+    let target = {
+        let mut config = state.config.lock().unwrap();
+        let Some(l) = config.listeners.iter_mut().find(|l| l.id == id) else {
+            return Err("listener not found".into());
+        };
+        l.enabled = enabled;
+        let hp = (l.host.clone(), l.port);
+        config::save(&state.config_path, &config).map_err(|e| e.to_string())?;
+        hp
+    };
+    if enabled {
+        if let Err(e) = start_one(&state, &id, &target.0, target.1).await {
+            let mut config = state.config.lock().unwrap();
+            if let Some(l) = config.listeners.iter_mut().find(|l| l.id == id) {
+                l.enabled = false;
+            }
+            let _ = config::save(&state.config_path, &config);
+            return Err(e);
+        }
+    } else {
+        stop_one(&state, &id).await;
+    }
+    Ok(status_list(&state))
+}
+
+/// Edit a listener's host/port. Rebinds on the new address when it was running.
+#[tauri::command]
+pub async fn update_listener(state: State<'_, AppState>, id: String, host: String, port: u16) -> CmdResult<Vec<ListenerStatus>> {
+    let was_running = {
+        let mut config = state.config.lock().unwrap();
+        let Some(l) = config.listeners.iter_mut().find(|l| l.id == id) else {
+            return Err("listener not found".into());
+        };
+        l.host = host.clone();
+        l.port = port;
+        config::save(&state.config_path, &config).map_err(|e| e.to_string())?;
+        state.server.lock().unwrap().iter().any(|r| r.id == id)
+    };
+    if was_running {
+        start_one(&state, &id, &host, port).await?;
+    }
+    Ok(status_list(&state))
+}
+
+/// The open project's Organizer (collections of saved requests).
+#[tauri::command]
+pub fn organizer_state(state: State<AppState>) -> CmdResult<crate::organizer::Organizer> {
+    crate::organizer::load(&state.ctx.store)
+}
+
+/// Apply one Organizer edit. The backend owns the Organizer so the UI and the MCP server
+/// can't overwrite each other; the result carries the new state for the UI to show.
+#[tauri::command]
+pub fn organizer_op(state: State<AppState>, action: crate::organizer::Op) -> CmdResult<crate::organizer::Applied> {
+    crate::organizer::apply(&state.ctx.store, action)
+}
+
+/// Replace the hostname -> IP overrides (direct connections). Persisted + applied live.
+#[tauri::command]
+pub fn set_host_overrides(state: State<AppState>, overrides: Vec<config::HostOverride>) -> CmdResult<()> {
+    let mut config = state.config.lock().unwrap();
+    config.host_overrides = overrides;
+    config::save(&state.config_path, &config).map_err(|e| e.to_string())?;
+    state.ctx.set_host_overrides(&config.host_overrides);
     Ok(())
-}
-
-#[tauri::command]
-pub fn proxy_status(state: State<AppState>) -> Option<ProxyStatus> {
-    state.server.lock().unwrap().as_ref().map(|r| ProxyStatus {
-        running: true,
-        host: r.host.clone(),
-        port: r.port,
-    })
 }
 
 #[tauri::command]
@@ -731,11 +890,30 @@ async fn write_document(dir: PathBuf, state: State<'_, AppState>, path: PathBuf)
     Ok(make_save_result(&path, raw_len as usize, comp_len as usize))
 }
 
-/// Save (compress) the current project to a chosen `.cegat` path.
+/// Save (compress) the current project to a chosen `.cegat` path. A missing parent
+/// folder is created, so a new project can go straight into the default folder.
 #[tauri::command]
 pub async fn save_project_as(app: tauri::AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<SaveResult> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    write_document(dir, state, PathBuf::from(path)).await
+    let path = PathBuf::from(path);
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+    }
+    write_document(dir, state, path).await
+}
+
+/// Folder offered for a new project when none was used before: `~/Documents/Ngintip`
+/// (home if there is no Documents). Created on the first save, not here.
+#[tauri::command]
+pub fn default_project_dir(app: tauri::AppHandle) -> CmdResult<String> {
+    let base = app.path().document_dir().or_else(|_| app.path().home_dir()).map_err(|e| e.to_string())?;
+    Ok(base.join(brand::NAME).display().to_string())
+}
+
+/// Whether a file or folder exists (the New project dialog asks before replacing one).
+#[tauri::command]
+pub fn path_exists(path: String) -> bool {
+    !path.is_empty() && Path::new(&path).exists()
 }
 
 /// Save (compress) the current project to its existing document path.

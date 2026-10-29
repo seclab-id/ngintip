@@ -10,11 +10,14 @@
   import ComparerView from './components/ComparerView.svelte';
   import ExtensionsView from './components/ExtensionsView.svelte';
   import IntruderView from './components/IntruderView.svelte';
+  import OrganizerView from './components/OrganizerView.svelte';
   import PassiveView from './components/PassiveView.svelte';
   import HelpView from './components/HelpView.svelte';
   import LogsView from './components/LogsView.svelte';
   import SettingsView from './components/SettingsView.svelte';
   import ProjectChooser from './components/ProjectChooser.svelte';
+  import ConfirmDialog from './components/ConfirmDialog.svelte';
+  import NewProjectDialog from './components/NewProjectDialog.svelte';
   import { store } from './lib/store.svelte.js';
 
   onMount(() => store.init());
@@ -51,6 +54,8 @@
         <RepeaterView />
       {:else if store.view === 'intruder'}
         <IntruderView />
+      {:else if store.view === 'organizer'}
+        <OrganizerView />
       {:else if store.view === 'passive'}
         <PassiveView />
       {:else if store.view === 'decoder'}
@@ -69,6 +74,14 @@
     </section>
   </main>
 </div>
+{/if}
+
+{#if store.newProjectDialog}
+  <NewProjectDialog dialog={store.newProjectDialog} />
+{/if}
+
+{#if store.confirmDialog}
+  <ConfirmDialog dialog={store.confirmDialog} />
 {/if}
 
 {#if store.decompressing || store.saving}

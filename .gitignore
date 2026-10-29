@@ -47,3 +47,4 @@ venv/
 coverage/
 *.log
 npm-debug.log*
+request.txt

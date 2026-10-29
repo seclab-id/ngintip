@@ -359,13 +359,16 @@ export function lineContentRect(snap, colKey, lineIdx) {
   return { x: x1 - 3, y: y - 1, w: Math.max(12, x2 - x1) + 6, h: snap.LH, cx: col.textX, charW: snap.charW, lineY: y };
 }
 
-/** Hit-test a point to a {col, line, char} (char = column index within the visual line). */
+/** Hit-test a point to a {col, line, char} (char = column index within the visual line).
+ *  `px`/`py` are snapshot coords (what the editor's pointer maps to); columns are laid out
+ *  card-local, so the card's margin is taken off first - the same offset drawSnapshot adds. */
 export function hitTest(snap, px, py) {
+  const x = px - snap.card.x, y = py - snap.card.y;
   for (const col of snap.columns) {
-    if (px < col.x || px > col.x + col.w) continue;
-    const i = Math.floor((py - col.codeTop) / snap.LH);
+    if (x < col.x || x > col.x + col.w) continue;
+    const i = Math.floor((y - col.codeTop) / snap.LH);
     if (i < 0 || i >= col.lines.length) continue;
-    const ch = Math.max(0, Math.round((px - col.textX) / snap.charW));
+    const ch = Math.max(0, Math.floor((x - col.textX) / snap.charW));
     return { col: col.key, line: i, char: ch };
   }
   return null;

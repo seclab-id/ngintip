@@ -1,8 +1,8 @@
 <script>
-  // Two side-by-side panes with a draggable vertical divider. The ratio is
-  // remembered per `storeKey` in localStorage.
+  // Two panes with a draggable divider: side by side, or stacked top/bottom with
+  // `vertical`. The ratio is remembered per `storeKey` in localStorage.
   import { brandKey } from '../lib/brand.js';
-  let { left, right, min = 0.15, max = 0.85, start = 0.5, storeKey } = $props();
+  let { left, right, min = 0.15, max = 0.85, start = 0.5, storeKey, vertical = false } = $props();
 
   function load() {
     try {
@@ -25,7 +25,8 @@
   function move(e) {
     if (!dragging) return;
     const r = el.getBoundingClientRect();
-    split = Math.min(max, Math.max(min, (e.clientX - r.left) / r.width));
+    const f = vertical ? (e.clientY - r.top) / r.height : (e.clientX - r.left) / r.width;
+    split = Math.min(max, Math.max(min, f));
   }
   function up() {
     dragging = false;
@@ -37,13 +38,18 @@
   }
 </script>
 
-<div class="split" bind:this={el} style="grid-template-columns: {split}fr 6px {1 - split}fr">
+<div
+  class="split"
+  class:vertical
+  bind:this={el}
+  style="{vertical ? 'grid-template-rows' : 'grid-template-columns'}: {split}fr 6px {1 - split}fr"
+>
   <div class="pane">{@render left()}</div>
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
     class="divider"
     role="separator"
-    aria-orientation="vertical"
+    aria-orientation={vertical ? 'horizontal' : 'vertical'}
     onpointerdown={down}
     onpointermove={move}
     onpointerup={up}
@@ -66,6 +72,9 @@
   .divider {
     background: var(--border);
     cursor: col-resize;
+  }
+  .vertical > .divider {
+    cursor: row-resize;
   }
   .divider:hover {
     background: var(--accent);

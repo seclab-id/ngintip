@@ -43,6 +43,10 @@
   function swap() {
     [cmp.a, cmp.b] = [cmp.b, cmp.a];
   }
+  async function clearAll() {
+    const n = cmp.items.length;
+    if (await store.confirm({ title: `Remove all ${n} item${n === 1 ? '' : 's'} from Comparer?`, message: 'This cannot be undone.', yes: 'Yes, remove' })) store.clearComparer();
+  }
   const fmtLen = (t) => `${(t ?? '').length} chars`;
 </script>
 
@@ -53,7 +57,7 @@
       <div class="spacer"></div>
       <button class="btn sm" title="Add a new item to type or paste into" onclick={addItem}>+ Add</button>
       {#if cmp.items.length}
-        <button class="btn ghost sm" onclick={() => store.clearComparer()}>Clear all</button>
+        <button class="btn ghost sm" onclick={clearAll}>Clear all</button>
       {/if}
     </header>
     {#if !cmp.items.length}

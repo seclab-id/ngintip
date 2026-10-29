@@ -1,9 +1,20 @@
 // Thin wrappers over the Rust commands in src-tauri/src/commands.rs.
 import { invoke } from '@tauri-apps/api/core';
 
-export const startProxy = (host, port) => invoke('start_proxy', { host, port });
-export const stopProxy = () => invoke('stop_proxy');
-export const proxyStatus = () => invoke('proxy_status');
+// Proxy listeners: several can run at once. Each status is { id, host, port, enabled, running }.
+export const listListeners = () => invoke('list_listeners');
+export const startListeners = () => invoke('start_listeners');
+export const stopListeners = () => invoke('stop_listeners');
+export const addListener = (host, port) => invoke('add_listener', { host, port });
+export const removeListener = (id) => invoke('remove_listener', { id });
+export const setListenerEnabled = (id, enabled) => invoke('set_listener_enabled', { id, enabled });
+export const updateListener = (id, host, port) => invoke('update_listener', { id, host, port });
+// Hostname -> IP overrides for direct connections (app-scoped hosts file).
+export const setHostOverrides = (overrides) => invoke('set_host_overrides', { overrides });
+// Organizer: the backend owns it, so UI and MCP edits can't overwrite each other.
+// `action` is one edit, e.g. { op: 'save', collection, item } (see organizer.rs Op).
+export const organizerState = () => invoke('organizer_state');
+export const organizerOp = (action) => invoke('organizer_op', { action });
 export const listFlows = () => invoke('list_flows');
 export const getLogs = () => invoke('logs');
 export const clearLogs = () => invoke('clear_logs');
@@ -33,6 +44,8 @@ export const saveBinary = (path, data) => invoke('save_binary', { path, data });
 export const copyImage = (width, height, data) => invoke('copy_image', { width, height, data });
 export const saveProjectAs = (path) => invoke('save_project_as', { path });
 export const saveProject = () => invoke('save_project');
+export const defaultProjectDir = () => invoke('default_project_dir');
+export const pathExists = (path) => invoke('path_exists', { path });
 export const interceptStatus = () => invoke('intercept_status');
 export const setIntercept = (enabled) => invoke('set_intercept', { enabled });
 export const interceptForward = (key, raw = null, holdResponse = false) =>

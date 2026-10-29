@@ -119,7 +119,7 @@
   function onKey(e) {
     if ((e.key === 'Delete' || e.key === 'Backspace') && store.targetIds.length) {
       e.preventDefault();
-      store.deleteFlows(store.targetIds);
+      store.askDeleteFlows(store.targetIds);
       return;
     }
     if (e.key === 'a' && (e.metaKey || e.ctrlKey)) {

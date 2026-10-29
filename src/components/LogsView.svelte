@@ -26,7 +26,15 @@
     selected = allShownSelected ? new Set() : new Set(visible.map((l) => l.id));
   }
   async function deleteSelected() {
+    const n = selected.size;
+    if (!(await store.confirm({ title: `Delete ${n} log line${n === 1 ? '' : 's'}?`, message: 'This cannot be undone.' }))) return;
     await store.deleteLogs([...selected]);
+    selected = new Set();
+  }
+  async function clearAll() {
+    const n = store.logs.length;
+    if (!(await store.confirm({ title: `Clear all ${n.toLocaleString('en-US')} log lines?`, message: 'The whole process log is emptied. This cannot be undone.', yes: 'Yes, clear' }))) return;
+    await store.clearLogs();
     selected = new Set();
   }
   async function deleteOne(id) {
@@ -99,7 +107,7 @@
     {#if selected.size}
       <button class="btn ghost sm" onclick={deleteSelected}>Delete ({selected.size})</button>
     {/if}
-    <button class="btn ghost sm" onclick={() => store.clearLogs()} disabled={!store.logs.length}>Clear all</button>
+    <button class="btn ghost sm" onclick={clearAll} disabled={!store.logs.length}>Clear all</button>
   </div>
 
   <div class="rows" bind:this={viewport}>

@@ -96,6 +96,7 @@
         { label: 'Send to Intruder', run: () => store.sendFlowToIntruder(flow.id) },
         { label: 'Send request to Comparer', run: () => store.sendFlowToComparer(flow.id, 'request') },
         { label: 'Send response to Comparer', run: () => store.sendFlowToComparer(flow.id, 'response') },
+        { label: 'Save to Organizer', hint: store.organizerTargetHint, run: () => store.saveFlowToOrganizer(flow.id) },
         'separator',
         { label: 'Copy full URL', run: () => store.copyText(`${flow.scheme}://${flow.host}${flow.path}`, 'URL') },
         { label: 'Copy as cURL', run: () => store.copyCurl(flow.id) },
@@ -113,7 +114,7 @@
         },
         { label: 'Clear highlight', disabled: !ids.some((id) => store.flows.find((f) => f.id === id)?.color), run: () => store.setColorMany(ids, '') },
         'separator',
-        { label: many ? `Delete ${ids.length} requests` : 'Delete', hint: '⌫', danger: true, run: () => store.deleteFlows(ids) },
+        { label: many ? `Delete ${ids.length} requests…` : 'Delete…', hint: '⌫', danger: true, run: () => store.askDeleteFlows(ids) },
       ],
     };
   }
@@ -309,7 +310,7 @@
     >
       🌐 {store.browser.exists ? (store.browser.opened ? 'Browser opened' : 'Open browser') : 'Set up browser'}
     </button>
-    <button class="btn ghost sm" onclick={() => store.clear()} disabled={!store.flows.length}>Clear</button>
+    <button class="btn ghost sm" title="Delete every request in History (asks first)" onclick={() => store.askClear()} disabled={!store.flows.length}>Clear</button>
   </div>
 
   {#if store.advOpen}
@@ -446,7 +447,7 @@
         <div style="display:contents" onpointerdowncapture={() => (activePane = 'req')} onfocusincapture={() => (activePane = 'req')}>
           <MessageView bind:this={reqRef} title="Request" raw={detail?.requestRaw} placeholder="Select a request to see details"
             truncated={detail?.requestTruncatedView} loadFull={() => store.flowBody(current.id, 'request')} variants={reqVariants}
-            isBinary={detail?.requestIsBinary} loadHex={() => store.flowHex(current.id, 'request')}
+            isBinary={detail?.requestIsBinary} loadHex={() => store.flowHex(current.id, 'request')} preferPretty
             ondecode={(t) => (miniDecode = { text: t })} onsend={(t) => store.sendStringToDecoder(t)} />
         </div>
       {/snippet}
@@ -458,7 +459,7 @@
           {:else}
             <MessageView bind:this={resRef} title="Response" raw={detail?.responseRaw} isImage={detail?.responseIsImage} loadImage={() => store.flowImage(current.id)}
               truncated={detail?.responseTruncatedView} loadFull={() => store.flowBody(current.id, 'response')} variants={resVariants}
-              isBinary={detail?.responseIsBinary} loadHex={() => store.flowHex(current.id, 'response')}
+              isBinary={detail?.responseIsBinary} loadHex={() => store.flowHex(current.id, 'response')} preferPretty
               ondecode={(t) => (miniDecode = { text: t })} onsend={(t) => store.sendStringToDecoder(t)} />
           {/if}
         </div>
