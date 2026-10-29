@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildSnapshot, drawSnapshot, drawShapes, bodyType, tokenizeLine, wordAt } from './capture.js';
+import { buildSnapshot, drawSnapshot, drawShapes, bodyType, tokenizeLine, wordAt, hitTest, lineContentRect } from './capture.js';
 
 // A recording 2D-context stub so we can run the real draw path (jsdom has no canvas).
 function stubCtx() {
@@ -177,6 +177,43 @@ describe('wordAt', () => {
     const text = snap.columns[0].lines[line].cells.map((c) => c.ch).join('');
     const w = wordAt(snap, 'req', line, text.indexOf('admin') + 1);
     expect(text.slice(w.c1, w.c2)).toBe('admin');
+  });
+});
+
+describe('hitTest', () => {
+  // Clicking the middle of a drawn line must pick THAT line (not the one below): the
+  // pointer is in snapshot coords, lines are laid out card-local inside the margin.
+  const snap = buildSnapshot({
+    request: 'POST /api HTTP/1.1\nHost: x\n\n{"a":"first","b":"second","c":"third"}',
+    response: 'HTTP/1.1 200 OK\nContent-Type: text/plain\n\nalpha\nbeta\ngamma',
+  }, { layout: 'side', beautifyReq: true }, fakeCanvas());
+  const centre = (col, line) => {
+    const r = lineContentRect(snap, col, line);
+    return [snap.card.x + r.x + r.w / 2, snap.card.y + r.y + r.h / 2];
+  };
+
+  it('maps the centre of every drawn line back to that line', () => {
+    for (const col of snap.columns) {
+      for (let i = 0; i < col.lines.length; i++) {
+        const hit = hitTest(snap, ...centre(col.key, i));
+        expect(hit).toMatchObject({ col: col.key, line: i });
+      }
+    }
+  });
+
+  it('maps a click on a character to that character (redact picks the clicked word)', () => {
+    const col = snap.columns[1];
+    const line = col.lines.findIndex((l) => l.cells.map((c) => c.ch).join('') === 'beta');
+    const y = centre('res', line)[1];
+    const x = snap.card.x + col.textX + 2.5 * snap.charW; // inside the 3rd char
+    expect(hitTest(snap, x, y)).toEqual({ col: 'res', line, char: 2 });
+    expect(wordAt(snap, 'res', line, 2)).toEqual({ c1: 0, c2: 4 });
+  });
+
+  it('misses the backdrop margin and the column titles', () => {
+    expect(hitTest(snap, 2, 2)).toBeNull();
+    const col = snap.columns[0];
+    expect(hitTest(snap, snap.card.x + col.textX + 4, snap.card.y + col.y + 2)).toBeNull();
   });
 });
 

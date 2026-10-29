@@ -108,6 +108,7 @@
       x: e.clientX,
       y: e.clientY,
       items: [
+        { label: 'Save to Organizer', hint: store.organizerTargetHint, run: () => store.saveRepeaterToOrganizer(tab) },
         { label: 'Send to Intruder', run: () => store.sendToIntruder({ target: tab.target, raw: tab.raw }) },
         { label: 'Send to Decoder', run: () => store.sendStringToDecoder(tab.raw || '') },
         { label: 'Send to Comparer', run: () => store.addToComparer(tab.raw || '', `${tab.name || 'Repeater'} req`, 'req') },
@@ -136,6 +137,7 @@
         { label: 'Send response to Decoder', run: () => store.sendStringToDecoder(respRaw) },
         { label: 'Send response to Comparer', run: () => store.addToComparer(respRaw, `${tab.name || 'Repeater'} res`, 'res') },
         'separator',
+        { label: 'Save to Organizer', hint: store.organizerTargetHint, run: () => store.saveRepeaterToOrganizer(tab) },
         { label: 'Send request to Intruder', run: () => store.sendToIntruder({ target: tab.target, raw: tab.raw }) },
         { label: 'Copy URL', run: () => store.copyText(requestUrl(), 'URL') },
         { label: 'Copy as cURL', run: () => store.copyText(toCurl(tab.raw || '', tab.target), 'cURL command') },
@@ -181,8 +183,14 @@
     for (const t of rep.tabs) if ((t.group || '') === name) t.group = '';
     dropGroupColor(name);
   }
-  function deleteGroup(name) {
-    for (const id of rep.tabs.filter((t) => (t.group || '') === name).map((t) => t.id)) store.closeRepeaterTab(id);
+  async function deleteGroup(name) {
+    const ids = rep.tabs.filter((t) => (t.group || '') === name).map((t) => t.id);
+    const ok = await store.confirm({
+      title: `Delete group "${name}" and its ${ids.length} tab${ids.length === 1 ? '' : 's'}?`,
+      message: 'The tabs close with their requests and send history. Use "Ungroup (keep tabs)" to keep them. This cannot be undone.',
+    });
+    if (!ok) return;
+    for (const id of ids) store.closeRepeaterTab(id);
     dropGroupColor(name);
   }
   function dropGroupColor(name) {
@@ -211,7 +219,7 @@
         { label: 'Default colour', run: () => dropGroupColor(name) },
         'separator',
         { label: 'Ungroup (keep tabs)', run: () => ungroupAll(name) },
-        { label: 'Delete group + tabs', danger: true, run: () => deleteGroup(name) },
+        { label: 'Delete group + tabs…', danger: true, run: () => deleteGroup(name) },
       ],
     };
   }
@@ -293,6 +301,7 @@
       items: [
         { label: 'Rename', run: () => (renaming = t.id) },
         { label: 'Duplicate', run: () => store.duplicateRepeaterTab(t) },
+        { label: 'Save to Organizer', hint: store.organizerTargetHint, run: () => store.saveRepeaterToOrganizer(t) },
         'separator',
         { label: 'New group…', run: () => (groupModal = { mode: 'new', tabId: t.id, name: '' }) },
         ...groupNames

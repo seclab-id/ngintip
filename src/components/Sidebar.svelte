@@ -7,6 +7,7 @@
     { id: 'intercept', label: 'Intercept', icon: 'M10 15V9M14 15V9M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20z' },
     { id: 'repeater', label: 'Repeater', icon: 'm17 2 4 4-4 4M3 11v-1a4 4 0 0 1 4-4h14M7 22l-4-4 4-4M21 13v1a4 4 0 0 1-4 4H3' },
     { id: 'intruder', label: 'Intruder', icon: 'M12 2v4M12 18v4M2 12h4M18 12h4M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z' },
+    { id: 'organizer', label: 'Organizer', icon: 'M4 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2zM4 11h16' },
     { id: 'passive', label: 'Passive Scan', icon: 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM12 8v4M12 16h.01' },
     { id: 'decoder', label: 'Decoder', icon: 'M16 18l6-6-6-6M8 6l-6 6 6 6M14 4l-4 16' },
     { id: 'comparer', label: 'Comparer', icon: 'M9 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h4M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M12 2v20' },
@@ -38,6 +39,8 @@
         <span class="count alert">{store.passiveAlerts}</span>
       {:else if item.id === 'comparer' && store.comparer.items.length}
         <span class="count">{store.comparer.items.length}</span>
+      {:else if item.id === 'organizer' && store.organizerCount}
+        <span class="count">{store.organizerCount}</span>
       {/if}
     </button>
   {/each}

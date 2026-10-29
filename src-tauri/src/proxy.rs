@@ -93,10 +93,10 @@ struct Route {
 }
 
 impl Route {
-    fn new(proxy: Option<Arc<UpstreamProxy>>) -> Result<Self> {
+    fn new(proxy: Option<Arc<UpstreamProxy>>, overrides: upstream::Overrides) -> Result<Self> {
         Ok(Self {
-            h1: upstream::client(proxy.clone(), false)?,
-            auto: upstream::client(proxy.clone(), true)?,
+            h1: upstream::client(proxy.clone(), false, overrides.clone())?,
+            auto: upstream::client(proxy.clone(), true, overrides)?,
             proxy,
         })
     }
@@ -122,8 +122,12 @@ pub struct Ctx {
     pub rules: Rules,
     /// Python extensions that can transform requests/responses.
     pub extensions: crate::extensions::Extensions,
-    /// Address the listener is bound to, for spotting requests aimed at ourselves.
-    listener: RwLock<Option<SocketAddr>>,
+    /// Addresses our listeners are bound to, for spotting requests aimed at ourselves.
+    /// A set because several listeners (different host:port) can run at once.
+    listeners: RwLock<Vec<SocketAddr>>,
+    /// Hostname -> IP overrides applied to direct connections (an app-scoped hosts
+    /// file). Shared with every upstream connector so a change takes effect live.
+    host_overrides: upstream::Overrides,
     /// `user:pass` clients must present, when proxy auth is on.
     auth: RwLock<Option<String>>,
     /// Invisible proxying: accept direct (non-proxy-aware) connections and use
@@ -142,17 +146,19 @@ const H2_BROKEN_TTL: Duration = Duration::from_secs(300);
 
 impl Ctx {
     pub fn new(events: Box<dyn Events>, ca: Arc<CertAuthority>, store: Store) -> Result<Self> {
+        let host_overrides: upstream::Overrides = Arc::new(RwLock::new(HashMap::new()));
         Ok(Self {
             events,
             store,
             ca,
-            route: RwLock::new(Route::new(None)?),
+            route: RwLock::new(Route::new(None, host_overrides.clone())?),
             intercept: Intercept::default(),
             ws_intercept: ws::WsIntercept::default(),
             scope: Scope::default(),
             rules: Rules::default(),
             extensions: crate::extensions::Extensions::default(),
-            listener: RwLock::new(None),
+            listeners: RwLock::new(Vec::new()),
+            host_overrides,
             auth: RwLock::new(None),
             invisible: AtomicBool::new(false),
             writer: OnceLock::new(),
@@ -211,8 +217,22 @@ impl Ctx {
 
     /// Route traffic through `proxy`, or directly when None.
     pub fn set_upstream(&self, proxy: Option<UpstreamProxy>) -> Result<()> {
-        *self.route.write().unwrap() = Route::new(proxy.map(Arc::new))?;
+        *self.route.write().unwrap() = Route::new(proxy.map(Arc::new), self.host_overrides.clone())?;
         Ok(())
+    }
+
+    /// Replace the hostname -> IP overrides for direct connections. Takes effect live:
+    /// the map is shared with every connector, so no route rebuild is needed.
+    pub fn set_host_overrides(&self, overrides: &[crate::config::HostOverride]) {
+        let mut map = self.host_overrides.write().unwrap();
+        map.clear();
+        for o in overrides {
+            let host = o.host.trim().to_ascii_lowercase();
+            let ip = o.ip.trim().to_string();
+            if o.enabled && !host.is_empty() && !ip.is_empty() {
+                map.insert(host, ip);
+            }
+        }
     }
 
     /// Send a request to its target, through the upstream proxy if one is set.
@@ -272,20 +292,28 @@ impl Ctx {
             .is_some_and(|given| constant_time_eq(given.as_bytes(), expected.as_bytes()))
     }
 
-    pub fn set_listener(&self, addr: Option<SocketAddr>) {
-        *self.listener.write().unwrap() = addr;
+    /// Record a bound listener address (deduped), so `is_self` can spot loopbacks.
+    pub fn add_listener(&self, addr: SocketAddr) {
+        let mut v = self.listeners.write().unwrap();
+        if !v.contains(&addr) {
+            v.push(addr);
+        }
     }
 
-    /// True when `uri` points back at our own listener, so forwarding it would
-    /// just send the request to ourselves again.
+    /// Forget a listener address when its listener stops.
+    pub fn remove_listener(&self, addr: &SocketAddr) {
+        self.listeners.write().unwrap().retain(|a| a != addr);
+    }
+
+    /// True when `uri` points back at any of our own listeners, so forwarding it
+    /// would just send the request to ourselves again.
     pub fn is_self(&self, uri: &Uri) -> bool {
-        let Some(listener) = *self.listener.read().unwrap() else {
-            return false;
-        };
-        let default_port = if uri.scheme() == Some(&Scheme::HTTPS) { 443 } else { 80 };
-        if uri.port_u16().unwrap_or(default_port) != listener.port() {
+        let listeners = self.listeners.read().unwrap();
+        if listeners.is_empty() {
             return false;
         }
+        let default_port = if uri.scheme() == Some(&Scheme::HTTPS) { 443 } else { 80 };
+        let uri_port = uri.port_u16().unwrap_or(default_port);
         let host = uri.host().unwrap_or_default().trim_start_matches('[').trim_end_matches(']');
         let ip = if host.eq_ignore_ascii_case("localhost") {
             IpAddr::V4(Ipv4Addr::LOCALHOST)
@@ -295,23 +323,28 @@ impl Ctx {
                 Err(_) => return false,
             }
         };
-        let bound = listener.ip();
-        if bound.is_unspecified() {
-            // 0.0.0.0 / :: accepts on loopback and every local interface.
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || if_addrs::get_if_addrs()
-                    .map(|nics| nics.iter().any(|n| n.ip() == ip))
-                    .unwrap_or(false)
-        } else {
-            ip == bound || (bound.is_loopback() && ip.is_loopback())
-        }
+        listeners.iter().any(|listener| {
+            if uri_port != listener.port() {
+                return false;
+            }
+            let bound = listener.ip();
+            if bound.is_unspecified() {
+                // 0.0.0.0 / :: accepts on loopback and every local interface.
+                ip.is_loopback()
+                    || ip.is_unspecified()
+                    || if_addrs::get_if_addrs()
+                        .map(|nics| nics.iter().any(|n| n.ip() == ip))
+                        .unwrap_or(false)
+            } else {
+                ip == bound || (bound.is_loopback() && ip.is_loopback())
+            }
+        })
     }
 }
 
 pub async fn serve(listener: TcpListener, ctx: Arc<Ctx>) {
-    ctx.set_listener(listener.local_addr().ok());
     if let Ok(addr) = listener.local_addr() {
+        ctx.add_listener(addr);
         ctx.log_info("proxy", format!("listening on {addr}"));
     }
     loop {
@@ -1289,16 +1322,18 @@ mod tests {
         let is_self = |uri: &str| ctx.is_self(&uri.parse().unwrap());
 
         assert!(!is_self("http://127.0.0.1:8080/"), "no listener yet");
-        ctx.set_listener(Some("127.0.0.1:8080".parse().unwrap()));
+        ctx.add_listener("127.0.0.1:8080".parse().unwrap());
         assert!(is_self("http://127.0.0.1:8080/"));
         assert!(is_self("http://localhost:8080/x"));
         assert!(!is_self("http://127.0.0.1:8081/"));
         assert!(!is_self("http://example.com:8080/"));
         assert!(!is_self("http://10.9.8.7:8080/"));
 
-        ctx.set_listener(Some("0.0.0.0:8080".parse().unwrap()));
-        assert!(is_self("http://[::1]:8080/"));
-        assert!(is_self("https://127.0.0.1:8080/"));
+        // A second listener on every interface also makes its port count as self.
+        ctx.add_listener("0.0.0.0:9090".parse().unwrap());
+        assert!(is_self("http://[::1]:9090/"));
+        assert!(is_self("https://127.0.0.1:9090/"));
+        assert!(is_self("http://127.0.0.1:8080/"), "first listener still matches");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

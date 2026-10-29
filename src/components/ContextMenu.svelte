@@ -1,6 +1,9 @@
 <script>
-  // Right-click menu. `items`: { label, run, danger?, disabled?, swatch? } or 'separator'.
-  import { onMount } from 'svelte';
+  // Right-click menu. `items`: { label, run, danger?, disabled?, hint? }, a highlight row
+  // { label, swatches: [{ color | hex, on, run, label?, title? }] } (`color` is a named
+  // highlight, `hex` any CSS colour), a nested menu { label, submenu: [items] } (opens on
+  // hover, click, Enter or ArrowRight), or 'separator'.
+  import { onMount, tick } from 'svelte';
 
   let { x, y, items, onclose } = $props();
   let menu;
@@ -23,6 +26,58 @@
     onclose();
     item.run();
   }
+
+  // ---- Nested menu (one level) ----
+  // `sub` is the open submenu: its parent's index, items and element. Hovering another
+  // item closes it after a short grace period, so a diagonal move from the parent into
+  // the submenu does not snap it shut.
+  let sub = $state(null); // { index, items, el }
+  let subEl = $state();
+  let subPos = $state({ left: 0, top: 0 });
+  let closeTimer;
+
+  function openSub(index, item, el) {
+    clearTimeout(closeTimer);
+    if (item.disabled || !item.submenu?.length || sub?.index === index) return;
+    const r = el.getBoundingClientRect();
+    sub = { index, items: item.submenu, el };
+    subPos = { left: r.right - 2, top: r.top - 5 };
+  }
+  function closeSubSoon() {
+    clearTimeout(closeTimer);
+    closeTimer = setTimeout(() => (sub = null), 200);
+  }
+  function keepSub() {
+    clearTimeout(closeTimer);
+  }
+  // Keyboard: open the submenu and focus its first item; ArrowLeft goes back.
+  async function enterSub(index, item, el) {
+    openSub(index, item, el);
+    await tick();
+    subEl?.querySelector('button:not(:disabled)')?.focus();
+  }
+  function leaveSub() {
+    const parent = sub?.el;
+    sub = null;
+    parent?.focus();
+  }
+  // A new menu (same component, new items) starts with no submenu open.
+  $effect(() => {
+    void items;
+    sub = null;
+  });
+  // Keep the submenu inside the window: flip it to the menu's left, shift it up.
+  $effect(() => {
+    if (!sub || !subEl) return;
+    const r = sub.el.getBoundingClientRect();
+    const w = subEl.offsetWidth;
+    const h = subEl.offsetHeight;
+    let l = r.right - 2;
+    if (l + w + 6 > window.innerWidth) l = Math.max(6, r.left - w + 2);
+    let t = r.top - 5;
+    if (t + h + 6 > window.innerHeight) t = Math.max(6, window.innerHeight - h - 6);
+    subPos = { left: l, top: t };
+  });
 </script>
 
 <svelte:window onmousedown={(e) => !menu?.contains(e.target) && onclose()} onblur={onclose} onresize={onclose} />
@@ -33,25 +88,82 @@
   tabindex="-1"
   bind:this={menu}
   style="left: {left}px; top: {top}px"
-  onkeydown={(e) => e.key === 'Escape' && onclose()}
+  onkeydown={(e) => {
+    // Escape closes only the menu, not a dialog or editor underneath that also listens for it.
+    if (e.key === 'Escape') {
+      e.stopPropagation();
+      onclose();
+    }
+  }}
   oncontextmenu={(e) => e.preventDefault()}
+  onscroll={() => (sub = null)}
 >
-  {#each items as item}
+  {#each items as item, i}
     {#if item === 'separator'}
       <div class="sep"></div>
     {:else if item.swatches}
-      <div class="swatches" role="group" aria-label={item.label}>
+      <div class="swatches" role="group" aria-label={item.label} onpointerenter={closeSubSoon}>
         {#each item.swatches as s}
-          <button class="swatch c-{s.color}" class:on={s.on} title={s.color} aria-label="Highlight {s.color}" onclick={() => pick(s)}></button>
+          <button
+            class="swatch {s.color ? `c-${s.color}` : ''}"
+            class:on={s.on}
+            style={s.hex ? `--hl: ${s.hex}` : undefined}
+            title={s.title ?? s.color}
+            aria-label={s.label ?? `Highlight ${s.color}`}
+            onclick={() => pick(s)}
+          ></button>
         {/each}
       </div>
+    {:else if item.submenu}
+      <button
+        class="item parent"
+        class:open={sub?.index === i}
+        role="menuitem"
+        aria-haspopup="menu"
+        aria-expanded={sub?.index === i}
+        disabled={item.disabled || !item.submenu.length}
+        onpointerenter={(e) => openSub(i, item, e.currentTarget)}
+        onclick={(e) => openSub(i, item, e.currentTarget)}
+        onkeydown={(e) => {
+          if (e.key === 'ArrowRight' || e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            enterSub(i, item, e.currentTarget);
+          }
+        }}
+      >
+        {item.label}
+        <span class="caret" aria-hidden="true">›</span>
+      </button>
     {:else}
-      <button class="item" class:danger={item.danger} role="menuitem" disabled={item.disabled} onclick={() => pick(item)}>
+      <button class="item" class:danger={item.danger} role="menuitem" disabled={item.disabled} onpointerenter={closeSubSoon} onclick={() => pick(item)}>
         {item.label}
         {#if item.hint}<span class="hint">{item.hint}</span>{/if}
       </button>
     {/if}
   {/each}
+
+  {#if sub}
+    <div
+      class="menu sub"
+      role="menu"
+      tabindex="-1"
+      bind:this={subEl}
+      style="left: {subPos.left}px; top: {subPos.top}px"
+      onpointerenter={keepSub}
+      onkeydown={(e) => e.key === 'ArrowLeft' && (e.stopPropagation(), leaveSub())}
+    >
+      {#each sub.items as item}
+        {#if item === 'separator'}
+          <div class="sep"></div>
+        {:else}
+          <button class="item" class:danger={item.danger} role="menuitem" disabled={item.disabled} onclick={() => pick(item)}>
+            {item.label}
+            {#if item.hint}<span class="hint">{item.hint}</span>{/if}
+          </button>
+        {/if}
+      {/each}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -70,6 +182,11 @@
     background: var(--bg-elev);
     box-shadow: 0 10px 30px rgb(0 0 0 / 0.35);
   }
+  /* The nested menu is fixed to the viewport, so the parent's scroll box doesn't clip it. */
+  .menu.sub {
+    z-index: 101;
+    min-width: 180px;
+  }
   .item {
     display: flex;
     justify-content: space-between;
@@ -86,7 +203,8 @@
     align-items: center;
     cursor: pointer;
   }
-  .item:hover:not(:disabled) {
+  .item:hover:not(:disabled),
+  .item.open {
     background: var(--accent-soft);
   }
   .item:disabled {
@@ -99,6 +217,11 @@
   .hint {
     color: var(--text-faint);
     font-size: 11.5px;
+  }
+  .caret {
+    color: var(--text-faint);
+    font-size: 15px;
+    line-height: 1;
   }
   .sep {
     height: 1px;

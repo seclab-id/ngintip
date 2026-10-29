@@ -24,11 +24,19 @@
   let previewImage = $derived(image ?? lazyImage);
   let canPreviewImage = $derived(!!(image || (isImage && loadImage)));
 
-  // Default to Pretty when asked (Repeater): activeMode still falls back to Raw for a
-  // body that can't be prettified (plain text, binary), and the user can toggle freely.
-  // Only the initial value of this constant prop is needed, by design.
+  // Default to Pretty when asked (History, Repeater): activeMode still falls back to Raw
+  // for a body that can't be prettified (plain text, binary), and the user can toggle
+  // freely. Only the initial value of this constant prop is needed, by design.
   // svelte-ignore state_referenced_locally
   let mode = $state(preferPretty ? 'pretty' : 'raw');
+  // True while Pretty is only that default (not picked): then a binary body stays on Raw
+  // instead of fetching its hex dump for every message opened.
+  // svelte-ignore state_referenced_locally
+  let autoPretty = $state(preferPretty);
+  function pick(id) {
+    mode = id;
+    autoPretty = false;
+  }
   let showingFull = $state(false);
   let full = $state(null);
   let loadingFull = $state(false);
@@ -102,7 +110,7 @@
     { id: 'pretty', label: hexAvailable && !pretty ? 'Hex' : 'Pretty', on: !!pretty || hexAvailable },
     { id: 'preview', label: 'Preview', on: !!(canPreviewImage || html) },
   ]);
-  let activeMode = $derived(modes.find((m) => m.id === mode)?.on ? mode : 'raw');
+  let activeMode = $derived(mode === 'pretty' && autoPretty && !pretty ? 'raw' : modes.find((m) => m.id === mode)?.on ? mode : 'raw');
   let shown = $derived.by(() => {
     if (activeMode === 'pretty') {
       if (pretty) return pretty;
@@ -267,7 +275,7 @@
     {#if raw}
       <div class="modes" role="tablist">
         {#each modes as m}
-          <button class="mode" class:active={activeMode === m.id} role="tab" aria-selected={activeMode === m.id} disabled={!m.on} onclick={() => (mode = m.id)}>
+          <button class="mode" class:active={activeMode === m.id} role="tab" aria-selected={activeMode === m.id} disabled={!m.on} onclick={() => pick(m.id)}>
             {m.label}
           </button>
         {/each}
@@ -312,10 +320,10 @@
         <span class="dim">Binary body ({fmtSize(bodyBytes)}, not printable) — hidden to keep the viewer fast.</span>
         <div class="load-actions">
           {#if canPreviewImage}
-            <button class="btn sm" onclick={() => (mode = 'preview')}>Preview image</button>
+            <button class="btn sm" onclick={() => pick('preview')}>Preview image</button>
           {/if}
           {#if hexAvailable}
-            <button class="btn ghost sm" onclick={() => (mode = 'pretty')}>View hex</button>
+            <button class="btn ghost sm" onclick={() => pick('pretty')}>View hex</button>
           {/if}
           <button class="btn ghost sm" onclick={() => (bodyShown = true)}>Load raw</button>
         </div>

@@ -7,7 +7,9 @@
   //  text) plus the new semantic ones:
   //   - Mark:   click a line to box it + add a numbered note (callout or legend).
   //   - Redact: click a value to hide it (on top of the automatic redaction).
-  //  Theme / Layout / Watermark / Export scale on the right; Copy or Save PNG.
+  //  It opens on the neutral Select tool, so nothing is placed until a tool is picked.
+  //  Right-click opens the editor's own menu (undo/redo, act on what is under the pointer,
+  //  switch tool, export). Theme / Layout / Watermark / Export scale on the right.
   // ============================================================================
   import { onMount } from 'svelte';
   import { save } from '@tauri-apps/plugin-dialog';
@@ -19,6 +21,7 @@
     DEFAULT_OPTS, MARK_COLORS, EXPORT_SCALES,
   } from '../lib/capture.js';
   import { prettyBody } from '../lib/message.js';
+  import ContextMenu from './ContextMenu.svelte';
 
   let { source, onclose } = $props();
 
@@ -28,7 +31,7 @@
   // Options that shape the snapshot + export. `source` is a stable prop for one open.
   // svelte-ignore state_referenced_locally
   let opts = $state({ ...DEFAULT_OPTS, theme: appTheme === 'light' ? 'light' : 'dark', title: source?.title ?? '', exportScale: 2 });
-  let tool = $state('mark'); // mark | redact | rect | ellipse | arrow | line | pen | highlight | text
+  let tool = $state('select'); // select | mark | redact | rect | ellipse | arrow | line | pen | highlight | text
   let width = $state(4); // freehand stroke width
   let marks = $state([]); // { col, line, color, note, dx, dy }
   let redacts = $state([]); // { col, line, c1, c2 }
@@ -222,6 +225,8 @@
   function deleteShape(i) { if (i < 0) return; beginChange(); shapes = shapes.filter((_, j) => j !== i); selShape = -1; }
 
   function down(e) {
+    // Only a plain primary click draws; right-click (and macOS Ctrl+click) opens the menu.
+    if (e.button !== 0 || e.ctrlKey) return;
     const p = at(e);
     // Drag a callout note (any tool).
     for (const nr of noteRects) {
@@ -239,7 +244,10 @@
       }
       const i = hitShape(p);
       selShape = i;
-      if (i >= 0) { shapeDrag = { i, mode: 'move', sx: p.x, sy: p.y, orig: clone(shapes[i]), began: false }; hideShape = i; liveShape = clone(shapes[i]); canvas.setPointerCapture(e.pointerId); renderAll(); }
+      if (i >= 0) { shapeDrag = { i, mode: 'move', sx: p.x, sy: p.y, orig: clone(shapes[i]), began: false }; hideShape = i; liveShape = clone(shapes[i]); canvas.setPointerCapture(e.pointerId); renderAll(); return; }
+      // No annotation here: a click on a marked line picks that mark (never creates one).
+      const mi = markAt(hitTest(snap, p.x, p.y));
+      if (mi >= 0) selectMark(mi); else selMark = -1;
       return;
     }
     if (freehand(tool)) {
@@ -261,20 +269,24 @@
     }
     const hit = hitTest(snap, p.x, p.y);
     if (!hit) { selMark = -1; return; }
-    if (tool === 'mark') {
-      // If a mark already boxes this line, just select+edit it instead of stacking.
-      const existing = marks.findIndex((m) => m.col === hit.col && m.line === hit.line);
-      if (existing >= 0) { selectMark(existing); return; }
-      beginChange();
-      marks = [...marks, { col: hit.col, line: hit.line, color: opts.markColor, note: '', dx: 0, dy: 0 }];
-      selectMark(marks.length - 1);
-    } else if (tool === 'redact') {
-      const w = wordAt(snap, hit.col, hit.line, hit.char);
-      if (!w) return;
-      beginChange();
-      const ex = redacts.findIndex((r) => r.col === hit.col && r.line === hit.line && !(w.c2 <= r.c1 || w.c1 >= r.c2));
-      redacts = ex >= 0 ? redacts.filter((_, i) => i !== ex) : [...redacts, { col: hit.col, line: hit.line, c1: w.c1, c2: w.c2 }];
-    }
+    if (tool === 'mark') addMark(hit);
+    else if (tool === 'redact') toggleRedact(hit);
+  }
+  const markAt = (hit) => (hit ? marks.findIndex((m) => m.col === hit.col && m.line === hit.line) : -1);
+  function addMark(hit) {
+    // If a mark already boxes this line, just select+edit it instead of stacking.
+    const existing = markAt(hit);
+    if (existing >= 0) { selectMark(existing); return; }
+    beginChange();
+    marks = [...marks, { col: hit.col, line: hit.line, color: opts.markColor, note: '', dx: 0, dy: 0 }];
+    selectMark(marks.length - 1);
+  }
+  function toggleRedact(hit) {
+    const w = wordAt(snap, hit.col, hit.line, hit.char);
+    if (!w) return;
+    beginChange();
+    const ex = redacts.findIndex((r) => r.col === hit.col && r.line === hit.line && !(w.c2 <= r.c1 || w.c1 >= r.c2));
+    redacts = ex >= 0 ? redacts.filter((_, i) => i !== ex) : [...redacts, { col: hit.col, line: hit.line, c1: w.c1, c2: w.c2 }];
   }
   function move(e) {
     const p = at(e);
@@ -317,9 +329,7 @@
     // Double-click a text annotation to edit it (any tool).
     const ti = hitTextShape(p);
     if (ti >= 0) { editTextShape(ti); return; }
-    const hit = hitTest(snap, p.x, p.y);
-    if (!hit) return;
-    const i = marks.findIndex((m) => m.col === hit.col && m.line === hit.line);
+    const i = markAt(hitTest(snap, p.x, p.y));
     if (i >= 0) selectMark(i);
   }
   function editTextShape(i) {
@@ -338,7 +348,7 @@
     selMark = i;
     requestAnimationFrame(() => {
       const el = document.getElementById('mark-note-' + i);
-      if (el) { el.focus(); el.select?.(); el.scrollIntoView({ block: 'nearest' }); }
+      if (el) { el.focus(); el.select?.(); el.scrollIntoView?.({ block: 'nearest' }); }
     });
   }
   function deleteMark(i) { beginChange(); marks = marks.filter((_, j) => j !== i); if (selMark >= marks.length) selMark = marks.length - 1; }
@@ -356,6 +366,68 @@
     textPop = null;
   }
 
+  // ---- right-click menu (the editor's own, never the browser's) ----
+  // Undo/redo first, then actions for whatever is under the pointer (a mark or its note,
+  // an annotation, a redaction, or a bare line), then tool switching and export.
+  let ctxMenu = $state(null);
+  const TOOL_NAMES = [['select', 'Select'], ['mark', 'Mark'], ['redact', 'Redact'], ...FREE_TOOLS.map((t) => [t.id, t.label])];
+  const noteAt = (p) => noteRects.find((nr) => p.x >= nr.x && p.x <= nr.x + nr.w && p.y >= nr.y && p.y <= nr.y + nr.h)?.i ?? -1;
+  const redactAt = (hit) => (hit ? redacts.findIndex((r) => r.col === hit.col && r.line === hit.line && hit.char >= r.c1 && hit.char < r.c2) : -1);
+  const colorRow = (label, current, set) => ({ label, swatches: MARK_COLORS.map((c) => ({ hex: c, on: current === c, label: `${label} ${c}`, title: c, run: () => set(c) })) });
+  const shapeName = (s) => (FREE_TOOLS.find((t) => t.id === s.type)?.label ?? 'annotation').toLowerCase();
+
+  function onContextMenu(e) {
+    e.preventDefault();
+    if (drawing || shapeDrag || noteDrag) return;
+    const p = at(e);
+    const hit = hitTest(snap, p.x, p.y);
+    let mi = noteAt(p);
+    const si = mi < 0 ? hitShape(p) : -1;
+    if (mi < 0 && si < 0) mi = markAt(hit);
+    const ri = mi < 0 && si < 0 ? redactAt(hit) : -1;
+    const items = [
+      { label: 'Undo', hint: '⌘Z', disabled: !past.length, run: undo },
+      { label: 'Redo', hint: '⌘Y', disabled: !future.length, run: redoAct },
+      'separator',
+    ];
+    if (mi >= 0) {
+      selMark = mi;
+      const m = marks[mi];
+      items.push(
+        { label: `Edit note of mark ${mi + 1}`, run: () => selectMark(mi) },
+        colorRow('Mark colour', m.color, (c) => { beginChange(); marks[mi].color = c; marks = [...marks]; }),
+      );
+      if (m.dx || m.dy) items.push({ label: 'Reset note position', run: () => { beginChange(); marks[mi].dx = 0; marks[mi].dy = 0; marks = [...marks]; } });
+      items.push({ label: `Delete mark ${mi + 1}`, danger: true, run: () => deleteMark(mi) });
+    } else if (si >= 0) {
+      const s = shapes[si];
+      if (s.type === 'text') items.push({ label: 'Edit text', run: () => editTextShape(si) });
+      items.push(
+        { label: 'Select to move / resize', run: () => { setTool('select'); selShape = si; } },
+        colorRow('Colour', s.color, (c) => { beginChange(); shapes[si] = { ...shapes[si], color: c }; shapes = [...shapes]; }),
+        { label: 'Bring to front', disabled: si === shapes.length - 1, run: () => { beginChange(); shapes = [...shapes.filter((_, j) => j !== si), s]; selShape = -1; } },
+        { label: `Delete ${shapeName(s)}`, danger: true, run: () => deleteShape(si) },
+      );
+    } else if (ri >= 0) {
+      items.push({ label: 'Remove redaction', danger: true, run: () => { beginChange(); redacts = redacts.filter((_, j) => j !== ri); } });
+    } else if (hit) {
+      items.push(
+        { label: 'Mark this line', run: () => addMark(hit) },
+        { label: 'Redact this value', disabled: !wordAt(snap, hit.col, hit.line, hit.char), run: () => toggleRedact(hit) },
+      );
+    }
+    if (items.at(-1) !== 'separator') items.push('separator');
+    items.push(
+      { label: 'Tool', submenu: TOOL_NAMES.map(([id, label]) => ({ label, hint: tool === id ? '✓' : '', run: () => setTool(id) })) },
+      { label: 'Clear all annotations', danger: true, disabled: !marks.length && !redacts.length && !shapes.length, run: clearAll },
+      'separator',
+      { label: 'Zoom to fit', disabled: zoom === 0, run: () => (zoom = 0) },
+      { label: 'Copy image', run: copyImg },
+      { label: 'Save PNG…', run: savePng },
+    );
+    ctxMenu = { x: e.clientX, y: e.clientY, items };
+  }
+
   function onWheel(e) {
     if (!(e.metaKey || e.ctrlKey)) return;
     e.preventDefault();
@@ -363,6 +435,8 @@
   }
   function onKey(e) {
     if (textPop) return;
+    // An open menu owns the keyboard; Escape closes it, never the whole editor.
+    if (ctxMenu) { if (e.key === 'Escape') { e.preventDefault(); ctxMenu = null; } return; }
     if (e.key === 'Escape') { e.preventDefault(); if (selShape >= 0) { selShape = -1; return; } onclose(); return; }
     if ((e.key === 'Delete' || e.key === 'Backspace') && tool === 'select' && selShape >= 0) { e.preventDefault(); deleteShape(selShape); return; }
     const mod = e.metaKey || e.ctrlKey;
@@ -458,14 +532,14 @@
       <button class="tbtn" title="Zoom in" onclick={() => (zoom = Math.min(4, zoomFactor() * 1.1))}>+</button>
     </div>
     <div class="spacer"></div>
-    <span class="hint-dim">Cmd/Ctrl + scroll to zoom</span>
+    <span class="hint-dim">Right-click for actions · Cmd/Ctrl + scroll to zoom</span>
   </div>
 
   <div class="body">
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="stage" bind:this={stageEl} onwheel={onWheel}>
       <canvas bind:this={canvas} class="canvas" class:cross={tool !== 'text' && tool !== 'select'} class:textc={tool === 'text'} class:selc={tool === 'select'}
-        onpointerdown={down} onpointermove={move} onpointerup={up} ondblclick={onDblClick}></canvas>
+        onpointerdown={down} onpointermove={move} onpointerup={up} ondblclick={onDblClick} oncontextmenu={onContextMenu}></canvas>
     </div>
 
     <aside class="panel">
@@ -499,7 +573,7 @@
             </div>
           {/each}
         {:else}
-          <p class="marks-empty">Pick <b>Mark</b>, click a line in the snapshot, then type its note here.</p>
+          <p class="marks-empty">Pick <b>Mark</b> and click a line (or right-click a line), then type its note here.</p>
         {/if}
       </div>
 
@@ -534,6 +608,10 @@
     <button class="btn primary sm" onclick={savePng}>Save PNG…</button>
     <button class="btn ghost sm" onclick={onclose}>Close</button>
   </div>
+
+  {#if ctxMenu}
+    <ContextMenu x={ctxMenu.x} y={ctxMenu.y} items={ctxMenu.items} onclose={() => (ctxMenu = null)} />
+  {/if}
 
   {#if textPop}
     <input id="free-text-input" class="note-inp free-text" style="left:{textPop.sx}px; top:{textPop.sy}px" placeholder="Type, then Enter…"

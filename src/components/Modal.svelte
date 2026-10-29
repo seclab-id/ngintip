@@ -1,8 +1,8 @@
 <script>
   // A centered modal dialog. Close via the X button, the Escape key, or a click
   // on the backdrop. Content is a child snippet. With `draggable`, the title bar
-  // can be grabbed to move the modal around.
-  let { title = '', onclose, draggable = false, children } = $props();
+  // can be grabbed to move the modal around. `width` caps its width in px.
+  let { title = '', onclose, draggable = false, width = 660, children } = $props();
 
   let dx = $state(0);
   let dy = $state(0);
@@ -33,7 +33,7 @@
 <svelte:window onkeydown={(e) => e.key === 'Escape' && onclose()} />
 
 <div class="backdrop" role="presentation" onmousedown={(e) => e.target === e.currentTarget && onclose()}>
-  <div class="modal" role="dialog" aria-modal="true" aria-label={title} style="transform: translate({dx}px, {dy}px)">
+  <div class="modal" role="dialog" aria-modal="true" aria-label={title} style="width: min({width}px, 100%); transform: translate({dx}px, {dy}px)">
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <header class="mhead" class:draggable onpointerdown={down} onpointermove={move} onpointerup={up}>
       <span class="mtitle">{title}</span>
@@ -58,7 +58,6 @@
   .modal {
     display: flex;
     flex-direction: column;
-    width: min(660px, 100%);
     max-height: min(82vh, 760px);
     border: 1px solid var(--border);
     border-radius: 12px;

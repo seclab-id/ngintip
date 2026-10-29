@@ -9,10 +9,12 @@ import { inScope } from './scope.js';
 import { BUILTIN_RULES } from './passive-rules.js';
 import { isLoopback } from './net.js';
 import { toCurl } from './curl.js';
-import { generate, MAX_REQUESTS, defaultPayloadConfig } from './intruder.js';
+import { generate, MAX_REQUESTS, defaultPayloadConfig, clearPositions } from './intruder.js';
 import { followRequest, redirectInfo } from './redirect.js';
 import { BRAND, brandKey } from './brand.js';
 import { newInterceptRule, normalizeInterceptRule } from './interceptfilter.js';
+import { normalizeEntry, templateFields, newField, kindInfo, cloneFields } from './vault.js';
+import { dirOf } from './projectName.js';
 
 // Extension scope surfaces (must match Rust's Surface tokens), in canonical order.
 export const EXT_SURFACES = ['proxy', 'interceptor', 'repeater'];
@@ -95,10 +97,22 @@ const PASSIVE_COLLAPSED_SETTING = 'passiveCollapsed';
 const INTERCEPT_FILTER_SETTING = 'interceptFilter';
 // Chrome DevTools Protocol for the launched browser, saved per project (default off).
 const BROWSER_CDP_SETTING = 'browserCdp';
+// Per-project MCP switch ({ enabled }). Absent = off, so a new project starts with MCP off.
+const MCP_SETTING = 'mcp';
 // Persistent browser profiles (cookies/history next to the project) + multi-profile list.
 const BROWSER_PROFILES_SETTING = 'browserProfiles';
+// Organizer: collections of saved requests, per project.
+const ORGANIZER_SETTING = 'organizer';
+// Organizer > Notes, kept under their own key so typing a note never rewrites the
+// (possibly large) saved request/response bodies.
+const ORGANIZER_NOTES_SETTING = 'organizerNotes';
+// Vault: credentials stored (plaintext) with the project; its UI lives in Settings.
+const VAULT_SETTING = 'vault';
 // Where tabs were kept before they moved into the project (webview-wide).
 const LEGACY_REPEATER_KEY = 'intip.repeater';
+
+// Suffix for ids made in the UI (Organizer notes, Vault entries and fields).
+let organizerSeq = 0;
 
 function makeTab(id, fields = {}) {
   return {
@@ -193,9 +207,19 @@ class Store {
   // Match & Replace rules of the open project.
   rules = $state.raw([]);
 
-  proxy = $state({ running: false, host: '127.0.0.1', port: 8080 });
+  // Proxy listeners (several can run at once). Each: { id, host, port, enabled, running }.
+  // The backend (list_listeners / start_listeners / ...) is the source of truth; the
+  // derived `proxy` getter below exposes the primary one for the rest of the UI.
+  listeners = $state([]);
   proxyError = $state(null);
+  // Hostname -> IP overrides for direct connections (an app-scoped hosts file). Lives in
+  // the app config; edited in Settings and pushed with setHostOverrides().
+  hostOverrides = $state([]);
   notice = $state(null);
+  // The open Yes/No warning (see confirm()); ConfirmDialog in App renders it.
+  confirmDialog = $state.raw(null); // { title, message, yes, no, danger, resolve }
+  // The open New project dialog (see askNewProject()); NewProjectDialog in App renders it.
+  newProjectDialog = $state.raw(null); // { dir, resolve }
   // True while a compressed .cegatc project is being decompressed (shows overlay).
   decompressing = $state(false);
   // True while the project is being snapshotted + compressed to disk (shows overlay).
@@ -221,9 +245,40 @@ class Store {
   // Python extensions: engine on/off, interpreter, venv, loaded scripts, setup log.
   extensions = $state({ enabled: false, python: '', venv: '', venvReady: false, list: [], busy: false, log: '' });
 
-  /** Listening where other machines can reach the proxy. */
+  // Organizer (per project): named collections of saved requests (from History /
+  // Repeater / Intruder) plus freeform notes. `viewId` is the collection on screen;
+  // `activeId` is where "Save to Organizer" lands (null = none active). Persisted in the
+  // project (.ngintip) via ORGANIZER_SETTING and ORGANIZER_NOTES_SETTING.
+  organizer = $state({ collections: [], activeId: null, viewId: null, notes: [] });
+  // Credential vault (per project, PLAINTEXT by design): entries kept with the project.
+  // Its UI lives in Settings, not the Organizer. Persisted via the VAULT_SETTING key.
+  vault = $state({ entries: [] });
+
+  /** The primary listener as a simple { running, host, port }, for the parts of the
+   *  UI (Topbar, FlowTable, browser launch) that only care about one address.
+   *  running = any listener up; host/port = the first running one, else the first. */
+  get proxy() {
+    const list = this.listeners;
+    const up = list.filter((l) => l.running);
+    const primary = up[0] ?? list[0];
+    return { running: up.length > 0, host: primary?.host ?? '127.0.0.1', port: primary?.port ?? 8080 };
+  }
+
+  /** Listening where other machines can reach the proxy (any exposed listener). */
   get exposed() {
-    return this.proxy.running && !isLoopback(this.proxy.host);
+    return this.listeners.some((l) => l.running && !isLoopback(l.host));
+  }
+
+  /** Total saved requests across all Organizer collections (for the sidebar badge). */
+  get organizerCount() {
+    return this.organizer.collections.reduce((n, c) => n + c.items.length, 0);
+  }
+
+  /** Short name of the collection "Save to Organizer" writes into ("Saved" when none is
+   *  active), shown as the hint next to that menu item so the target is never a guess. */
+  get organizerTargetHint() {
+    const name = this.organizer.collections.find((c) => c.id === this.organizer.activeId)?.name ?? 'Saved';
+    return name.length > 18 ? `${name.slice(0, 17)}…` : name;
   }
 
   // Raw (non-deep) state: flows are replaced, never mutated in place.
@@ -317,9 +372,12 @@ class Store {
       window.addEventListener('beforeunload', () => {
         this.#flushRepeater();
         this.#flushHistoryFilter();
+        this.#flushNotes();
+        this.#flushVault();
       });
       this.config = await api.getConfig();
       this.mcp = await api.mcpStatus().catch(() => this.mcp);
+      await this.#syncMcp();
       this.browser = { ...this.browser, ...(await api.browserStatus().catch(() => ({}))) };
       this.scope = await api.getScope();
       this.rules = await api.getRules();
@@ -331,9 +389,11 @@ class Store {
       const unlistenMenu = await listen('menu', (e) => this.#onMenu(e.payload));
       const unlistenLog = await listen('log', (e) => this.#onLog(e.payload));
       const unlistenDl = await listen('browser-download', (e) => this.#onBrowserDownload(e.payload));
+      // Organizer edits made over MCP.
+      const unlistenOrg = await listen('organizer', (e) => this.#onOrganizerChanged(e.payload));
       this.logs = await api.getLogs().catch(() => []);
       unlisten = () =>
-        (unlistenFlow(), unlistenHeld(), unlistenWs(), unlistenWsHeld(), unlistenMenu(), unlistenLog(), unlistenDl());
+        (unlistenFlow(), unlistenHeld(), unlistenWs(), unlistenWsHeld(), unlistenMenu(), unlistenLog(), unlistenDl(), unlistenOrg());
 
       const held = await api.interceptStatus();
       this.intercept.enabled = held.enabled;
@@ -346,9 +406,14 @@ class Store {
         wsHeld.pending.forEach((item) => this.#onWsHeld(item));
       }
 
-      const status = await api.proxyStatus();
-      if (status) this.proxy = status;
-      else await this.startProxy();
+      // Bring up the configured listeners (idempotent) and reflect their live state.
+      this.hostOverrides = Array.isArray(this.config.hostOverrides) ? this.config.hostOverrides : [];
+      try {
+        this.listeners = await api.startListeners();
+      } catch (e) {
+        this.proxyError = String(e);
+        this.listeners = await api.listListeners().catch(() => []);
+      }
 
       // Passive-scan any not-yet-scanned flows in the background (trackable via
       // the progress bar + sidebar badge). Only new flows are processed.
@@ -379,19 +444,88 @@ class Store {
     this.flows = incoming.size ? next.concat([...incoming.values()]) : next;
   }
 
-  async startProxy(host = this.proxy.host, port = this.proxy.port) {
+  /** Start all enabled listeners (the global Start / ensure-running). */
+  async startProxy() {
     this.proxyError = null;
     try {
-      this.proxy = await api.startProxy(host, Number(port));
+      this.listeners = await api.startListeners();
     } catch (e) {
-      this.proxy = { running: false, host, port };
       this.proxyError = String(e);
     }
   }
 
+  /** Stop every running listener (the global Stop). */
   async stopProxy() {
-    await api.stopProxy();
-    this.proxy = { ...this.proxy, running: false };
+    try {
+      this.listeners = await api.stopListeners();
+    } catch (e) {
+      this.proxyError = String(e);
+    }
+  }
+
+  /** Add a new listener on `host:port` and start it. */
+  async addListener(host, port) {
+    this.proxyError = null;
+    try {
+      this.listeners = await api.addListener(host, Number(port));
+    } catch (e) {
+      this.proxyError = String(e);
+    }
+  }
+
+  /** Delete a listener by id. */
+  async removeListener(id) {
+    this.proxyError = null;
+    try {
+      this.listeners = await api.removeListener(id);
+    } catch (e) {
+      this.proxyError = String(e);
+    }
+  }
+
+  /** Enable (start) or disable (stop) one listener. */
+  async toggleListener(id, enabled) {
+    this.proxyError = null;
+    try {
+      this.listeners = await api.setListenerEnabled(id, enabled);
+    } catch (e) {
+      this.proxyError = String(e);
+    }
+  }
+
+  /** Edit a listener's host/port (rebinds if it was running). */
+  async updateListener(id, host, port) {
+    this.proxyError = null;
+    try {
+      this.listeners = await api.updateListener(id, host, Number(port));
+    } catch (e) {
+      this.proxyError = String(e);
+    }
+  }
+
+  // ---- Hostname overrides (app config) ----
+  /** Persist and apply the current hostOverrides list to the backend. */
+  async saveHostOverrides() {
+    const clean = this.hostOverrides
+      .map((o) => ({ host: String(o.host ?? '').trim(), ip: String(o.ip ?? '').trim(), enabled: o.enabled !== false }))
+      .filter((o) => o.host || o.ip);
+    try {
+      await api.setHostOverrides(clean);
+    } catch (e) {
+      this.#notify(`Failed to save overrides: ${e}`, true);
+    }
+  }
+  addHostOverride() {
+    // A blank row; not persisted until it has a host/ip (edits commit on blur).
+    this.hostOverrides = [...this.hostOverrides, { host: '', ip: '', enabled: true }];
+  }
+  updateHostOverride(i, patch) {
+    this.hostOverrides = this.hostOverrides.map((o, j) => (j === i ? { ...o, ...patch } : o));
+    this.saveHostOverrides();
+  }
+  removeHostOverride(i) {
+    this.hostOverrides = this.hostOverrides.filter((_, j) => j !== i);
+    this.saveHostOverrides();
   }
 
   async clear() {
@@ -404,19 +538,55 @@ class Store {
     this.#detailInflight.clear();
   }
 
+  // New project: name it first (typed, or a random dated name) in the New project
+  // dialog, then it is saved as <folder>/<name>.ngintip straight away. Returns whether
+  // a project was created (false if the dialog was cancelled).
   async newProject() {
-    const path = await save({
-      title: 'New project',
-      defaultPath: `untitled.${BRAND.ext}`,
-      filters: [{ name: `${BRAND.name} project`, extensions: [BRAND.ext] }],
-    });
-    if (!path) return;
+    const path = await this.askNewProject();
+    if (!path) return false;
     // A new project's file does not exist yet, so it can't be opened (that reads
     // from disk and fails, leaving us stuck on the chooser). Instead start a
     // fresh blank project - which loads state and switches to the main view -
     // then write it to the chosen path so it gains a document on disk.
     await this.blankProject();
-    await this.#runSave(() => api.saveProjectAs(path));
+    return await this.#runSave(() => api.saveProjectAs(path));
+  }
+
+  /** Show the New project dialog; resolves the chosen file path, or null if cancelled. */
+  askNewProject() {
+    this.newProjectDialog?.resolve(null);
+    return new Promise((resolve) => {
+      this.newProjectDialog = { dir: this.#lastProjectDir(), resolve };
+    });
+  }
+
+  answerNewProject(path) {
+    const d = this.newProjectDialog;
+    if (!d) return;
+    this.newProjectDialog = null;
+    d.resolve(path || null);
+  }
+
+  // The folder of the last project saved or opened, offered for the next new one
+  // ('' lets the dialog fall back to the default ~/Documents/Ngintip).
+  #lastProjectDir() {
+    try {
+      const d = localStorage.getItem(brandKey('projectDir'));
+      if (d) return d;
+    } catch {
+      /* storage unavailable */
+    }
+    return dirOf(this.project.path || '');
+  }
+
+  #rememberProjectDir(path) {
+    const d = dirOf(path || '');
+    if (!d) return;
+    try {
+      localStorage.setItem(brandKey('projectDir'), d);
+    } catch {
+      /* storage unavailable */
+    }
   }
 
   async openProject() {
@@ -436,9 +606,12 @@ class Store {
   async blankProject() {
     await this.#flushRepeater();
     await this.#flushHistoryFilter();
+    await this.#flushNotes();
+    await this.#flushVault();
     this.project = await api.blankProject();
     await this.#loadRepeater();
     await this.#loadProjectSettings();
+    await this.#syncMcp();
     this.scope = await api.getScope();
     this.rules = await api.getRules();
     this.#pending = [];
@@ -458,14 +631,18 @@ class Store {
     // Finish writing this project's tabs before the file changes underneath.
     await this.#flushRepeater();
     await this.#flushHistoryFilter();
+    await this.#flushNotes();
+    await this.#flushVault();
     // A .cegat is compressed; show the overlay while it's expanded and opened.
     this.decompressing = true;
     try {
       // Let the overlay paint before the (blocking) backend work runs.
       await new Promise((r) => setTimeout(r, 60));
       this.project = await api.openProject(path);
+      this.#rememberProjectDir(path);
       await this.#loadRepeater();
       await this.#loadProjectSettings();
+      await this.#syncMcp();
       this.scope = await api.getScope();
       this.rules = await api.getRules();
       this.#pending = [];
@@ -662,6 +839,23 @@ class Store {
     this.config.mcp = enabled;
     this.config.mcpPort = this.mcp.port;
     this.config.mcpDocsPath = this.mcp.docsPath;
+    // Remembered by THIS project only; other and new projects keep their own switch.
+    api.setSetting(MCP_SETTING, { enabled: !!this.mcp.running }).catch(() => {});
+  }
+
+  /** MCP is opt-in per project: start or stop the server to match the open project's
+   *  own switch, so it is never carried into another project (a new one has no switch,
+   *  so MCP is off there). Port and docs path stay app-wide. Runs on launch, on a new /
+   *  blank project and on every project switch. */
+  async #syncMcp() {
+    const want = (await api.getSetting(MCP_SETTING).catch(() => null))?.enabled === true;
+    if (want === !!this.mcp.running) return;
+    try {
+      this.mcp = await api.setMcp(want, this.mcp.port || 8082, this.mcp.docsPath || '/docs');
+      this.config.mcp = want;
+    } catch (e) {
+      this.#notify(`MCP server: ${e}`, true);
+    }
   }
 
   // ---- browser engine -------------------------------------------------------
@@ -775,6 +969,36 @@ class Store {
     if (resetIds) await api.resetFlowIds().catch(() => {});
     this.#notify(`Deleted ${ids.length} out-of-scope request${ids.length === 1 ? '' : 's'}${resetIds ? ' and reset flow ids' : ''}`);
     return ids.length;
+  }
+
+  /** Delete History flows after a Yes/No warning. Every UI path that removes flows (the
+   *  Delete key, the row menu) goes through here; deleteFlows itself stays unprompted for
+   *  internal callers that already asked. Resolves true when they were deleted. */
+  async askDeleteFlows(ids) {
+    if (!ids?.length) return false;
+    const n = ids.length;
+    const count = n.toLocaleString('en-US');
+    const all = n > 1 && n === this.flows.length;
+    const ok = await this.confirm({
+      title: n === 1 ? `Delete request #${ids[0]}?` : `Delete ${all ? 'all ' : ''}${count} requests?`,
+      message: `${n === 1 ? 'It is' : 'They are'} removed from History for good, with ${n === 1 ? 'its response and findings' : 'their responses and findings'}. This cannot be undone.`,
+      yes: n === 1 ? 'Yes, delete' : `Yes, delete ${count}`,
+    });
+    if (ok) await this.deleteFlows(ids);
+    return ok;
+  }
+
+  /** The History "Clear" button: wipe every flow, after a Yes/No warning. */
+  async askClear() {
+    const n = this.flows.length;
+    if (!n) return false;
+    const ok = await this.confirm({
+      title: `Clear all ${n.toLocaleString('en-US')} requests from History?`,
+      message: 'Every captured request and response in this project is deleted. This cannot be undone.',
+      yes: 'Yes, clear History',
+    });
+    if (ok) await this.clear();
+    return ok;
   }
 
   async deleteFlows(ids) {
@@ -974,8 +1198,11 @@ class Store {
       // The overlay paints while the (non-blocking, off-thread) save runs.
       await this.#flushRepeater();
       await this.#flushHistoryFilter();
+      await this.#flushNotes();
+      await this.#flushVault();
       const r = await fn();
       this.project = { name: r.name, path: r.path };
+      this.#rememberProjectDir(r.path);
       this.#notify(`Saved ${r.name} - ${r.summary}`);
       return true;
     } catch (e) {
@@ -997,6 +1224,8 @@ class Store {
     this.#autoSaveTimer = null;
     await this.#flushRepeater();
     await this.#flushHistoryFilter();
+    await this.#flushNotes();
+    await this.#flushVault();
     // Closing the project also closes any browser this app launched.
     await api.closeLaunchedBrowsers().catch(() => {});
     this.browser = { ...this.browser, opened: false };
@@ -1012,6 +1241,23 @@ class Store {
   /** Public transient toast (thin wrapper over the internal notifier). */
   notify(text, error = false) {
     this.#notify(text, error);
+  }
+
+  /** Ask before something destructive: shows the Yes/No warning dialog and resolves true
+   *  only on an explicit "Yes" (No, Escape or a click outside resolve false). A newer ask
+   *  replaces one still open, declining it. */
+  confirm({ title, message = '', yes = 'Yes, delete', no = 'No', danger = true } = {}) {
+    this.confirmDialog?.resolve(false);
+    return new Promise((resolve) => {
+      this.confirmDialog = { title, message, yes, no, danger, resolve };
+    });
+  }
+
+  answerConfirm(ok) {
+    const d = this.confirmDialog;
+    if (!d) return;
+    this.confirmDialog = null;
+    d.resolve(ok);
   }
 
   cycleTheme() {
@@ -1466,8 +1712,301 @@ class Store {
     this.addIntruderTab({ target, raw });
   }
 
+  /** Clone an Intruder attack tab (request, type and payload sets). */
+  duplicateIntruderTab(tab) {
+    this.addIntruderTab({
+      name: `${tab.name} copy`,
+      target: tab.target,
+      raw: tab.raw,
+      type: tab.type,
+      sets: JSON.parse(JSON.stringify(tab.sets ?? [])),
+      concurrency: tab.concurrency,
+    });
+  }
+
   stopAttack(tab) {
     tab.running = false;
+  }
+
+  // ---- Organizer: collections of saved requests (per project) ----
+  // The backend owns it (src-tauri/src/organizer.rs), so UI and MCP edits can't overwrite
+  // each other: every edit goes through #organizerOp and comes back as the new state,
+  // and edits made over MCP arrive as an `organizer` event. `rev` orders the states so a
+  // late, older one is never shown. `viewId` (the collection on screen) is UI-only.
+  #organizerRev = -1;
+
+  /** Show a backend state, unless it is older than the one already shown. */
+  #applyOrganizer(state) {
+    if (!state || (state.rev ?? 0) < this.#organizerRev) return;
+    this.#organizerRev = state.rev ?? 0;
+    const collections = Array.isArray(state.collections) ? state.collections : [];
+    const has = (id) => id != null && collections.some((c) => c.id === id);
+    this.organizer.collections = collections;
+    this.organizer.activeId = has(state.activeId) ? state.activeId : null;
+    if (!has(this.organizer.viewId)) this.organizer.viewId = this.organizer.activeId ?? collections[0]?.id ?? null;
+  }
+
+  /** Run one edit on the backend and show the result; null when it failed. */
+  async #organizerOp(action) {
+    try {
+      const r = await api.organizerOp(action);
+      this.#applyOrganizer(r?.state);
+      return r;
+    } catch (e) {
+      this.#notify(`Organizer: ${e}`, true);
+      return null;
+    }
+  }
+
+  /** An edit made elsewhere (MCP): fetch it, unless that revision is already shown. */
+  async #onOrganizerChanged(payload) {
+    if ((payload?.rev ?? Infinity) <= this.#organizerRev) return;
+    this.#applyOrganizer(await api.organizerState().catch(() => null));
+  }
+
+  async #loadOrganizer() {
+    // Each project counts its own revisions.
+    this.#organizerRev = -1;
+    this.organizer.viewId = null;
+    this.#applyOrganizer((await api.organizerState().catch(() => null)) ?? { rev: 0, collections: [], activeId: null });
+    // Older projects kept the notes inside the organizer blob; newer ones under their own key.
+    const savedNotes = await api.getSetting(ORGANIZER_NOTES_SETTING).catch(() => null);
+    const legacy = Array.isArray(savedNotes) ? null : (await api.getSetting(ORGANIZER_SETTING).catch(() => null))?.notes;
+    const rawNotes = Array.isArray(savedNotes) ? savedNotes : Array.isArray(legacy) ? legacy : [];
+    this.organizer.notes = rawNotes.map((n) => ({
+      id: n.id ?? `note-${++organizerSeq}`,
+      title: n.title ?? '',
+      body: n.body ?? '',
+      createdAt: n.createdAt ?? n.updatedAt ?? Date.now(),
+      updatedAt: n.updatedAt ?? Date.now(),
+    }));
+    // Move legacy notes to their own key right away, so no later load depends on the old place.
+    if (Array.isArray(legacy) && legacy.length) await this.#flushNotes(true);
+  }
+
+  /** Create a collection and show it; it becomes the save target when none is active. */
+  async addCollection(name = 'Collection') {
+    const r = await this.#organizerOp({ op: 'createCollection', name: String(name) });
+    if (r?.collectionId) this.organizer.viewId = r.collectionId;
+    return r?.collectionId ?? null;
+  }
+  renameCollection(id, name) {
+    return this.#organizerOp({ op: 'renameCollection', id, name: String(name) });
+  }
+  removeCollection(id) {
+    return this.#organizerOp({ op: 'deleteCollection', id });
+  }
+  /** Show a collection (UI only; where saves go is unchanged). */
+  viewCollection(id) {
+    this.organizer.viewId = id;
+  }
+  /** Make `id` the collection "Save to Organizer" writes into (null = none active). */
+  async setActiveCollection(id) {
+    if (!(await this.#organizerOp({ op: 'setActive', id: id ?? null }))) return;
+    const col = this.organizer.collections.find((c) => c.id === id);
+    this.#notify(col ? `"${col.name}" is now the active collection` : 'No active collection');
+  }
+
+  /** Save `item` ({ name, target, request, response, status, label, note, color, source })
+   *  into `collection` (an id or a name), else the active collection, else "Saved". */
+  async saveRequestToCollection(item, collection = null) {
+    const r = await this.#organizerOp({ op: 'save', collection, item });
+    if (!r) return null;
+    const col = this.organizer.collections.find((c) => c.id === r.collectionId);
+    this.#notify(`Saved to "${col?.name ?? 'collection'}"`);
+    return r.itemId;
+  }
+  removeSavedRequest(itemId) {
+    return this.#organizerOp({ op: 'remove', itemId });
+  }
+  /** Edit a saved request's label / note / colour. */
+  updateSavedRequest(itemId, patch) {
+    return this.#organizerOp({ op: 'update', itemId, ...patch });
+  }
+  /** Move a saved request into another collection (appended at its end). */
+  async moveSavedRequest(itemId, toId) {
+    if (!(await this.#organizerOp({ op: 'move', itemId, to: toId }))) return;
+    const to = this.organizer.collections.find((c) => c.id === toId);
+    this.#notify(`Moved to "${to?.name ?? 'collection'}"`);
+  }
+  /** Replay a saved request in a new Repeater / Intruder tab. */
+  sendSavedToRepeater(item) {
+    this.addRepeaterTab({ name: item.name || item.host, target: item.target, raw: item.request });
+  }
+  sendSavedToIntruder(item) {
+    this.addIntruderTab({ name: item.name || item.host, target: item.target, raw: item.request });
+  }
+
+  /** Save the right-clicked History flow into the Organizer (request + response). */
+  async saveFlowToOrganizer(id, collectionId) {
+    const detail = await api.getFlow(id);
+    if (!detail) return;
+    const { scheme, host, path, status, color, note } = detail.summary;
+    return this.saveRequestToCollection(
+      { name: `${host}${path ?? ''}`, target: `${scheme}://${host}`, request: detail.requestRaw, response: detail.responseRaw, status: status || null, color, note, source: 'history' },
+      collectionId,
+    );
+  }
+  saveRepeaterToOrganizer(tab, collectionId) {
+    return this.saveRequestToCollection(
+      { name: tab.name, target: tab.target, request: tab.raw, response: tab.response?.responseRaw ?? '', status: tab.response?.status ?? null, note: tab.note ?? '', source: 'repeater' },
+      collectionId,
+    );
+  }
+  saveIntruderToOrganizer(tab, collectionId) {
+    return this.saveRequestToCollection({ name: tab.name, target: tab.target, request: tab.raw, response: '', source: 'intruder' }, collectionId);
+  }
+  /** Save one Intruder result (the request actually sent + its response); the payload
+   *  becomes the label. Rows of a large run may not keep their raw: fall back to the
+   *  template without its markers. */
+  saveIntruderResultToOrganizer(tab, r, collectionId) {
+    const payload = (r.payloads ?? []).join(', ');
+    return this.saveRequestToCollection(
+      {
+        name: `${tab.name} #${r.n}`,
+        target: tab.target,
+        request: r.requestRaw || clearPositions(tab.raw),
+        response: r.error ? '' : r.responseRaw ?? '',
+        status: r.status || null,
+        label: payload,
+        source: 'intruder',
+      },
+      collectionId,
+    );
+  }
+
+  // ---- Notes (Organizer > Notes) ----
+  // Edits update the list live; the write to the project is debounced while typing and
+  // flushed on project save / switch / close / unload. Add, duplicate and delete write now.
+  #notesTimer = null;
+  #saveNotesSoon() {
+    clearTimeout(this.#notesTimer);
+    this.#notesTimer = setTimeout(() => this.#flushNotes(), 400);
+  }
+  /** Write pending note edits (or all notes when `force`). */
+  async #flushNotes(force = false) {
+    if (!force && this.#notesTimer == null) return;
+    clearTimeout(this.#notesTimer);
+    this.#notesTimer = null;
+    await api.setSetting(ORGANIZER_NOTES_SETTING, this.organizer.notes).catch(() => {});
+  }
+  addNote() {
+    const now = Date.now();
+    const id = `note-${now}-${++organizerSeq}`;
+    this.organizer.notes = [{ id, title: '', body: '', createdAt: now, updatedAt: now }, ...this.organizer.notes];
+    this.#flushNotes(true);
+    return id;
+  }
+  updateNote(id, patch) {
+    this.organizer.notes = this.organizer.notes.map((n) => (n.id === id ? { ...n, ...patch, updatedAt: Date.now() } : n));
+    this.#saveNotesSoon();
+  }
+  duplicateNote(id) {
+    const src = this.organizer.notes.find((n) => n.id === id);
+    if (!src) return null;
+    const now = Date.now();
+    const copy = { id: `note-${now}-${++organizerSeq}`, title: src.title ? `${src.title} (copy)` : '', body: src.body, createdAt: now, updatedAt: now };
+    this.organizer.notes = [copy, ...this.organizer.notes];
+    this.#flushNotes(true);
+    return copy.id;
+  }
+  removeNote(id) {
+    this.organizer.notes = this.organizer.notes.filter((n) => n.id !== id);
+    this.#flushNotes(true);
+  }
+
+  // ---- Vault (credentials, PLAINTEXT by design; UI lives in Settings > Vault) ----
+  // Edits show immediately; the write to the project is debounced while typing and
+  // flushed on project save / switch / close / unload. Add, duplicate and delete write now.
+  #vaultTimer = null;
+  #saveVaultSoon() {
+    clearTimeout(this.#vaultTimer);
+    this.#vaultTimer = setTimeout(() => this.#flushVault(), 400);
+  }
+  /** Write pending vault edits (or the whole vault when `force`). */
+  async #flushVault(force = false) {
+    if (!force && this.#vaultTimer == null) return;
+    clearTimeout(this.#vaultTimer);
+    this.#vaultTimer = null;
+    await api.setSetting(VAULT_SETTING, { entries: this.vault.entries }).catch(() => {});
+  }
+  async #loadVault() {
+    const s = await api.getSetting(VAULT_SETTING).catch(() => null);
+    let migrated = false;
+    const entries = (Array.isArray(s?.entries) ? s.entries : []).map((e) => {
+      const r = normalizeEntry(e);
+      migrated ||= r.migrated;
+      return r.entry;
+    });
+    this.vault = { entries };
+    // Write the current shape right away: the MCP server and later loads read it.
+    if (migrated) await this.#flushVault(true);
+  }
+  /** A new credential with the fields of a template (login, email, apikey, token, blank). */
+  addVaultEntry(template = 'login') {
+    const now = Date.now();
+    const id = `vault-${now}-${++organizerSeq}`;
+    this.vault.entries = [...this.vault.entries, { id, label: '', role: '', note: '', fields: templateFields(template), createdAt: now, updatedAt: now }];
+    this.#flushVault(true);
+    return id;
+  }
+  /** Edit an entry's label / role / note. */
+  updateVaultEntry(id, patch) {
+    this.vault.entries = this.vault.entries.map((e) => (e.id === id ? { ...e, ...patch, updatedAt: Date.now() } : e));
+    this.#saveVaultSoon();
+  }
+  duplicateVaultEntry(id) {
+    const src = this.vault.entries.find((e) => e.id === id);
+    if (!src) return null;
+    const now = Date.now();
+    const copy = { ...src, id: `vault-${now}-${++organizerSeq}`, label: src.label ? `${src.label} (copy)` : '', fields: cloneFields(src.fields), createdAt: now, updatedAt: now };
+    this.vault.entries = [...this.vault.entries, copy];
+    this.#flushVault(true);
+    return copy.id;
+  }
+  removeVaultEntry(id) {
+    this.vault.entries = this.vault.entries.filter((e) => e.id !== id);
+    this.#flushVault(true);
+  }
+  // Field edits: typing is debounced, structural changes are written right away.
+  #editFields(id, change, soon = false) {
+    this.vault.entries = this.vault.entries.map((e) => (e.id === id ? { ...e, fields: change(e.fields), updatedAt: Date.now() } : e));
+    if (soon) this.#saveVaultSoon();
+    else this.#flushVault(true);
+  }
+  /** Add a field of `kind`; returns its id. */
+  addVaultField(id, kind) {
+    const field = newField(kind);
+    this.#editFields(id, (fields) => [...fields, field]);
+    return field.id;
+  }
+  /** Edit a field's value or name (debounced, as it is typed). */
+  updateVaultField(id, fieldId, patch) {
+    this.#editFields(id, (fields) => fields.map((f) => (f.id === fieldId ? { ...f, ...patch } : f)), true);
+  }
+  /** Turn masking on/off for one field. */
+  setVaultFieldSecret(id, fieldId, secret) {
+    this.#editFields(id, (fields) => fields.map((f) => (f.id === fieldId ? { ...f, secret: !!secret } : f)));
+  }
+  /** Change a field's kind (and its secrecy); a name still at the old default follows. */
+  setVaultFieldKind(id, fieldId, kind) {
+    const k = kindInfo(kind);
+    this.#editFields(id, (fields) =>
+      fields.map((f) => (f.id === fieldId ? { ...f, kind: k.kind, secret: k.secret, name: f.name === kindInfo(f.kind).name ? k.name : f.name } : f)),
+    );
+  }
+  moveVaultField(id, fieldId, delta) {
+    this.#editFields(id, (fields) => {
+      const i = fields.findIndex((f) => f.id === fieldId);
+      const j = i + delta;
+      if (i < 0 || j < 0 || j >= fields.length) return fields;
+      const next = [...fields];
+      [next[i], next[j]] = [next[j], next[i]];
+      return next;
+    });
+  }
+  removeVaultField(id, fieldId) {
+    this.#editFields(id, (fields) => fields.filter((f) => f.id !== fieldId));
   }
 
   // ---- Python extensions ----
@@ -1886,6 +2425,8 @@ class Store {
     await this.#loadInterceptFilter();
     await this.#loadCdp();
     await this.#loadProfiles();
+    await this.#loadOrganizer();
+    await this.#loadVault();
     // Extensions are per-project: the backend loads the open project's set, so
     // refresh the UI list here too (runs on init, blankProject and switchProject).
     await this.#loadExtensions();

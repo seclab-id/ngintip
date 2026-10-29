@@ -6,6 +6,7 @@
   import { isLoopback } from '../lib/net.js';
   import { BRAND } from '../lib/brand.js';
   import SitemapTree from './SitemapTree.svelte';
+  import VaultPanel from './VaultPanel.svelte';
 
   // Sitemap under Scope: browse discovered hosts and click one to add it to scope.
   let sitemapSel = $state(null);
@@ -65,6 +66,7 @@
     { id: 'scope', label: 'Scope' },
     { id: 'rules', label: 'Match & Replace' },
     { id: 'listener', label: 'Proxy listener' },
+    { id: 'vault', label: 'Vault' },
     { id: 'mcp', label: 'MCP server' },
     { id: 'browser', label: 'Browser Engine' },
     { id: 'ca', label: 'CA certificate' },
@@ -204,8 +206,8 @@
     }
   }
 
-  // Warn about the address being configured and the one actually in use.
-  let exposed = $derived(!isLoopback(host) || store.exposed);
+  // Warn when any running listener is reachable off-box.
+  let exposed = $derived(store.exposed);
 
   onMount(async () => {
     [ca, interfaces] = await Promise.all([api.caInfo(), api.listInterfaces()]);
@@ -360,6 +362,7 @@
         {#if s.id === 'listener' && store.proxy.running}<span class="dot on" title="Running"></span>{/if}
         {#if s.id === 'rules' && store.rules.filter((r) => r.enabled).length}<span class="ncount">{store.rules.filter((r) => r.enabled).length}</span>{/if}
         {#if s.id === 'scope' && store.scope.length}<span class="ncount">{store.scope.length}</span>{/if}
+        {#if s.id === 'vault' && store.vault.entries.length}<span class="ncount">{store.vault.entries.length}</span>{/if}
       </button>
     {/each}
   </div>
@@ -547,8 +550,32 @@
   {#if section === 'listener'}
   <section class="card">
     <h2>Proxy listener</h2>
-    <p class="dim">Pick the interface the proxy listens on, or Custom to type an IP. <span class="mono">0.0.0.0</span> = all interfaces (for testing from a phone or other device).</p>
-    <div class="form">
+    <p class="dim">Run one or more listeners at once. <span class="mono">0.0.0.0</span> = all interfaces (reach it from a phone or other device). Disable a row to stop it without losing it.</p>
+
+    {#if store.listeners.length}
+      <div class="listeners">
+        {#each store.listeners as l (l.id)}
+          <div class="lrow" class:off={!l.enabled}>
+            <span class="dot" class:on={l.running} title={l.running ? 'Running' : 'Stopped'}></span>
+            <input class="input mono lhost" value={l.host} spellcheck="false" aria-label="Listener host"
+              onchange={(e) => store.updateListener(l.id, e.currentTarget.value.trim(), l.port)} />
+            <span class="colon">:</span>
+            <input class="input mono lport" type="number" min="1" max="65535" value={l.port} aria-label="Listener port"
+              onchange={(e) => store.updateListener(l.id, l.host, e.currentTarget.value)} />
+            <span class="grow"></span>
+            {#if l.running}{@render copyIcon('l-' + l.id, `${l.host}:${l.port}`)}{/if}
+            <button class="btn sm" class:primary={!l.enabled} onclick={() => store.toggleListener(l.id, !l.enabled)}>
+              {l.enabled ? 'Disable' : 'Enable'}
+            </button>
+            <button class="btn ghost sm icon-btn lremove" title="Remove listener" aria-label="Remove listener" onclick={() => store.removeListener(l.id)}>✕</button>
+          </div>
+        {/each}
+      </div>
+    {:else}
+      <p class="dim">No listeners. Add one below.</p>
+    {/if}
+
+    <div class="form add-listener">
       <label>
         <span>Interface</span>
         <select class="input select" value={custom ? '__custom' : host} onchange={pickInterface}>
@@ -568,16 +595,9 @@
         <span>Port</span>
         <input class="input mono" type="number" min="1" max="65535" bind:value={port} />
       </label>
-      <button class="btn primary" onclick={() => store.startProxy(host, port)}>
-        {store.proxy.running ? 'Restart' : 'Start'}
-      </button>
+      <button class="btn primary" onclick={() => store.addListener(host, port)}>Add listener</button>
     </div>
-    {#if store.proxy.running}
-      <p class="dim status-line">
-        Listening on <span class="mono">{store.proxy.host}:{store.proxy.port}</span>
-        {@render copyIcon('proxyaddr', `${store.proxy.host}:${store.proxy.port}`)}
-      </p>
-    {/if}
+
     {#if store.proxyError}<p class="error">{store.proxyError}</p>{/if}
     {#if exposed}
       <div class="warn" class:danger={!store.config.auth.enabled}>
@@ -601,6 +621,39 @@
       connections are routed by TLS SNI or the Host header instead of needing CONNECT. TLS targets are assumed on port 443.
     </p>
   </section>
+  {/if}
+
+  {#if section === 'listener'}
+  <section class="card">
+    <h2>Hostname overrides</h2>
+    <p class="dim">
+      Force a hostname to a specific IP on direct connections, like an app-scoped <span class="mono">/etc/hosts</span>.
+      The TLS SNI and the certificate {BRAND.name} presents keep the real hostname, so the target still sees the right name.
+      Not applied when an upstream proxy is set (that proxy resolves the host).
+    </p>
+    {#if store.hostOverrides.length}
+      <div class="overrides">
+        {#each store.hostOverrides as o, i (i)}
+          <div class="orow" class:off={o.enabled === false}>
+            <input class="input mono ohost" value={o.host} placeholder="api.example.com" spellcheck="false" aria-label="Hostname"
+              onchange={(e) => store.updateHostOverride(i, { host: e.currentTarget.value.trim() })} />
+            <span class="arrow">→</span>
+            <input class="input mono oip" value={o.ip} placeholder="127.0.0.1" spellcheck="false" aria-label="IP address"
+              onchange={(e) => store.updateHostOverride(i, { ip: e.currentTarget.value.trim() })} />
+            <label class="check tiny"><input type="checkbox" checked={o.enabled !== false} onchange={(e) => store.updateHostOverride(i, { enabled: e.currentTarget.checked })} /> On</label>
+            <button class="btn ghost sm icon-btn lremove" title="Remove override" aria-label="Remove override" onclick={() => store.removeHostOverride(i)}>✕</button>
+          </div>
+        {/each}
+      </div>
+    {/if}
+    <div class="form">
+      <button class="btn sm" onclick={() => store.addHostOverride()}>+ Add override</button>
+    </div>
+  </section>
+  {/if}
+
+  {#if section === 'vault'}
+    <VaultPanel />
   {/if}
 
   {#if section === 'listener'}
@@ -678,7 +731,7 @@
     <div class="form">
       <label class="check">
         <input type="checkbox" checked={store.mcp.running} onchange={(e) => toggleMcp(e.currentTarget.checked)} />
-        Enable MCP server
+        Enable MCP server <span class="dim">for this project</span>
       </label>
       <label>
         <span>Port</span>
@@ -701,6 +754,10 @@
     {:else}
       <p class="dim status-line">Off.</p>
     {/if}
+    <p class="dim hint-line">
+      The switch belongs to this project: reopening it restores its state, while other projects and every
+      new project start with MCP off. Port and docs path are shared by all projects.
+    </p>
     <p class="dim hint-line">
       Point an MCP client (e.g. Claude Desktop, or any HTTP JSON-RPC client) at the endpoint. Tools:
       <span class="mono">history_list/get/search</span>, <span class="mono">history_set_note/set_color/get_color</span>,
@@ -1335,6 +1392,66 @@
     color: var(--text);
     font-size: 12.5px;
     line-height: 1.5;
+  }
+  /* Listeners table */
+  .listeners,
+  .overrides {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 10px 0;
+  }
+  .lrow,
+  .orow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .lrow.off,
+  .orow.off {
+    opacity: 0.5;
+  }
+  .dot {
+    flex: none;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--text-faint, #666);
+  }
+  .dot.on {
+    background: var(--green, #46c46a);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--green, #46c46a) 25%, transparent);
+  }
+  .lhost {
+    width: 150px;
+  }
+  .lport {
+    width: 82px;
+  }
+  .colon {
+    color: var(--text-dim);
+    margin: 0 -4px;
+  }
+  .lremove {
+    color: var(--red);
+  }
+  .add-listener {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+  .ohost {
+    width: 220px;
+  }
+  .oip {
+    width: 150px;
+  }
+  .arrow {
+    color: var(--text-dim);
+  }
+  .check.tiny {
+    font-size: 12px;
+    gap: 4px;
   }
   .warn.danger {
     border-color: color-mix(in srgb, var(--red) 50%, transparent);

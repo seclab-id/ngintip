@@ -98,8 +98,16 @@
   function copySelected() {
     store.copyPassiveFindings(store.passiveFindings.filter((f) => selected.has(f.key)));
   }
-  function deleteSelected() {
+  async function deleteSelected() {
+    const n = selected.size;
+    if (!(await store.confirm({ title: `Delete ${n} finding${n === 1 ? '' : 's'}?`, message: 'A later scan will not bring them back. This cannot be undone.' }))) return;
     store.deletePassiveFindings(selected);
+    selected = new Set();
+  }
+  async function clearAll() {
+    const n = store.passiveFindings.length;
+    if (!(await store.confirm({ title: `Clear all ${n.toLocaleString('en-US')} findings?`, message: 'Every passive finding in this project is removed (run Scan history again to rebuild them).', yes: 'Yes, clear' }))) return;
+    store.clearPassive();
     selected = new Set();
   }
 
@@ -124,7 +132,7 @@
       <input type="checkbox" checked={store.passiveInScopeOnly} onchange={(e) => store.setPassiveInScopeOnly(e.currentTarget.checked)} />
       In scope only
     </label>
-    <button class="btn ghost sm" onclick={() => store.clearPassive()} disabled={p.scanning || !store.passiveFindings.length}>Clear</button>
+    <button class="btn ghost sm" onclick={clearAll} disabled={p.scanning || !store.passiveFindings.length}>Clear</button>
     <button class="btn ghost sm" class:on={rulesOpen} onclick={() => (rulesOpen = !rulesOpen)}>
       Rules{store.passiveRules.length ? ` (+${store.passiveRules.length})` : ''}
     </button>

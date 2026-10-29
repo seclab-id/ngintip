@@ -22,7 +22,7 @@
   async function proceed() {
     const action = confirm;
     confirm = null;
-    if (action === 'new') await store.blankProject();
+    if (action === 'new') await store.newProject(); // name it, then it is saved
     else if (action === 'close') await store.closeProject();
   }
   async function saveThenProceed() {

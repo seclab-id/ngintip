@@ -13,6 +13,106 @@ const flows = [
 ];
 // Fake Repeater history, like the repeater_history table.
 const sent = [];
+// Paths handed to save_project_as, and files that "exist" for path_exists.
+const savedAs = [];
+const existing = new Set();
+// Fake proxy listeners (the backend returns the full status list from every mutation).
+let mockListeners = [{ id: 'default', host: '0.0.0.0', port: 8080, enabled: true, running: true }];
+// Fake Organizer: the backend owns it (src-tauri/src/organizer.rs); same ops and rules.
+const org = { rev: 0, collections: [], activeId: null };
+let orgSeq = 0;
+function orgFind(itemId) {
+  for (const c of org.collections) {
+    const it = c.items.find((i) => i.id === itemId);
+    if (it) return [c, it];
+  }
+  return [null, null];
+}
+function orgApply(a) {
+  const hasActive = () => org.collections.some((c) => c.id === org.activeId);
+  const create = (name) => {
+    const c = { id: `col-${++orgSeq}`, name: String(name ?? '').trim() || 'Collection', items: [] };
+    org.collections.push(c);
+    if (!hasActive()) org.activeId = c.id;
+    return c;
+  };
+  let collectionId = null;
+  let itemId = null;
+  switch (a.op) {
+    case 'createCollection': {
+      const c = create(a.name);
+      if (a.activate) org.activeId = c.id;
+      collectionId = c.id;
+      break;
+    }
+    case 'renameCollection': {
+      const c = org.collections.find((x) => x.id === a.id);
+      if (!c) throw `no collection ${a.id}`;
+      if (String(a.name).trim()) c.name = String(a.name).trim();
+      collectionId = c.id;
+      break;
+    }
+    case 'deleteCollection':
+      if (!org.collections.some((c) => c.id === a.id)) throw `no collection ${a.id}`;
+      org.collections = org.collections.filter((c) => c.id !== a.id);
+      if (org.activeId === a.id) org.activeId = null;
+      break;
+    case 'setActive':
+      if (a.id != null && !org.collections.some((c) => c.id === a.id)) throw `no collection ${a.id}`;
+      org.activeId = a.id ?? null;
+      collectionId = a.id ?? null;
+      break;
+    case 'save': {
+      const want = String(a.collection ?? '').trim();
+      let c = want
+        ? (org.collections.find((x) => x.id === want || x.name.toLowerCase() === want.toLowerCase()) ?? create(want))
+        : org.collections.find((x) => x.id === org.activeId);
+      if (!c) {
+        c = org.collections.find((x) => x.name === 'Saved') ?? create('Saved');
+        org.activeId = c.id;
+      }
+      const it = a.item ?? {};
+      const [method = 'GET', path = '/'] = String(it.request ?? '').split('\n')[0].trim().split(/\s+/).filter(Boolean);
+      const host = String(it.target ?? '').replace(/^[a-z]+:\/\//i, '').split('/')[0];
+      const saved = { id: `req-${++orgSeq}`, name: it.name || `${method} ${host}${path}`, method, host, path, target: it.target ?? '', request: it.request ?? '', response: it.response ?? '', status: it.status ?? null, label: it.label ?? '', note: it.note ?? '', color: it.color ?? '', source: it.source ?? '', savedAt: Date.now() };
+      c.items.push(saved);
+      collectionId = c.id;
+      itemId = saved.id;
+      break;
+    }
+    case 'update': {
+      const [c, it] = orgFind(a.itemId);
+      if (!it) throw `no saved request ${a.itemId}`;
+      for (const k of ['label', 'note', 'color']) if (a[k] != null) it[k] = a[k];
+      collectionId = c.id;
+      itemId = it.id;
+      break;
+    }
+    case 'remove': {
+      const [c] = orgFind(a.itemId);
+      if (!c) throw `no saved request ${a.itemId}`;
+      c.items = c.items.filter((i) => i.id !== a.itemId);
+      collectionId = c.id;
+      break;
+    }
+    case 'move': {
+      const to = org.collections.find((x) => x.id === a.to);
+      const [from, it] = orgFind(a.itemId);
+      if (!to || !it) throw 'bad move';
+      if (from !== to) {
+        from.items = from.items.filter((i) => i.id !== a.itemId);
+        to.items.push(it);
+      }
+      collectionId = to.id;
+      itemId = it.id;
+      break;
+    }
+    default:
+      throw `unknown op ${a.op}`;
+  }
+  org.rev += 1;
+  return { state: structuredClone(org), collectionId, itemId };
+}
 const backend = {
   send_raw: ({ target, raw, tab }) => {
     const line = raw.split('\n')[0];
@@ -28,9 +128,11 @@ const backend = {
   clear_repeater_history: () => null,
   project_info: () => ({ name: 'demo', path: '/tmp/demo.intip' }),
   blank_project: () => ({ name: 'scratch', path: '' }),
-  save_project_as: () => ({ name: 'demo', path: '/tmp/demo.cegat', rawSize: 1048576, compressedSize: 131072, percent: 88, summary: '1.0 MB -> 128.0 KB (88% smaller)' }),
+  save_project_as: ({ path }) => (savedAs.push(path), { name: 'demo', path: '/tmp/demo.cegat', rawSize: 1048576, compressedSize: 131072, percent: 88, summary: '1.0 MB -> 128.0 KB (88% smaller)' }),
+  default_project_dir: () => '/Users/me/Documents/Ngintip',
+  path_exists: ({ path }) => existing.has(path),
   save_project: () => ({ name: 'demo', path: '/tmp/demo.cegat', rawSize: 1048576, compressedSize: 131072, percent: 88, summary: '1.0 MB -> 128.0 KB (88% smaller)' }),
-  get_config: () => ({ auth: { enabled: false, username: '', password: '' }, upstream: '', invisible: false, autoContentLength: true }),
+  get_config: () => ({ auth: { enabled: false, username: '', password: '' }, upstream: '', invisible: false, autoContentLength: true, hostOverrides: [] }),
   set_auto_content_length: () => null,
   get_scope: () => ['*.example.com'],
   set_scope: ({ patterns }) => patterns,
@@ -51,7 +153,16 @@ const backend = {
   logs: () => [],
   clear_logs: () => null,
   intercept_status: () => ({ enabled: true, responses: false, pending: [] }),
-  proxy_status: () => ({ running: true, host: '0.0.0.0', port: 8080 }),
+  list_listeners: () => mockListeners,
+  start_listeners: () => (mockListeners = mockListeners.map((l) => (l.enabled ? { ...l, running: true } : l))),
+  stop_listeners: () => (mockListeners = mockListeners.map((l) => ({ ...l, running: false }))),
+  add_listener: ({ host, port }) => (mockListeners = [...mockListeners, { id: `l${mockListeners.length + 1}`, host, port, enabled: true, running: true }]),
+  remove_listener: ({ id }) => (mockListeners = mockListeners.filter((l) => l.id !== id)),
+  set_listener_enabled: ({ id, enabled }) => (mockListeners = mockListeners.map((l) => (l.id === id ? { ...l, enabled, running: enabled } : l))),
+  update_listener: ({ id, host, port }) => (mockListeners = mockListeners.map((l) => (l.id === id ? { ...l, host, port } : l))),
+  set_host_overrides: () => null,
+  organizer_state: () => structuredClone(org),
+  organizer_op: ({ action }) => orgApply(action),
   get_flow: ({ id }) => ({
     summary: flows.find((f) => f.id === id),
     requestRaw: `GET /v1/users?id=1 HTTP/2\nHost: api.example.com\nAccept: */*\n\n`,
@@ -114,7 +225,7 @@ vi.mock('@tauri-apps/api/event', () => ({
   }),
 }));
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(), save: vi.fn() }));
-const { save: saveDialog } = await import('@tauri-apps/plugin-dialog');
+const { open: openDialog, save: saveDialog } = await import('@tauri-apps/plugin-dialog');
 
 const { default: App } = await import('./App.svelte');
 const { store } = await import('./lib/store.svelte.js');
@@ -135,6 +246,13 @@ const click = async (el) => {
 };
 const buttonWith = (label) => $$('button').find((b) => b.textContent.trim().startsWith(label));
 const buttonLabeled = (label) => $$('button').find((b) => b.getAttribute('aria-label') === label);
+// The Yes/No warning shown before anything destructive (ConfirmDialog).
+const dialog = () => $('[role="alertdialog"]');
+const answer = async (yes) => {
+  expect(dialog()).toBeTruthy();
+  await click(dialog().querySelector(yes ? '.yes' : '.no'));
+  expect(dialog()).toBeNull();
+};
 
 let app;
 const errors = [];
@@ -293,6 +411,28 @@ describe('UI smoke test', () => {
     await settle();
   });
 
+  it('history opens request/response on Pretty by default; a picked Raw sticks', async () => {
+    store.view = 'history';
+    await settle();
+    const row = (path) => $$('.table .row:not(.head)').find((r) => r.textContent.includes(path));
+    const res = () => $$('.msgs .panel')[1];
+    const active = () => res().querySelector('.mode.active').textContent.trim();
+    await click(row('/v1/users'));
+    await settle();
+    // The JSON response opens formatted.
+    expect(active()).toBe('Pretty');
+    expect(res().querySelector('pre.code').textContent).toContain('"name": "a"');
+    // Picking Raw is respected, also for the next request opened.
+    await click([...res().querySelectorAll('.mode')].find((b) => b.textContent.trim() === 'Raw'));
+    expect(active()).toBe('Raw');
+    expect(res().querySelector('pre.code').textContent).toContain('{"id":1,"name":"a"}');
+    await click(row('/v1/login'));
+    await settle();
+    expect(active()).toBe('Raw');
+    store.selectedId = null;
+    await settle();
+  });
+
   it('defers a binary response body behind a Load button (no auto-render)', async () => {
     store.view = 'history';
     await settle();
@@ -315,9 +455,13 @@ describe('UI smoke test', () => {
         : orig({ id });
     listeners.flow({ payload: { id: 100, ts: 9, method: 'GET', scheme: 'https', host: 'api.example.com', path: '/logo.png', status: 200, length: 10, reqLength: 0, mime: 'image/png', durationMs: 2, error: null, note: '', color: '', streaming: false } });
     await settle();
+    const hexCalls = calls.filter((c) => c === 'flow_hex').length;
     await click($$('.table .row:not(.head)').find((r) => r.textContent.includes('/logo.png')));
     await settle();
     const res = $$('.msgs .panel')[1];
+    // History defaults to Pretty, but that default never pulls a binary body's hex dump.
+    expect(res.querySelector('.mode.active').textContent.trim()).toBe('Raw');
+    expect(calls.filter((c) => c === 'flow_hex').length).toBe(hexCalls);
     // The body isn't rendered; a placeholder with load actions is shown instead.
     expect(res.querySelector('.load-body')).toBeTruthy();
     expect(res.textContent).toContain('Binary body');
@@ -944,6 +1088,67 @@ describe('UI smoke test', () => {
     expect($('.overlay')).toBeNull();
   });
 
+  it('snapshot editor: opens on Select, right-click is its own menu, right-click never places a mark', async () => {
+    store.view = 'repeater';
+    await settle();
+    await click(buttonLabeled('Capture screenshot'));
+    const canvas = $('.overlay canvas');
+    const toolBtn = (name) => [...document.querySelectorAll('.overlay .bar .tbtn')].find((b) => b.textContent.trim().endsWith(name) || b.getAttribute('aria-label') === name);
+    const marksHead = () => $('.overlay .marks-head').textContent.trim();
+    // Neutral by default: the Select arrow is active, not Mark.
+    expect(toolBtn('Select').classList.contains('active')).toBe(true);
+    expect(toolBtn('Mark').classList.contains('active')).toBe(false);
+
+    // Right-click on the backdrop: the editor's menu, not the browser's.
+    const ev = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 1, clientY: 1 });
+    canvas.dispatchEvent(ev);
+    await settle();
+    expect(ev.defaultPrevented).toBe(true);
+    const labels = () => $$('.menu .item').map((b) => b.textContent.trim());
+    for (const l of ['Undo', 'Redo', 'Tool', 'Clear all annotations', 'Zoom to fit', 'Copy image', 'Save PNG…']) {
+      expect(labels().some((t) => t.startsWith(l))).toBe(true);
+    }
+    expect($$('.menu .item').find((b) => b.textContent.trim().startsWith('Undo')).disabled).toBe(true);
+    // Escape closes only the menu; the editor stays open.
+    $('.menu').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await settle();
+    expect($('.menu')).toBeNull();
+    expect($('.overlay')).toBeTruthy();
+
+    // Tool submenu switches to Mark.
+    canvas.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 1, clientY: 1 }));
+    await settle();
+    const toolParent = $$('.menu .item.parent').find((b) => b.textContent.includes('Tool'));
+    toolParent.dispatchEvent(new PointerEvent('pointerenter'));
+    await settle();
+    await click([...document.querySelectorAll('.menu.sub .item')].find((b) => b.textContent.trim().startsWith('Mark')));
+    expect(toolBtn('Mark').classList.contains('active')).toBe(true);
+
+    // Sweep the canvas: a right button press never places a mark, a left click does.
+    const sweep = (button) => {
+      for (let x = 1; x < 120; x += 4) {
+        for (let y = 1; y < 80; y += 3) canvas.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, button, clientX: x, clientY: y }));
+      }
+    };
+    sweep(2);
+    await settle();
+    expect(marksHead()).toBe('Marks');
+    sweep(0);
+    await settle();
+    expect(marksHead()).toMatch(/^Marks \(\d+\)$/);
+
+    // ...and right-click Undo takes the last mark back.
+    const before = Number(marksHead().match(/\d+/)[0]);
+    canvas.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 1, clientY: 1 }));
+    await settle();
+    await click($$('.menu .item').find((b) => b.textContent.trim().startsWith('Undo')));
+    expect(marksHead()).toBe(before > 1 ? `Marks (${before - 1})` : 'Marks');
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await settle();
+    expect($('.overlay')).toBeNull();
+  });
+
   it('decodes in Decoder with a multi-step recipe', async () => {
     store.view = 'decoder';
     store.decoder.recipe = [];
@@ -1187,6 +1392,7 @@ describe('UI smoke test', () => {
     for (const l of [...store.logs]) rowFor(l.message).querySelector('.rowcheck').dispatchEvent(new Event('change', { bubbles: true }));
     await settle();
     await click(buttonWith('Delete ('));
+    await answer(true);
     expect(store.logs.length).toBe(0);
   });
 
@@ -1339,6 +1545,7 @@ describe('UI smoke test', () => {
     store.view = 'passive';
     await settle();
     await click(buttonWith('Clear'));
+    await answer(true);
     expect(store.passiveFindings.length).toBe(0);
   });
 
@@ -1403,6 +1610,7 @@ describe('UI smoke test', () => {
     const firstGroupCount = $$('.group')[0].querySelectorAll('.gitem').length;
     await click($('.group .gcheck'));
     await click(buttonWith('Delete ('));
+    await answer(true);
     expect(store.passiveFindings.length).toBe(before - firstGroupCount);
     // Deletions persist to the project.
     expect(calls).toContain('set_setting');
@@ -1526,7 +1734,7 @@ describe('UI smoke test', () => {
     store.chooser = false; // restore for the remaining assertions
     await settle();
 
-    // New project → modal → "Save & continue" saves, then starts a blank project.
+    // New project → modal → "Save & continue" saves, then asks for the new name.
     await click($('.project'));
     await click($$('.menu .mi').find((b) => b.textContent.trim() === 'New project'));
     expect($('[role="dialog"]')).toBeTruthy();
@@ -1534,27 +1742,96 @@ describe('UI smoke test', () => {
     await click(buttonWith('Save & continue'));
     await settle();
     expect(calls).toContain('save_project');
+    expect(calls).not.toContain('blank_project');
+    expect($('#np-name')).toBeTruthy();
+    $('#np-name').value = 'next one';
+    $('#np-name').dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    $('form.np').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await settle();
     expect(calls).toContain('blank_project');
+    expect(savedAs.at(-1)).toMatch(/\/next_one\.ngintip$/);
     expect(store.chooser).toBe(false);
   });
 
-  it('onboarding "New project" creates and enters the project after naming it', async () => {
-    // Back to the onboarding chooser.
+  it('onboarding "New project" asks for a name and saves it as name_with_underscores.ngintip', async () => {
+    // Back to the onboarding chooser; no folder used before, so the default one is offered.
     store.chooser = true;
+    store.project = { name: '', path: '' };
+    localStorage.removeItem('ngintip.projectDir');
     await settle();
     saveDialog.mockClear();
-    saveDialog.mockResolvedValueOnce('/tmp/fresh.cegat');
     calls.length = 0;
-    // The chooser's "New project…" button drives store.newProject().
-    await store.newProject();
+    await click($$('.chooser button').find((b) => b.textContent.includes('New project')));
+    const name = $('#np-name');
+    expect(name).toBeTruthy();
+    expect(document.activeElement).toBe(name);
+    expect($('.np .dir').textContent).toBe('/Users/me/Documents/Ngintip');
+    // Nothing typed: no file name yet, Create is off.
+    const create = () => buttonWith('Create project');
+    expect(create().disabled).toBe(true);
+    expect($('.np .file').textContent).toContain('Type a name or press Random');
+
+    name.value = 'project pentest x';
+    name.dispatchEvent(new Event('input', { bubbles: true }));
     await settle();
+    expect($('.np .file').textContent).toBe('project_pentest_x.ngintip');
+    expect(create().disabled).toBe(false);
+    await click(create());
     // It must create a blank project and WRITE it (not open a non-existent file),
-    // then advance to the main view.
+    // without the native save dialog, then advance to the main view.
+    expect(saveDialog).not.toHaveBeenCalled();
     expect(calls).toContain('blank_project');
-    expect(calls).toContain('save_project_as');
     expect(calls).not.toContain('open_project');
+    expect(savedAs.at(-1)).toBe('/Users/me/Documents/Ngintip/project_pentest_x.ngintip');
+    expect($('#np-name')).toBeNull();
     expect(store.chooser).toBe(false);
     expect(store.project.path).toBe('/tmp/demo.cegat');
+  });
+
+  it('New project: Random gives a dated name, Change… picks the folder, an existing file asks first', async () => {
+    store.chooser = true;
+    await settle();
+    await click($$('.chooser button').find((b) => b.textContent.includes('New project')));
+    // The folder of the last saved project is offered next time.
+    expect($('.np .dir').textContent).toBe('/tmp');
+
+    await click(buttonWith('Random'));
+    expect($('#np-name').value).toMatch(/^\d{2}-\d{2}-\d{4}-[a-z0-9]{6}$/);
+    expect($('.np .file').textContent).toBe(`${$('#np-name').value}.ngintip`);
+
+    openDialog.mockResolvedValueOnce('/work/clients');
+    await click(buttonWith('Change…'));
+    expect(openDialog).toHaveBeenLastCalledWith(expect.objectContaining({ directory: true }));
+    expect($('.np .dir').textContent).toBe('/work/clients');
+
+    // That name is taken there: Replace? No keeps the dialog open for another name.
+    const n = savedAs.length;
+    $('#np-name').value = 'taken';
+    $('#np-name').dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    existing.add('/work/clients/taken.ngintip');
+    await click(buttonWith('Create project'));
+    expect(dialog().textContent).toContain('Replace "taken.ngintip"?');
+    await answer(false);
+    expect($('#np-name')).toBeTruthy();
+    expect(savedAs.length).toBe(n);
+    // Yes replaces it.
+    await click(buttonWith('Create project'));
+    await answer(true);
+    expect(savedAs.at(-1)).toBe('/work/clients/taken.ngintip');
+    expect(store.chooser).toBe(false);
+    existing.clear();
+
+    // Cancel (Escape) creates nothing.
+    calls.length = 0;
+    const p = store.newProject();
+    await settle();
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    expect(await p).toBe(false);
+    await settle();
+    expect($('#np-name')).toBeNull();
+    expect(calls).not.toContain('blank_project');
   });
 
   it('right-clicks the request/response detail for the flow actions', async () => {
@@ -1782,6 +2059,74 @@ describe('UI smoke test', () => {
     store.selectedId = null;
   });
 
+  it('history: Ctrl+A then Delete (or Clear) asks Yes/No first; only Yes deletes', async () => {
+    const saved = store.flows;
+    const n = saved.length;
+    store.view = 'history';
+    await settle();
+    const grid = $('.viewport[role="grid"]');
+    const key = (k, mod = {}) => grid.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true, ...mod }));
+    const deletes = () => calls.filter((c) => c === 'delete_flows' || c === 'clear_flows').length;
+    const before = deletes();
+
+    // The blunder: select everything, hit Delete -> a warning, nothing deleted yet.
+    grid.focus();
+    key('a', { ctrlKey: true });
+    await settle();
+    expect(store.selectedIds.size).toBe(n);
+    key('Delete');
+    await settle();
+    expect(dialog().textContent).toContain(`Delete all ${n} requests?`);
+    expect(dialog().textContent).toContain('cannot be undone');
+    // "No" has the focus, so a reflexive Enter keeps the data.
+    expect(document.activeElement.textContent.trim()).toBe('No');
+    // More key presses while it is open reach nothing behind it (no second delete).
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }));
+    key('Backspace');
+    await settle();
+    expect($$('[role="alertdialog"]').length).toBe(1);
+    // Escape = No.
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await settle();
+    expect(dialog()).toBeNull();
+    expect(store.flows.length).toBe(n);
+    expect(deletes()).toBe(before);
+    // Focus is handed back to the table, so the keyboard keeps working there.
+    expect(document.activeElement).toBe(grid);
+
+    // Delete again and press No.
+    key('Delete');
+    await settle();
+    await answer(false);
+    expect(store.flows.length).toBe(n);
+
+    // The History "Clear" button asks too.
+    await click(buttonWith('Clear'));
+    expect(dialog().textContent).toContain(`Clear all ${n} requests from History?`);
+    await answer(false);
+    expect(store.flows.length).toBe(n);
+    expect(deletes()).toBe(before);
+
+    // Row menu "Delete…" on one request: Yes deletes exactly that one.
+    store.selectedIds = new Set();
+    await settle();
+    const row = $$('.table .row:not(.head)')[0];
+    const id = store.flows.find((f) => row.textContent.includes(`${f.id}`))?.id;
+    row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 10, clientY: 10 }));
+    await settle();
+    await click($$('.menu .item').find((b) => b.textContent.trim().startsWith('Delete')));
+    expect(dialog().textContent).toMatch(/Delete request #\d+\?/);
+    await answer(true);
+    expect(deletes()).toBe(before + 1);
+    expect(store.flows.length).toBe(n - 1);
+    if (id != null) expect(store.flows.some((f) => f.id === id)).toBe(false);
+
+    store.flows = saved;
+    store.selectedId = null;
+    store.selectedIds = new Set();
+    await settle();
+  });
+
   it('sorting newest-first keeps new flows at the top (follows the newest end)', async () => {
     // Remount the table so the sort starts at its default (# ascending).
     store.view = 'repeater';
@@ -1863,6 +2208,594 @@ describe('UI smoke test', () => {
     backend.get_setting = origGet;
     store.clearAllFilters();
     await settle();
+  });
+
+  it('proxy listener table: add, disable and remove a listener', async () => {
+    store.view = 'settings';
+    await settle();
+    const navItem = (label) => $$('.sub-nav-item').find((b) => b.textContent.trim().startsWith(label));
+    await click(navItem('Proxy listener'));
+    await settle();
+    // The default listener renders as a row.
+    const before = store.listeners.length;
+    expect($$('.lrow').length).toBe(before);
+    // Add a second listener via the add form (set the port, then click Add).
+    const portInput = $$('.add-listener input[type=number]')[0];
+    portInput.value = '9090';
+    portInput.dispatchEvent(new Event('input', { bubbles: true }));
+    await click(buttonWith('Add listener'));
+    expect(calls).toContain('add_listener');
+    expect(store.listeners.length).toBe(before + 1);
+    expect($$('.lrow').length).toBe(before + 1);
+    // Disable the new row (its toggle button reads "Disable" while enabled).
+    const newRow = () => $$('.lrow').at(-1);
+    const toggle = [...newRow().querySelectorAll('button')].find((b) => b.textContent.trim() === 'Disable');
+    await click(toggle);
+    expect(calls).toContain('set_listener_enabled');
+    expect(store.listeners.at(-1).enabled).toBe(false);
+    // Remove it.
+    await click(newRow().querySelector('[aria-label="Remove listener"]'));
+    expect(calls).toContain('remove_listener');
+    expect(store.listeners.length).toBe(before);
+  });
+
+  it('hostname overrides: add and edit persist to the backend', async () => {
+    store.view = 'settings';
+    await settle();
+    const navItem = (label) => $$('.sub-nav-item').find((b) => b.textContent.trim().startsWith(label));
+    await click(navItem('Proxy listener'));
+    await settle();
+    await click(buttonWith('+ Add override'));
+    expect(store.hostOverrides.length).toBe(1);
+    const hostIn = $$('.orow .ohost')[0];
+    hostIn.value = 'api.example.com';
+    hostIn.dispatchEvent(new Event('change', { bubbles: true }));
+    const ipIn = $$('.orow .oip')[0];
+    ipIn.value = '127.0.0.1';
+    ipIn.dispatchEvent(new Event('change', { bubbles: true }));
+    await settle();
+    expect(calls).toContain('set_host_overrides');
+    expect(store.hostOverrides[0]).toMatchObject({ host: 'api.example.com', ip: '127.0.0.1' });
+    // Remove it again (keeps later assertions clean).
+    await click($$('.orow [aria-label="Remove override"]')[0]);
+    await settle();
+    expect(store.hostOverrides.length).toBe(0);
+  });
+
+  it('vault: flexible typed fields from a template, masking, quick copy, search and safe delete', async () => {
+    store.view = 'settings';
+    await settle();
+    const navItem = (label) => $$('.sub-nav-item').find((b) => b.textContent.trim().startsWith(label));
+    await click(navItem('Vault'));
+    await settle();
+    expect(text()).toContain('No credentials yet');
+    expect(text()).not.toContain('unencrypted'); // no plaintext banner any more
+    // Start from the "Email login" template: email + password + URL.
+    await click($$('.vault .tcard').find((b) => b.textContent.includes('Email login')));
+    const e = () => store.vault.entries[0];
+    expect(store.vault.entries.length).toBe(1);
+    expect(e().fields.map((f) => f.kind)).toEqual(['email', 'password', 'url']);
+    expect(calls).toContain('set_setting');
+    const typeInto = (el, value) => {
+      el.value = value;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    };
+    const row = (name) => $$('.vault .field').find((r) => r.querySelector('.fname').value === name);
+    const val = (name) => row(name).querySelector('.fval');
+    const menuOn = async (el) => {
+      el.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 20, clientY: 20 }));
+      await settle();
+    };
+    const pick = (label) => click($$('.menu .item').find((b) => b.textContent.trim().startsWith(label)));
+    typeInto($('.vault .dtitle .title'), 'Admin staging');
+    typeInto($('.vault .dtitle .role-in'), 'admin');
+    typeInto(val('Email'), 'admin@target.test');
+    typeInto(val('Password'), 's3cret');
+    await settle();
+    expect(e()).toMatchObject({ label: 'Admin staging', role: 'admin' });
+    expect(e().fields.find((f) => f.kind === 'email').value).toBe('admin@target.test');
+    // Secrets are masked until revealed; the list never shows them.
+    expect(val('Password').type).toBe('password');
+    await click(buttonLabeled('Show Password'));
+    expect(val('Password').type).toBe('text');
+    const item = () => $('.vault .vitem');
+    expect(item().textContent).toContain('Admin staging');
+    expect(item().textContent).toContain('admin@target.test');
+    expect(item().textContent).not.toContain('s3cret');
+    // Add any field: an API key is a masked secret by default; rename it inline.
+    await click($$('.vault .chip').find((b) => b.textContent.trim() === '+ API key'));
+    expect(e().fields.map((f) => f.kind)).toEqual(['email', 'password', 'url', 'apikey']);
+    typeInto(val('API key'), 'sk_live_123');
+    await settle();
+    expect(val('API key').type).toBe('password');
+    typeInto(row('API key').querySelector('.fname'), 'Stripe key');
+    await settle();
+    expect(e().fields[3]).toMatchObject({ name: 'Stripe key', value: 'sk_live_123', secret: true });
+    // Field menu: show a secret as plain text, change a type, remove a field.
+    await menuOn(row('Stripe key'));
+    await pick('Show as plain text');
+    expect(e().fields[3].secret).toBe(false);
+    await menuOn(row('Stripe key'));
+    await click($$('.menu .item').find((b) => b.textContent.trim().startsWith('Type')));
+    await click($$('.menu.sub .item').find((b) => b.textContent.trim().startsWith('Token')));
+    expect(e().fields[3]).toMatchObject({ kind: 'token', name: 'Stripe key', secret: true }); // a custom name is kept
+    await menuOn(row('URL'));
+    await pick('Remove field');
+    expect(e().fields.map((f) => f.kind)).toEqual(['email', 'password', 'token']);
+    // Ready-made headers: Basic from email + password, Bearer from the token.
+    navigator.clipboard.writeText.mockClear();
+    await click(buttonWith('Copy Basic auth'));
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(`Authorization: Basic ${btoa('admin@target.test:s3cret')}`);
+    await click(buttonWith('Copy Bearer'));
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith('Authorization: Bearer sk_live_123');
+    // Search: the role matches; a secret value never does.
+    const search = $('.vault .search input');
+    typeInto(search, 's3cret');
+    await settle();
+    expect($$('.vault .vitem').length).toBe(0);
+    typeInto(search, 'ADMIN');
+    await settle();
+    expect($$('.vault .vitem').length).toBe(1);
+    typeInto(search, '');
+    await settle();
+    // Right-click the credential: copy any field from the nested Copy menu (masked there).
+    await menuOn(item());
+    await click($('.menu .item.parent'));
+    expect($('.menu.sub').textContent).toContain('Password');
+    expect($('.menu.sub').textContent).not.toContain('s3cret');
+    navigator.clipboard.writeText.mockClear();
+    await click($$('.menu.sub .item').find((b) => b.textContent.startsWith('Email')));
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith('admin@target.test');
+    // Duplicate (the copy is selected), then delete it: deleting asks first.
+    await menuOn(item());
+    await pick('Duplicate');
+    expect(store.vault.entries.length).toBe(2);
+    expect(navItem('Vault').textContent).toContain('2');
+    expect($('.vault .dtitle .title').value).toBe('Admin staging (copy)');
+    await click(buttonLabeled('Delete credential'));
+    await answer(true);
+    expect(store.vault.entries.length).toBe(1);
+    expect(store.vault.entries[0].label).toBe('Admin staging');
+    store.removeVaultEntry(store.vault.entries[0].id);
+    await settle();
+  });
+
+  it('organizer: sortable/searchable table, note modal, right-click label/colour/capture/move/send', async () => {
+    store.view = 'organizer';
+    await settle();
+    expect(text()).toContain('Organizer');
+    store.addCollection('Targets');
+    await settle();
+    expect(calls).toContain('set_setting');
+    // The first collection becomes the active save target, marked in the list.
+    const targets = () => store.organizer.collections.find((c) => c.name === 'Targets');
+    const colBtn = (name) => $$('.organizer .col-item').find((b) => b.textContent.includes(name));
+    expect(store.organizer.activeId).toBe(targets().id);
+    expect(colBtn('Targets').textContent).toContain('active');
+    // Save two History flows (request AND response are captured).
+    await store.saveFlowToOrganizer(1);
+    await store.saveFlowToOrganizer(2);
+    await settle();
+    expect(targets().items.length).toBe(2);
+    expect(targets().items[0].request).toContain('GET /v1/users');
+    expect(targets().items[0].response).toContain('name');
+    const rowsEl = () => $$('.organizer .rbody .rrow');
+    expect(rowsEl().length).toBe(2);
+    expect(rowsEl()[0].textContent).toContain('history'); // Source column
+    // Sort: clicking Status twice sorts descending, so the 401 comes first.
+    const th = (label) => $$('.organizer .th').find((b) => b.textContent.trim().startsWith(label));
+    await click(th('Status'));
+    await click(th('Status'));
+    expect(rowsEl()[0].textContent).toContain('401');
+    await click(th('#')); // back to saved order
+    expect(rowsEl()[0].textContent).toContain('200');
+    // Search filters the rows (matches the saved name /v1/login of flow #2).
+    const search = $('.organizer .col-head .search input');
+    search.value = 'login';
+    search.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    expect(rowsEl().length).toBe(1);
+    search.value = '';
+    search.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    expect(rowsEl().length).toBe(2);
+    // Selecting a row opens the request/response detail; no note/colour form under it.
+    await click(rowsEl()[0]);
+    expect($('.organizer .detail')).toBeTruthy();
+    expect($('.organizer .detail textarea')).toBeNull();
+    // Note: the row's note icon opens a modal to view / set it.
+    await click(rowsEl()[0].querySelector('.note-btn'));
+    const area = $('.note-modal textarea');
+    area.value = 'creds in body';
+    area.dispatchEvent(new Event('input', { bubbles: true }));
+    await click($$('.note-modal button').find((b) => b.textContent.trim() === 'Save note'));
+    expect(targets().items[0].note).toBe('creds in body');
+    expect(rowsEl()[0].querySelector('.note-btn').classList.contains('has')).toBe(true);
+    // Right-click: label (one-line modal) and colour (highlight swatch).
+    const menuOn = async (el) => {
+      el.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 12, clientY: 12 }));
+      await settle();
+    };
+    const pick = (label) => click($$('.menu .item').find((b) => b.textContent.trim().startsWith(label)));
+    await menuOn(rowsEl()[0]);
+    await pick('Set label');
+    const labelIn = $('.entry input');
+    labelIn.value = 'IDOR candidate';
+    labelIn.dispatchEvent(new Event('input', { bubbles: true }));
+    await click($('.entry button[type=submit]'));
+    expect(targets().items[0].label).toBe('IDOR candidate');
+    expect(rowsEl()[0].textContent).toContain('IDOR candidate');
+    await menuOn(rowsEl()[0]);
+    await click($('.menu .swatch.c-blue'));
+    expect(targets().items[0].color).toBe('blue');
+    // Capture (screenshot) from the detail header, same editor as History.
+    await click(buttonLabeled('Capture screenshot'));
+    expect($('.overlay')).toBeTruthy();
+    await click([...document.querySelectorAll('.overlay button')].find((b) => b.textContent.trim() === 'Close'));
+    expect($('.overlay')).toBeNull();
+    // With a single collection there is nowhere to move to: "Move to" is greyed out.
+    await menuOn(rowsEl()[0]);
+    expect($$('.menu .item').find((b) => b.textContent.trim().startsWith('Move to')).disabled).toBe(true);
+    // A new collection does not steal the active marker; move a request into it.
+    store.addCollection('Other');
+    await settle();
+    expect(store.organizer.activeId).toBe(targets().id);
+    await click(colBtn('Targets'));
+    await menuOn(rowsEl()[1]);
+    // "Move to" is ONE nested entry; the collections are listed inside it.
+    const moveItems = $$('.menu .item').filter((b) => b.textContent.trim().startsWith('Move to'));
+    expect(moveItems.length).toBe(1);
+    expect($('.menu.sub')).toBeNull();
+    await click(moveItems[0]);
+    const subItems = $$('.menu.sub .item');
+    expect(subItems.map((b) => b.textContent.trim())).toEqual([expect.stringContaining('Other')]);
+    await click(subItems[0]);
+    const other = () => store.organizer.collections.find((c) => c.name === 'Other');
+    expect(targets().items.length).toBe(1);
+    expect(other().items.length).toBe(1);
+    // Collection right-click: make "Other" the active save target.
+    await menuOn(colBtn('Other'));
+    await pick('Set as active');
+    expect(store.organizer.activeId).toBe(other().id);
+    expect(colBtn('Other').textContent).toContain('active');
+    expect(store.organizerTargetHint).toBe('Other');
+    // Send to Repeater from the row menu (no inline buttons).
+    const beforeTabs = store.repeater.tabs.length;
+    await menuOn(rowsEl()[0]);
+    await pick('Send to Repeater');
+    expect(store.view).toBe('repeater');
+    expect(store.repeater.tabs.length).toBe(beforeTabs + 1);
+  });
+
+  it('context menu: nested "Move to" opens on hover / ArrowRight and closes when leaving it', async () => {
+    store.view = 'organizer';
+    await settle();
+    await click($$('.organizer .col-item').find((b) => b.textContent.includes('Targets')));
+    $$('.organizer .rbody .rrow')[0].dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 12, clientY: 12 }));
+    await settle();
+    const move = $$('.menu .item').find((b) => b.textContent.trim().startsWith('Move to'));
+    const copy = $$('.menu .item').find((b) => b.textContent.trim().startsWith('Copy full URL'));
+    const wait = () => new Promise((r) => setTimeout(r, 260));
+    // Hover opens it.
+    move.dispatchEvent(new Event('pointerenter'));
+    await settle();
+    expect($('.menu.sub')).toBeTruthy();
+    expect(move.getAttribute('aria-expanded')).toBe('true');
+    // Passing over another item on the way into the submenu keeps it open (grace period).
+    copy.dispatchEvent(new Event('pointerenter'));
+    $('.menu.sub').dispatchEvent(new Event('pointerenter'));
+    await wait();
+    await settle();
+    expect($('.menu.sub')).toBeTruthy();
+    // Settling on another item closes it.
+    copy.dispatchEvent(new Event('pointerenter'));
+    await wait();
+    await settle();
+    expect($('.menu.sub')).toBeNull();
+    // Keyboard: ArrowRight opens and focuses the first collection, ArrowLeft goes back.
+    move.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await settle();
+    expect(document.activeElement?.closest('.menu.sub')).toBeTruthy();
+    document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+    await settle();
+    expect($('.menu.sub')).toBeNull();
+    expect(document.activeElement).toBe(move);
+    // A click outside closes the whole menu.
+    document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    await settle();
+    expect($('.menu')).toBeNull();
+  });
+
+  it('organizer notes: two-pane editor saves as you type; delete asks first', async () => {
+    store.view = 'organizer';
+    await settle();
+    await click($$('.organizer .tab').find((b) => b.textContent.trim().startsWith('Notes')));
+    expect(text()).toContain('No notes yet');
+    await click(buttonWith('+ New note'));
+    expect(store.organizer.notes.length).toBe(1);
+    const title = $('.neditor .ne-title');
+    title.value = 'Recon';
+    title.dispatchEvent(new Event('input', { bubbles: true }));
+    const body = $('.neditor .ne-body');
+    body.value = 'admin panel at /manage\nweak creds';
+    body.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    expect(store.organizer.notes[0]).toMatchObject({ title: 'Recon', body: 'admin panel at /manage\nweak creds' });
+    // The list shows the title and the first line as a preview.
+    expect($('.nlist .nitem').textContent).toContain('Recon');
+    expect($('.nlist .nitem').textContent).toContain('admin panel at /manage');
+    // Search notes.
+    const ns = $('.nlist .search input');
+    ns.value = 'zzz';
+    ns.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    expect($$('.nlist .nitem').length).toBe(0);
+    ns.value = '';
+    ns.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    // Deleting a note with content asks for confirmation first.
+    await click(buttonLabeled('Delete note'));
+    await answer(true);
+    expect(store.organizer.notes.length).toBe(0);
+  });
+
+  it('intruder: right-click a tab to save it to the Organizer', async () => {
+    store.view = 'intruder';
+    await settle();
+    const before = store.organizerCount;
+    const tabEl = $('.intruder .tabs .tab');
+    tabEl.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 14, clientY: 14 }));
+    await settle();
+    // The item names the target collection as its hint.
+    const save = $$('.menu .item').find((b) => b.textContent.trim().startsWith('Save to Organizer'));
+    expect(save.querySelector('.hint').textContent).toBe(store.organizerTargetHint);
+    await click(save);
+    expect(store.organizerCount).toBe(before + 1);
+  });
+
+  it('intruder: "Add position" can be undone with Ctrl+Z', async () => {
+    store.view = 'intruder';
+    await settle();
+    const activeRaw = () => store.intruder.tabs.find((x) => x.id === store.intruder.activeId).raw;
+    const marks = (s) => (s.match(/§/g) || []).length;
+    const before = activeRaw();
+    // Add a payload position (no selection -> inserts a §payload§ placeholder).
+    await click(buttonWith('Add position'));
+    expect(marks(activeRaw())).toBe(marks(before) + 2);
+    // Ctrl+Z restores the template (undoes the position).
+    $('.intruder .req').dispatchEvent(new KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true }));
+    await settle();
+    expect(activeRaw()).toBe(before);
+  });
+
+  it('intruder: custom right-click on the template, result rows and result panes', async () => {
+    store.view = 'intruder';
+    await settle();
+    const t = store.intruder.tabs.find((x) => x.id === store.intruder.activeId);
+    const labels = () => $$('.menu .item').map((b) => b.textContent.trim());
+    const ctx = async (el) => {
+      el.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 30, clientY: 30 }));
+      await settle();
+    };
+    // Request template: position + send actions instead of the webview's Inspect menu.
+    await ctx($('.intruder .req'));
+    expect(labels().some((l) => l.startsWith('Insert position') || l.startsWith('Add position'))).toBe(true);
+    expect(labels().some((l) => l.startsWith('Save to Organizer'))).toBe(true);
+    expect(labels().some((l) => l.startsWith('Send to Repeater'))).toBe(true);
+    // A finished result: right-click its row and save it (request + response, payload as label).
+    t.results = [{ n: 1, status: 200, length: 2, timeMs: 5, payloads: ['admin'], requestRaw: 'GET /search?q=admin HTTP/1.1\nHost: example.com\n\n', responseRaw: 'HTTP/1.1 200 OK\n\nok' }];
+    t.selected = 1;
+    await settle();
+    const before = store.organizerCount;
+    await ctx($$('.intruder .results .rows .row')[0]);
+    expect(labels().some((l) => l.startsWith('Copy payload'))).toBe(true);
+    await click($$('.menu .item').find((b) => b.textContent.trim().startsWith('Save to Organizer')));
+    expect(store.organizerCount).toBe(before + 1);
+    const saved = store.organizer.collections.flatMap((c) => c.items).at(-1);
+    expect(saved).toMatchObject({ source: 'intruder', label: 'admin', status: 200 });
+    expect(saved.response).toContain('ok');
+    // The result's response and request panes each get their own menu.
+    const panes = $$('.intruder .resp [style*="contents"]');
+    await ctx(panes[1]);
+    expect(labels().some((l) => l.startsWith('Copy response body'))).toBe(true);
+    await ctx(panes[0]);
+    expect(labels().some((l) => l.startsWith('Copy as cURL'))).toBe(true);
+    t.results = [];
+    t.selected = null;
+  });
+
+  it('intruder: result detail fills a resizable pane; arrow keys browse the sorted results', async () => {
+    store.view = 'intruder';
+    await settle();
+    const t = store.intruder.tabs.find((x) => x.id === store.intruder.activeId);
+    const result = (n, status) => ({ n, status, length: n * 10, timeMs: n, payloads: [`p${n}`], requestRaw: `GET /?q=p${n} HTTP/1.1\nHost: example.com\n\n`, responseRaw: `HTTP/1.1 ${status} X\n\nbody ${n}` });
+    t.results = [result(1, 200), result(2, 500), result(3, 404)];
+    t.selected = null;
+    await settle();
+    const rowEl = (n) => $(`.intruder .rows .row[data-n="${n}"]`);
+    // No selection: the table fills the pane, no divider.
+    expect($('.intruder .rdivider')).toBeNull();
+    // Selecting a row opens the detail under a draggable divider.
+    await click(rowEl(1));
+    expect(t.selected).toBe(1);
+    expect($('.intruder .rdivider')).toBeTruthy();
+    expect($('.intruder .results').getAttribute('style')).toContain('8px');
+    expect($('.intruder .resp').textContent).toContain('Request #1');
+    expect($('.intruder .resp').textContent).toContain('Response #1');
+    // Arrow keys move the selection (and stop the table from scrolling).
+    const key = async (k) => {
+      const ev = new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true });
+      (document.activeElement?.closest('.rows') ? document.activeElement : rowEl(t.selected)).dispatchEvent(ev);
+      await settle();
+      return ev.defaultPrevented;
+    };
+    expect(await key('ArrowDown')).toBe(true);
+    expect(t.selected).toBe(2);
+    expect($('.intruder .resp').textContent).toContain('Response #2');
+    await key('ArrowDown');
+    expect(t.selected).toBe(3);
+    await key('ArrowDown'); // stays on the last row
+    expect(t.selected).toBe(3);
+    await key('ArrowUp');
+    expect(t.selected).toBe(2);
+    await key('Home');
+    expect(t.selected).toBe(1);
+    await key('End');
+    expect(t.selected).toBe(3);
+    // It follows the displayed order: sort by Status descending (500, 404, 200).
+    const th = (label) => $$('.intruder .th').find((b) => b.textContent.trim().startsWith(label));
+    await click(th('Status'));
+    await click(th('Status'));
+    await click(rowEl(2)); // 500 is first
+    await key('ArrowDown');
+    expect(t.selected).toBe(3); // 404 next
+    await key('ArrowDown');
+    expect(t.selected).toBe(1); // then 200
+    // Request / response can be stacked top-bottom, then closed.
+    await click(buttonLabeled('Toggle request/response layout'));
+    expect($('.intruder .resp .split.vertical')).toBeTruthy();
+    await click(buttonLabeled('Toggle request/response layout'));
+    expect($('.intruder .resp .split.vertical')).toBeNull();
+    await click(buttonLabeled('Close result'));
+    expect(t.selected).toBeNull();
+    expect($('.intruder .rdivider')).toBeNull();
+    await click(th('#')); // back to the default order
+    t.results = [];
+  });
+
+  it('organizer: edits made over MCP show up live, and an older state is ignored', async () => {
+    store.view = 'organizer';
+    await settle();
+    store.viewCollection(store.organizer.activeId);
+    await settle();
+    // The MCP server saves into the active collection behind the UI's back...
+    const before = store.organizerCount;
+    orgApply({ op: 'save', item: { request: 'GET /from-mcp HTTP/1.1', target: 'https://mcp.test', source: 'mcp', label: 'agent' } });
+    listeners.organizer({ payload: { rev: org.rev } });
+    await settle();
+    // ...and the open Organizer shows it right away.
+    expect(store.organizerCount).toBe(before + 1);
+    expect(text()).toContain('/from-mcp');
+    expect(text()).toContain('mcp');
+    // A late event for an older revision neither refetches nor rolls back.
+    calls.length = 0;
+    listeners.organizer({ payload: { rev: 1 } });
+    await settle();
+    expect(calls).not.toContain('organizer_state');
+    expect(store.organizerCount).toBe(before + 1);
+  });
+
+  it('organizer and repeater deletes ask Yes/No; No keeps the data', async () => {
+    // Organizer: a saved request's row menu "Delete…".
+    const itemId = await store.saveRequestToCollection({ name: '/keep-me', method: 'GET', host: 'h', path: '/keep-me', request: 'GET /keep-me HTTP/1.1\r\nHost: h\r\n\r\n', response: '', source: 'history' });
+    const col = store.organizer.collections.find((c) => c.items.some((it) => it.id === itemId));
+    store.viewCollection(col.id);
+    store.view = 'organizer';
+    await settle();
+    const row = () => $$('.organizer .rbody .rrow').find((r) => r.textContent.includes('/keep-me'));
+    const rowDelete = async () => {
+      row().dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 10, clientY: 10 }));
+      await settle();
+      await click($$('.menu .item').find((b) => b.textContent.trim() === 'Delete…'));
+    };
+    await rowDelete();
+    expect(dialog().textContent).toContain('Delete saved request "/keep-me"?');
+    await answer(false);
+    expect(row()).toBeTruthy();
+    await rowDelete();
+    await answer(true);
+    expect(row()).toBeFalsy();
+    // Deleting a collection that still holds requests asks too.
+    await store.saveRequestToCollection({ name: '/inside', method: 'GET', host: 'h', path: '/inside', request: 'GET /inside HTTP/1.1\r\n\r\n', response: '', source: 'history' }, col.id);
+    await settle();
+    const colItem = $$('.organizer .col-item').find((b) => b.textContent.includes(col.name));
+    colItem.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 10, clientY: 10 }));
+    await settle();
+    await click($$('.menu .item').find((b) => b.textContent.trim() === 'Delete…'));
+    expect(dialog().textContent).toContain(`Delete collection "${col.name}"?`);
+    await answer(false);
+    expect(store.organizer.collections.some((c) => c.id === col.id)).toBe(true);
+
+    // Repeater: "Delete group + tabs…" asks; No keeps every tab.
+    store.addRepeaterTab({ name: 'g1', group: 'Doomed', target: 'https://h', raw: 'GET / HTTP/1.1\r\nHost: h\r\n\r\n' });
+    store.addRepeaterTab({ name: 'g2', group: 'Doomed', target: 'https://h', raw: 'GET / HTTP/1.1\r\nHost: h\r\n\r\n' });
+    store.view = 'repeater';
+    await settle();
+    const inGroup = () => store.repeater.tabs.filter((t) => t.group === 'Doomed').length;
+    const groupDelete = async () => {
+      $('.group-head[data-group="Doomed"] .group-label').dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 10, clientY: 10 }));
+      await settle();
+      await click($$('.menu .item').find((b) => b.textContent.trim() === 'Delete group + tabs…'));
+    };
+    await groupDelete();
+    expect(dialog().textContent).toContain('Delete group "Doomed" and its 2 tabs?');
+    await answer(false);
+    expect(inGroup()).toBe(2);
+    await groupDelete();
+    await answer(true);
+    expect(inGroup()).toBe(0);
+  });
+
+  it('MCP is per project: a new project starts with it off, a project that had it on gets it back', async () => {
+    const origGet = backend.get_setting;
+    const origSet = backend.set_setting;
+    const settings = new Map(); // the open project's settings table
+    backend.get_setting = ({ key }) => settings.get(key) ?? null;
+    backend.set_setting = ({ key, value }) => (settings.set(key, value), null);
+    try {
+      // Switched on here: remembered by THIS project.
+      await store.setMcp(true, 8082, '/docs');
+      expect(store.mcp.running).toBe(true);
+      expect(settings.get('mcp')).toEqual({ enabled: true });
+      const mine = new Map(settings);
+
+      // A new project has no switch of its own: MCP stops instead of carrying over,
+      // and nothing is written into the new project.
+      settings.clear();
+      await store.blankProject();
+      await settle();
+      expect(store.mcp.running).toBe(false);
+      expect(settings.has('mcp')).toBe(false);
+
+      // Loading a project that had it on (same load path as Open) starts it again.
+      for (const [k, v] of mine) settings.set(k, v);
+      await store.blankProject();
+      await settle();
+      expect(store.mcp.running).toBe(true);
+    } finally {
+      backend.get_setting = origGet;
+      backend.set_setting = origSet;
+      await store.setMcp(false, 8082, '/docs');
+    }
+  });
+
+  it('old Organizer notes and flat Vault entries migrate to the current shape on load', async () => {
+    const origGet = backend.get_setting;
+    const origSet = backend.set_setting;
+    const written = [];
+    backend.get_setting = ({ key }) =>
+      key === 'organizer'
+        ? { collections: [], notes: [{ id: 'n1', title: 'Legacy', body: 'keep me', updatedAt: 1 }] }
+        : key === 'vault'
+          ? { entries: [{ id: 'v1', label: 'Old', username: 'root', password: 'toor', url: '' }] }
+          : null;
+    backend.set_setting = ({ key }) => (written.push(key), null);
+    try {
+      await store.blankProject();
+      await settle();
+      // Notes move to their own key right away.
+      expect(store.organizer.notes.map((n) => n.title)).toEqual(['Legacy']);
+      expect(written).toContain('organizerNotes');
+      // A flat vault entry becomes typed fields (password secret) and is written back.
+      expect(store.vault.entries[0].fields.map((f) => [f.kind, f.value, f.secret])).toEqual([
+        ['username', 'root', false],
+        ['password', 'toor', true],
+      ]);
+      expect(written).toContain('vault');
+    } finally {
+      backend.get_setting = origGet;
+      backend.set_setting = origSet;
+    }
   });
 
   it('threw no uncaught errors', () => {

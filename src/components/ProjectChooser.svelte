@@ -33,7 +33,7 @@
       {/if}
       <button class="opt" onclick={() => run(() => store.newProject())}>
         <span class="opt-title">New project…</span>
-        <span class="opt-sub">Choose where to save a new .{BRAND.ext} file</span>
+        <span class="opt-sub">Name it (or pick a random name), saved as a .{BRAND.ext} file</span>
       </button>
       <button class="opt" onclick={() => run(() => store.openProject())}>
         <span class="opt-title">Open project…</span>
