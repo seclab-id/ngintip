@@ -48,3 +48,6 @@ coverage/
 *.log
 npm-debug.log*
 request.txt
+
+# Local vulnerable lab target (run manually, not shipped)
+test-target/
