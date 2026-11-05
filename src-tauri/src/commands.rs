@@ -324,16 +324,47 @@ pub fn list_flows(state: State<AppState>) -> CmdResult<Vec<FlowSummary>> {
 #[tauri::command]
 pub fn get_flow(state: State<AppState>, id: u64) -> CmdResult<Option<FlowDetail>> {
     let flow = state.ctx.store.get(id).map_err(|e| e.to_string())?;
-    Ok(flow.map(|f| FlowDetail {
-        request_raw: raw::request_text(&f),
-        response_raw: raw::response_text(&f),
-        request_truncated_view: raw::view_truncated(&f.req_headers, &f.req_body),
-        response_truncated_view: raw::view_truncated(&f.res_headers, &f.res_body),
-        response_is_image: raw::is_image(&f.res_headers, &f.res_body),
-        request_is_binary: raw::body_is_binary(&f.req_headers, &f.req_body),
-        response_is_binary: raw::body_is_binary(&f.res_headers, &f.res_body),
-        variants: f.variants,
-        summary: f.summary,
+    Ok(flow.map(|f| {
+        let mut variants = f.variants.clone();
+        // Lazy "decoded" view: when a decode_* extension is active and this host is in
+        // scope, compute the readable form on open and expose it as the "Decoded"
+        // version alongside the real (wire) message. The wire bytes stay canonical and
+        // nothing is persisted; this just makes an encrypted/encoded body readable.
+        if state.ctx.extensions.active() && state.ctx.scope.contains(&f.summary.host) {
+            let hc = || crate::extensions::HookCtx {
+                host: f.summary.host.clone(),
+                path: f.summary.path.clone(),
+                flow_id: Some(f.summary.id),
+                edited: false,
+            };
+            if variants.req_extension.is_none() {
+                let txt = raw::request_text_for_processing(&f);
+                if let Some(out) =
+                    state.ctx.extensions.decode(crate::extensions::Phase::Request, txt.as_bytes(), crate::extensions::Surface::Proxy, &hc())
+                {
+                    variants.req_extension = Some(String::from_utf8_lossy(&out).replace("\r\n", "\n"));
+                }
+            }
+            if variants.res_extension.is_none() && !f.res_headers.is_empty() {
+                let txt = raw::response_text_for_processing(&f);
+                if let Some(out) =
+                    state.ctx.extensions.decode(crate::extensions::Phase::Response, txt.as_bytes(), crate::extensions::Surface::Proxy, &hc())
+                {
+                    variants.res_extension = Some(String::from_utf8_lossy(&out).replace("\r\n", "\n"));
+                }
+            }
+        }
+        FlowDetail {
+            request_raw: raw::request_text(&f),
+            response_raw: raw::response_text(&f),
+            request_truncated_view: raw::view_truncated(&f.req_headers, &f.req_body),
+            response_truncated_view: raw::view_truncated(&f.res_headers, &f.res_body),
+            response_is_image: raw::is_image(&f.res_headers, &f.res_body),
+            request_is_binary: raw::body_is_binary(&f.req_headers, &f.req_body),
+            response_is_binary: raw::body_is_binary(&f.res_headers, &f.res_body),
+            variants,
+            summary: f.summary,
+        }
     }))
 }
 
@@ -552,7 +583,7 @@ pub fn index_in_background(ctx: &std::sync::Arc<proxy::Ctx>) {
 /// Magic prefix for a compressed project (see [`crate::brand`]): the brand magic
 /// + a version byte, then the compressed SQLite. Plain SQLite files
 /// ("SQLite format 3\0") are still opened directly, so older uncompressed
-/// projects keep working. The legacy "CEGATC" compressed format is not supported.
+/// projects keep working. A previous compressed format is not supported.
 ///
 /// Version 1 = gzip (older saves, still read). Version 2 = zstd (current): faster to
 /// save and smaller, with long-distance matching for cross-flow repeats.
@@ -684,7 +715,7 @@ fn fresh_working_path(dir: &Path) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    wd.join(format!("{}-{}.cegat", std::process::id(), nanos))
+    wd.join(format!("{}-{}.{}", std::process::id(), nanos, crate::brand::PROJECT_EXT))
 }
 
 fn remove_working_file(path: &Path) {
@@ -794,7 +825,7 @@ pub fn blank_project(app: tauri::AppHandle, state: State<AppState>) -> CmdResult
     Ok(project_info_of(&state))
 }
 
-/// Open a project file (compressed `.cegat` or a legacy plain SQLite one) by
+/// Open a project file (compressed `.ngintip` or a legacy plain SQLite one) by
 /// loading it into a fresh working copy.
 #[tauri::command]
 pub fn open_project(app: tauri::AppHandle, state: State<AppState>, path: String) -> CmdResult<ProjectInfo> {
@@ -890,7 +921,7 @@ async fn write_document(dir: PathBuf, state: State<'_, AppState>, path: PathBuf)
     Ok(make_save_result(&path, raw_len as usize, comp_len as usize))
 }
 
-/// Save (compress) the current project to a chosen `.cegat` path. A missing parent
+/// Save (compress) the current project to a chosen `.ngintip` path. A missing parent
 /// folder is created, so a new project can go straight into the default folder.
 #[tauri::command]
 pub async fn save_project_as(app: tauri::AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<SaveResult> {
@@ -1760,22 +1791,26 @@ pub fn ca_info(state: State<AppState>) -> CaInfo {
 /// With `tab`, the send is recorded in that tab's history (also when it fails
 /// on the network; a request that doesn't parse isn't recorded).
 #[tauri::command]
+/// `bypass_ext` is the tab's raw mode: skip extensions entirely for this send, so the
+/// request leaves exactly as typed and the response comes back exactly as it arrived.
 pub async fn send_raw(
     state: State<'_, AppState>,
     target: String,
     raw: String,
     tab: Option<u64>,
+    bypass_ext: Option<bool>,
 ) -> CmdResult<RepeaterResponse> {
     let auto_length = state.config.lock().unwrap().auto_content_length;
     let Some(tab) = tab else {
         return repeater_send(&state.ctx, &target, &raw, auto_length).await;
     };
+    let ext = if bypass_ext.unwrap_or(false) { None } else { Some(crate::extensions::Surface::Repeater) };
     // Register a cancel channel for this tab; `cancel_send` fires it to abort a slow
     // send (dropping the send future cancels the in-flight upstream request).
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     state.sends.lock().unwrap().insert(tab, tx);
     let result = tokio::select! {
-        r = send_and_record(&state.ctx, tab, &target, &raw, auto_length) => r,
+        r = send_and_record_ext(&state.ctx, tab, &target, &raw, auto_length, ext) => r,
         _ = rx => Err("Cancelled".to_string()),
     };
     state.sends.lock().unwrap().remove(&tab);
@@ -1822,19 +1857,21 @@ pub fn clear_repeater_history(state: State<AppState>, tab: u64) -> CmdResult<()>
 /// Build and send; if an HTTP/2 attempt fails (some servers mishandle h2), retry
 /// once over HTTP/1.1 so a usable response still comes back.
 ///
-/// `apply_ext` runs repeater-scope extensions: the request is transformed before it
-/// is sent (returned as `request_final`) and the response after it arrives
-/// (`response_original` keeps what arrived), so the Repeater shows Final vs Original
-/// like History does. It is on for interactive Repeater tab sends and off for bulk
-/// sends (Intruder), which must not pay the per-request Python round-trip.
-async fn send_with_fallback(ctx: &std::sync::Arc<proxy::Ctx>, target: &str, raw: &str, auto_length: bool, apply_ext: bool) -> CmdResult<RepeaterResponse> {
-    let sent = if apply_ext { ext_request_repeater(ctx, raw).await } else { None };
+/// `ext` runs the extensions scoped to that surface: the request is transformed before
+/// it is sent (returned as `request_final`) and the response after it arrives
+/// (`response_original` keeps what arrived), so Repeater / Intruder can show Final vs
+/// Original like History does. Pass `Some(Surface::Repeater)` for interactive Repeater
+/// sends and `Some(Surface::Intruder)` for attack requests; `None` skips the per-request
+/// Python round-trip (programmatic one-offs that opted out).
+async fn send_with_fallback(ctx: &std::sync::Arc<proxy::Ctx>, target: &str, raw: &str, auto_length: bool, ext: Option<crate::extensions::Surface>) -> CmdResult<RepeaterResponse> {
+    let host = host_of_target(target);
+    let sent = if let Some(s) = ext { ext_request(ctx, raw, &host, s).await } else { None };
     let sent_raw = sent.as_deref().unwrap_or(raw);
     let (request, proto) = repeater_request(target, sent_raw, auto_length, None)?;
-    let mut result = repeater_exchange(ctx, request, proto, apply_ext).await;
+    let mut result = repeater_exchange(ctx, request, proto, ext, &host).await;
     if result.is_err() && proto == proxy::Proto::PreferHttp2 {
         if let Ok((request, _)) = repeater_request(target, sent_raw, auto_length, Some(proxy::Proto::Http1)) {
-            let retry = repeater_exchange(ctx, request, proxy::Proto::Http1, apply_ext).await;
+            let retry = repeater_exchange(ctx, request, proxy::Proto::Http1, ext, &host).await;
             if retry.is_ok() {
                 result = retry;
             }
@@ -1848,12 +1885,27 @@ async fn send_with_fallback(ctx: &std::sync::Arc<proxy::Ctx>, target: &str, raw:
     result
 }
 
+/// A recorded Repeater-scoped send. Only the tests call this directly; `send_raw`
+/// goes through `send_and_record_ext` so a tab in raw mode can skip extensions.
+#[cfg(test)]
 pub async fn send_and_record(ctx: &std::sync::Arc<proxy::Ctx>, tab: u64, target: &str, raw: &str, auto_length: bool) -> CmdResult<RepeaterResponse> {
+    send_and_record_ext(ctx, tab, target, raw, auto_length, Some(crate::extensions::Surface::Repeater)).await
+}
+
+/// As `send_and_record`, but the caller picks the extension surface (or `None` to skip
+/// extensions entirely, which is what a Repeater tab in raw mode asks for).
+async fn send_and_record_ext(
+    ctx: &std::sync::Arc<proxy::Ctx>,
+    tab: u64,
+    target: &str,
+    raw: &str,
+    auto_length: bool,
+    ext: Option<crate::extensions::Surface>,
+) -> CmdResult<RepeaterResponse> {
     // An unparseable request is rejected before anything is recorded; only real
     // sends (including failed ones) end up in the tab's history.
     repeater_request(target, raw, auto_length, None)?;
-    // Interactive Repeater tab send: repeater-scope extensions apply.
-    let result = send_with_fallback(ctx, target, raw, auto_length, true).await;
+    let result = send_with_fallback(ctx, target, raw, auto_length, ext).await;
     record_repeater_history(ctx, tab, target, raw, &result);
     result
 }
@@ -1886,10 +1938,29 @@ fn record_repeater_history(ctx: &proxy::Ctx, tab: u64, target: &str, raw: &str, 
     }
 }
 
-/// Build and send without recording. Used for bulk sends (Intruder) and programmatic
-/// one-offs, so repeater-scope extensions are NOT applied here (see `send_and_record`).
+/// Build and send without recording and without extensions. Used for programmatic
+/// one-offs that opt out of the per-request Python round-trip (see `send_and_record`
+/// for Repeater and `intruder_send` for Intruder, which do apply extensions).
 pub async fn repeater_send(ctx: &std::sync::Arc<proxy::Ctx>, target: &str, raw: &str, auto_length: bool) -> CmdResult<RepeaterResponse> {
-    send_with_fallback(ctx, target, raw, auto_length, false).await
+    send_with_fallback(ctx, target, raw, auto_length, None).await
+}
+
+/// One Intruder attack request: no Repeater history, but intruder-scope extensions
+/// apply (so an encrypt/transform extension affects every attack request). The sent
+/// (transformed) request comes back as `request_final` and the arrived response as
+/// `response_original`, so a saved result can keep Wire / Original / Extension views.
+#[tauri::command]
+/// `bypass_ext` is the tab's raw mode: skip extensions entirely for this attack, which
+/// also removes the per-request Python round trip from a bulk run.
+pub async fn intruder_send(
+    state: State<'_, AppState>,
+    target: String,
+    raw: String,
+    bypass_ext: Option<bool>,
+) -> CmdResult<RepeaterResponse> {
+    let auto_length = state.config.lock().unwrap().auto_content_length;
+    let ext = if bypass_ext.unwrap_or(false) { None } else { Some(crate::extensions::Surface::Intruder) };
+    send_with_fallback(&state.ctx, &target, &raw, auto_length, ext).await
 }
 
 /// Resolve the absolute URL for a raw request against `target` (as repeater does).
@@ -1921,12 +1992,13 @@ fn request_flow(ctx: &proxy::Ctx, target: &str, raw: &str) -> CmdResult<store::F
 
 /// Send a request AND record it in History (the flows table), so MCP/tool-driven
 /// traffic shows up in the History tab alongside proxied traffic and persists in
-/// the .cegat. The real response bytes/headers are recorded (or the error). When
+/// the .ngintip. The real response bytes/headers are recorded (or the error). When
 /// `tab` is given, the send is also appended to that Repeater tab's history.
 pub async fn send_recorded(ctx: &std::sync::Arc<proxy::Ctx>, tab: Option<u64>, target: &str, raw: &str, auto_length: bool) -> CmdResult<RepeaterResponse> {
     // Repeater-scope extensions transform the request before it is sent; History
     // then shows the sent (transformed) request with the typed one under "Original".
-    let sent = ext_request_repeater(ctx, raw).await;
+    let host = host_of_target(target);
+    let sent = ext_request(ctx, raw, &host, crate::extensions::Surface::Repeater).await;
     let sent_raw = sent.as_deref().unwrap_or(raw);
     let mut flow = request_flow(ctx, target, sent_raw)?;
     if sent.is_some() {
@@ -1948,7 +2020,7 @@ pub async fn send_recorded(ctx: &std::sync::Arc<proxy::Ctx>, tab: Option<u64>, t
     let result = match outcome {
         Ok((parts, bytes, truncated)) => {
             // Repeater-scope response extensions (e.g. decrypt) before display/record.
-            let (parts, bytes) = match ext_response_repeater(ctx, &parts, &bytes).await {
+            let (parts, bytes) = match ext_response(ctx, &parts, &bytes, &host, crate::extensions::Surface::Repeater).await {
                 Some((p, b, original)) => {
                     flow.variants.res_original = Some(original);
                     (p, b)
@@ -2101,16 +2173,39 @@ fn header_map(pairs: &[(String, String)]) -> HeaderMap {
     map
 }
 
+/// The authority (host[:port]) of a Repeater target URL, for the hook ctx.
+fn host_of_target(target: &str) -> String {
+    target
+        .parse::<Uri>()
+        .ok()
+        .and_then(|u| u.authority().map(|a| a.as_str().to_string()))
+        .unwrap_or_default()
+}
+
 /// Repeater-scope extensions applied to the request text before it is sent. Returns
 /// the transformed raw when an extension changed it.
-async fn ext_request_repeater(ctx: &std::sync::Arc<proxy::Ctx>, raw: &str) -> Option<String> {
+async fn ext_request(ctx: &std::sync::Arc<proxy::Ctx>, raw: &str, host: &str, surface: crate::extensions::Surface) -> Option<String> {
     if !ctx.extensions.active() {
         return None;
     }
     let ext = ctx.clone();
     let cur = raw.as_bytes().to_vec();
+    let host = host.to_string();
     let out = tauri::async_runtime::spawn_blocking(move || {
-        ext.extensions.transform(crate::extensions::Phase::Request, &cur, crate::extensions::Surface::Repeater)
+        // Outgoing request: process (wire edits) then encode (e.g. encrypt the body you
+        // typed as plaintext). A Repeater / Intruder send is always treated as edited.
+        let mut buf = cur;
+        let mut changed = false;
+        if let Some(p) = ext.extensions.transform(crate::extensions::Phase::Request, &buf, surface) {
+            buf = p;
+            changed = true;
+        }
+        let hc = crate::extensions::HookCtx { host, edited: true, ..Default::default() };
+        if let Some(e) = ext.extensions.encode(crate::extensions::Phase::Request, &buf, surface, &hc) {
+            buf = e;
+            changed = true;
+        }
+        changed.then_some(buf)
     })
     .await
     .ok()
@@ -2120,10 +2215,12 @@ async fn ext_request_repeater(ctx: &std::sync::Arc<proxy::Ctx>, raw: &str) -> Op
 
 /// Repeater-scope extensions applied to a response. Returns (new parts, new body, the
 /// pre-transform raw text) when an extension changed it.
-async fn ext_response_repeater(
+async fn ext_response(
     ctx: &std::sync::Arc<proxy::Ctx>,
     parts: &http::response::Parts,
     bytes: &bytes::Bytes,
+    host: &str,
+    surface: crate::extensions::Surface,
 ) -> Option<(http::response::Parts, bytes::Bytes, String)> {
     if !ctx.extensions.active() {
         return None;
@@ -2138,8 +2235,23 @@ async fn ext_response_repeater(
     let original = raw::message_text(start.trim_end(), &headers, bytes);
     let ext = ctx.clone();
     let cur = original.clone().into_bytes();
+    let host = host.to_string();
     let out = tauri::async_runtime::spawn_blocking(move || {
-        ext.extensions.transform(crate::extensions::Phase::Response, &cur, crate::extensions::Surface::Repeater)
+        // Arrived response: process (wire edits) then decode (e.g. decrypt) for display.
+        // The pre-transform text is kept as Original by the caller. A response has no
+        // Host header, so the request's host is passed in ctx for the extension's scope.
+        let mut buf = cur;
+        let mut changed = false;
+        if let Some(p) = ext.extensions.transform(crate::extensions::Phase::Response, &buf, surface) {
+            buf = p;
+            changed = true;
+        }
+        let hc = crate::extensions::HookCtx { host, ..Default::default() };
+        if let Some(d) = ext.extensions.decode(crate::extensions::Phase::Response, &buf, surface, &hc) {
+            buf = d;
+            changed = true;
+        }
+        changed.then_some(buf)
     })
     .await
     .ok()
@@ -2152,14 +2264,14 @@ async fn ext_response_repeater(
     Some((new_parts, parsed.body, original))
 }
 
-async fn repeater_exchange(ctx: &std::sync::Arc<proxy::Ctx>, request: Request<body::Body>, proto: proxy::Proto, apply_ext: bool) -> CmdResult<RepeaterResponse> {
+async fn repeater_exchange(ctx: &std::sync::Arc<proxy::Ctx>, request: Request<body::Body>, proto: proxy::Proto, ext: Option<crate::extensions::Surface>, host: &str) -> CmdResult<RepeaterResponse> {
     let started = Instant::now();
     let (parts, bytes, truncated) = exchange_parts(ctx, request, proto).await?;
     let dur = started.elapsed().as_millis() as u64;
-    // Repeater-scope response extensions (e.g. decrypt) before display; the arrived
+    // Surface-scoped response extensions (e.g. decrypt) before display; the arrived
     // response is kept as `response_original` so the UI can show Original vs Final.
-    if apply_ext {
-        if let Some((p, b, original)) = ext_response_repeater(ctx, &parts, &bytes).await {
+    if let Some(s) = ext {
+        if let Some((p, b, original)) = ext_response(ctx, &parts, &bytes, host, s).await {
             let mut res = build_response(&p, &b, truncated, dur);
             res.response_original = Some(original);
             return Ok(res);

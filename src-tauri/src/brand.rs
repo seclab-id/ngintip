@@ -19,7 +19,7 @@ pub const PROJECT_EXT: &str = "ngintip";
 /// on-disk header layout (magic + 1 version byte) is unchanged.
 pub const MAGIC: &[u8] = b"NGNTPC";
 
-/// Older magic prefixes still accepted when reading. The legacy "CEGATC" format is
+/// Older magic prefixes still accepted when reading. A previous compressed format is
 /// no longer supported, so only the current [`MAGIC`] opens; keep the list here (same
 /// length as [`MAGIC`]) if back-compat is ever wanted again.
 pub const LEGACY_MAGICS: &[&[u8]] = &[];

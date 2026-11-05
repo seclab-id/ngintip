@@ -649,27 +649,61 @@ async fn forward(
         intercepted_request = true;
         let held = Flow::request(id, &parts.method, &parts.uri, parts.version, &parts.headers, bytes.clone());
         let arrived = crate::raw::request_text(&held);
-        // An interceptor-scope extension transforms what the editor shows (e.g. decrypt
-        // a body so it can be read and edited), keeping the arrived message as Original.
-        let transformed = if ext_active {
+        let host = held.summary.host.clone();
+        let path = held.summary.path.clone();
+        // What the editor shows: process_* is a real wire change; decode_* makes the body
+        // readable for editing WITHOUT changing the wire. The editor shows the decoded
+        // view when there is one, keeping the arrived message as Original.
+        let (processed, display) = if ext_active {
             let processing = crate::raw::request_text_for_processing(&held);
             let ext = ctx.clone();
+            let (h, p) = (host.clone(), path.clone());
             tauri::async_runtime::spawn_blocking(move || {
-                ext.extensions.transform(crate::extensions::Phase::Request, processing.as_bytes(), crate::extensions::Surface::Interceptor)
+                let processed = ext
+                    .extensions
+                    .transform(crate::extensions::Phase::Request, processing.as_bytes(), crate::extensions::Surface::Interceptor)
+                    .map(|o| String::from_utf8_lossy(&o).replace("\r\n", "\n"));
+                let base = processed.clone().unwrap_or(processing);
+                let hc = crate::extensions::HookCtx { host: h, path: p, ..Default::default() };
+                let display = ext
+                    .extensions
+                    .decode(crate::extensions::Phase::Request, base.as_bytes(), crate::extensions::Surface::Interceptor, &hc)
+                    .map(|o| String::from_utf8_lossy(&o).replace("\r\n", "\n"));
+                (processed, display)
             })
             .await
-            .unwrap_or(None)
-            // The runner serializes with CRLF; the editor (like request_text) uses LF.
-            .map(|o| String::from_utf8_lossy(&o).replace("\r\n", "\n"))
+            .unwrap_or((None, None))
         } else {
-            None
+            (None, None)
         };
+        let shown = display.or(processed.clone());
         let notify = |item: &PendingItem| ctx.events.emit(INTERCEPT_EVENT, item);
-        match ctx.intercept.hold(Phase::Request, &held, transformed.clone(), notify).await {
+        match ctx.intercept.hold(Phase::Request, &held, shown, notify).await {
             Decision::Forward { raw, hold_response } => {
                 wants_response = hold_response;
-                // Send the user's edit if any, otherwise the extension's transform.
-                if let Some(edited) = raw.or(transformed) {
+                // The wire form: an edit is encoded back (e.g. re-encrypted); an unchanged
+                // forward sends the process change if any, else the original bytes (never
+                // the decoded display).
+                let wire = match raw {
+                    Some(user_edit) if ext_active => {
+                        let ext = ctx.clone();
+                        let (h, p) = (host.clone(), path.clone());
+                        Some(
+                            tauri::async_runtime::spawn_blocking(move || {
+                                let hc = crate::extensions::HookCtx { host: h, path: p, edited: true, ..Default::default() };
+                                ext.extensions
+                                    .encode(crate::extensions::Phase::Request, user_edit.as_bytes(), crate::extensions::Surface::Interceptor, &hc)
+                                    .map(|o| String::from_utf8_lossy(&o).replace("\r\n", "\n"))
+                                    .unwrap_or(user_edit)
+                            })
+                            .await
+                            .unwrap_or_default(),
+                        )
+                    }
+                    Some(user_edit) => Some(user_edit),
+                    None => processed,
+                };
+                if let Some(edited) = wire {
                     // Remember the pre-edit request so History can show Original vs Final.
                     req_original = Some(arrived);
                     match apply_edit(&mut parts, &edited, bytes) {
@@ -872,42 +906,79 @@ impl Buffered {
         let bytes = if !hold {
             bytes
         } else {
-            // An interceptor-scope extension transforms what the editor shows (e.g.
-            // decrypt the body), keeping the arrived response as Original.
-            let transformed = if ext_on {
+            let host = flow.summary.host.clone();
+            let path = flow.summary.path.clone();
+            // process_* is a real wire change; decode_* makes the body readable for
+            // editing without changing the wire. The editor shows the decoded view,
+            // keeping the arrived response as Original. A response has no Host header,
+            // so the host is passed in ctx for the extension's scope.
+            let (processed, display) = if ext_on {
                 let processing = crate::raw::response_text_for_processing(&flow);
                 let ext = ctx.clone();
+                let (h, p) = (host.clone(), path.clone());
                 tauri::async_runtime::spawn_blocking(move || {
-                    ext.extensions.transform(crate::extensions::Phase::Response, processing.as_bytes(), crate::extensions::Surface::Interceptor)
+                    let processed = ext
+                        .extensions
+                        .transform(crate::extensions::Phase::Response, processing.as_bytes(), crate::extensions::Surface::Interceptor)
+                        .map(|o| String::from_utf8_lossy(&o).replace("\r\n", "\n"));
+                    let base = processed.clone().unwrap_or(processing);
+                    let hc = crate::extensions::HookCtx { host: h, path: p, ..Default::default() };
+                    let display = ext
+                        .extensions
+                        .decode(crate::extensions::Phase::Response, base.as_bytes(), crate::extensions::Surface::Interceptor, &hc)
+                        .map(|o| String::from_utf8_lossy(&o).replace("\r\n", "\n"));
+                    (processed, display)
                 })
                 .await
-                .unwrap_or(None)
-                // The runner serializes with CRLF; the editor (like response_text) uses LF.
-                .map(|o| String::from_utf8_lossy(&o).replace("\r\n", "\n"))
+                .unwrap_or((None, None))
             } else {
-                None
+                (None, None)
             };
+            let shown = display.or(processed.clone());
             let arrived = crate::raw::response_text(&flow);
             let notify = |item: &PendingItem| ctx.events.emit(INTERCEPT_EVENT, item);
-            match ctx.intercept.hold(Phase::Response, &flow, transformed.clone(), notify).await {
-                Decision::Forward { raw, .. } => match raw.or(transformed) {
-                    None => bytes,
-                    Some(edited) => {
-                        // Keep the pre-edit response as a History variant (Original vs Final).
-                        flow.variants.res_original = Some(arrived);
-                        match apply_response_edit(&mut head, &edited, &bytes) {
-                            Ok(body) => {
-                                flow.set_response(head.status, head.version, &head.headers, body.clone());
-                                body
-                            }
-                            Err(e) => {
-                                flow.set_error(format!("edited response invalid: {e:#}"));
-                                ctx.record_flow(flow);
-                                return text(StatusCode::BAD_GATEWAY, &format!("{}: edited response invalid: {e:#}", brand::NAME));
+            match ctx.intercept.hold(Phase::Response, &flow, shown, notify).await {
+                Decision::Forward { raw, .. } => {
+                    // An edit is encoded back (e.g. re-encrypted); an unchanged forward
+                    // sends the process change if any, else the original bytes.
+                    let wire = match raw {
+                        Some(user_edit) if ext_on => {
+                            let ext = ctx.clone();
+                            let (h, p) = (host.clone(), path.clone());
+                            Some(
+                                tauri::async_runtime::spawn_blocking(move || {
+                                    let hc = crate::extensions::HookCtx { host: h, path: p, edited: true, ..Default::default() };
+                                    ext.extensions
+                                        .encode(crate::extensions::Phase::Response, user_edit.as_bytes(), crate::extensions::Surface::Interceptor, &hc)
+                                        .map(|o| String::from_utf8_lossy(&o).replace("\r\n", "\n"))
+                                        .unwrap_or(user_edit)
+                                })
+                                .await
+                                .unwrap_or_default(),
+                            )
+                        }
+                        Some(user_edit) => Some(user_edit),
+                        None => processed,
+                    };
+                    match wire {
+                        None => bytes,
+                        Some(edited) => {
+                            // Keep the pre-edit response as a History variant (Original vs Final).
+                            flow.variants.res_original = Some(arrived);
+                            match apply_response_edit(&mut head, &edited, &bytes) {
+                                Ok(body) => {
+                                    flow.set_response(head.status, head.version, &head.headers, body.clone());
+                                    body
+                                }
+                                Err(e) => {
+                                    flow.set_error(format!("edited response invalid: {e:#}"));
+                                    ctx.record_flow(flow);
+                                    return text(StatusCode::BAD_GATEWAY, &format!("{}: edited response invalid: {e:#}", brand::NAME));
+                                }
                             }
                         }
                     }
-                },
+                }
                 Decision::Drop => {
                     flow.set_error("response dropped (intercept)".into());
                     ctx.record_flow(flow);

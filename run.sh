@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Jalankan Cegat (desktop app).
+# Jalankan Ngintip (desktop app).
 #   ./run.sh          -> mode dev (hot reload)
 #   ./run.sh build    -> bundle release (.app/.dmg/.msi/.deb)
 set -euo pipefail

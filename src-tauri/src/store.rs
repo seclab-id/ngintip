@@ -1,4 +1,4 @@
-//! HTTP history persisted in SQLite. One `.cegat` file = one project.
+//! HTTP history persisted in SQLite. One `.ngintip` file = one project.
 
 use std::{
     path::{Path, PathBuf},
@@ -320,8 +320,8 @@ impl Store {
         Ok(())
     }
 
-    /// A clean, defragmented copy of the current project as raw `.cegat` bytes
-    /// (the SQLite file). Used for the compressed `.cegatc` export.
+    /// A clean, defragmented copy of the current project as raw `.ngintip` bytes
+    /// (the SQLite file). Used for the compressed `.ngintipc` export.
     pub fn snapshot(&self) -> Result<Vec<u8>> {
         let tmp = std::env::temp_dir().join(format!(
             "{}-snapshot-{}-{}.{}",
@@ -765,7 +765,7 @@ impl Store {
     }
 }
 
-/// Marks a `.cegat` file as a Cegat project inside the SQLite header
+/// Marks a `.ngintip` file as a Ngintip project inside the SQLite header
 /// (`PRAGMA application_id`, offset 68). Value spells "CGAT" in ASCII, so
 /// `file`/`sqlite3` and other tools can recognise our projects.
 pub const APPLICATION_ID: i32 = 0x4347_4154;
@@ -776,7 +776,7 @@ fn connect(path: &Path) -> Result<(Connection, u64)> {
     let conn = Connection::open(path)?;
     conn.execute_batch(SCHEMA)?;
     migrate(&conn)?;
-    // Stamp the Cegat header markers (idempotent, cheap).
+    // Stamp the Ngintip header markers (idempotent, cheap).
     conn.pragma_update(None, "application_id", APPLICATION_ID)?;
     conn.pragma_update(None, "user_version", USER_VERSION)?;
     let max_id: i64 = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM flows", [], |r| r.get(0))?;
@@ -1047,7 +1047,7 @@ mod tests {
 
     #[test]
     fn logs_persist_with_the_project() {
-        let path = std::env::temp_dir().join(format!("cegat-logs-{}.cegat", std::process::id()));
+        let path = std::env::temp_dir().join(format!("ngintip-logs-{}.ngintip", std::process::id()));
         let _ = std::fs::remove_file(&path);
         {
             let store = Store::open(&path).unwrap();
@@ -1057,7 +1057,7 @@ mod tests {
             assert_eq!(logs.len(), 2);
             assert_eq!((logs[0].level.as_str(), logs[1].level.as_str()), ("info", "error")); // oldest first
         }
-        // Reopening the same file still has the logs (they live in the .cegat).
+        // Reopening the same file still has the logs (they live in the .ngintip).
         let store = Store::open(&path).unwrap();
         let logs = store.recent_logs(10).unwrap();
         assert_eq!(logs.len(), 2);
@@ -1074,15 +1074,15 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_is_a_valid_stamped_cegat_file() {
-        let path = std::env::temp_dir().join(format!("cegat-snap-src-{}.cegat", std::process::id()));
+    fn snapshot_is_a_valid_stamped_ngintip_file() {
+        let path = std::env::temp_dir().join(format!("ngintip-snap-src-{}.ngintip", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = Store::open(&path).unwrap();
         let uri: Uri = "https://example.com/x".parse().unwrap();
         let flow = Flow::request(store.next_id(), &Method::POST, &uri, Version::HTTP_11, &HeaderMap::new(), Bytes::from_static(b"role=admin"));
         store.push(flow).unwrap();
 
-        // The live file carries the Cegat header markers.
+        // The live file carries the Ngintip header markers.
         {
             let db = store.db.lock().unwrap();
             let app_id: i32 = db.conn.query_row("PRAGMA application_id", [], |r| r.get(0)).unwrap();
@@ -1094,7 +1094,7 @@ mod tests {
         // A snapshot is a self-standing SQLite file that reopens with the same data.
         let bytes = store.snapshot().unwrap();
         assert!(bytes.starts_with(b"SQLite format 3\0"), "snapshot is a SQLite file");
-        let dest = std::env::temp_dir().join(format!("cegat-snap-dst-{}.cegat", std::process::id()));
+        let dest = std::env::temp_dir().join(format!("ngintip-snap-dst-{}.ngintip", std::process::id()));
         let _ = std::fs::remove_file(&dest);
         std::fs::write(&dest, &bytes).unwrap();
         let reopened = Store::open(&dest).unwrap();

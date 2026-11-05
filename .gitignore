@@ -3,6 +3,8 @@ node_modules/
 dist/
 src-tauri/target/
 src-tauri/gen/schemas/
+temp_*
+
 
 # OS cruft
 .DS_Store
@@ -30,9 +32,8 @@ Thumbs.db
 *.p12
 *.pfx
 
-# Project files (the saved sessions, incl. stress-test output); .cegat is the old name
+# Project files (the saved sessions, incl. stress-test output)
 *.ngintip
-*.cegat
 
 # Per-project persistent browser profiles (generated at runtime, can be large)
 ngintip_browser/

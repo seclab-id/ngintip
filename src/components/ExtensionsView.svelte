@@ -18,6 +18,7 @@
     { id: 'proxy', short: 'Proxy', title: 'Run on live proxy (History) traffic' },
     { id: 'interceptor', short: 'Intercept', title: 'Run on messages held in the intercept queue' },
     { id: 'repeater', short: 'Repeater', title: 'Run on Repeater sends' },
+    { id: 'intruder', short: 'Intruder', title: 'Run on Intruder attack requests (applied to every request sent)' },
   ];
   const SAMPLE_REQUEST =
     'POST /login HTTP/1.1\nHost: example.com\nContent-Type: application/json\nContent-Length: 25\n\n{"user":"admin","pw":"x"}';
@@ -124,7 +125,7 @@
       </div>
     </div>
     {#if !ext.list.length}
-      <p class="dim empty">No extensions yet. Start from the template, or add a <span class="mono">.py</span> that defines <span class="mono">process_request</span> / <span class="mono">process_response</span>.</p>
+      <p class="dim empty">No extensions yet. Start from the template, or add a <span class="mono">.py</span> that defines <span class="mono">process_request</span>/<span class="mono">process_response</span> (change the wire), <span class="mono">decode_*</span> (show an encrypted body readable in History) or <span class="mono">encode_*</span> (re-encrypt an edited body on send).</p>
     {:else}
       <div class="table">
         <div class="trow thead">

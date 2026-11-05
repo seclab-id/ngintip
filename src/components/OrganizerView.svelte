@@ -2,6 +2,7 @@
   import { tick } from 'svelte';
   import { store } from '../lib/store.svelte.js';
   import MessageView from './MessageView.svelte';
+  import MiniDecoder from './MiniDecoder.svelte';
   import SplitPane from './SplitPane.svelte';
   import ContextMenu from './ContextMenu.svelte';
   import Modal from './Modal.svelte';
@@ -9,6 +10,9 @@
   import { HIGHLIGHTS } from '../lib/colors.js';
   import { fmtDateTime, statusClass } from '../lib/format.js';
   import { SAVED_COLUMNS, savedRows, notesView, notePreview } from '../lib/organizer.js';
+  import { splitMessage } from '../lib/message.js';
+  import { toCurl } from '../lib/curl.js';
+  import { loadColumnWidths, saveColumnWidths, columnTemplate, clampCol } from '../lib/colwidth.js';
 
   let tab = $state('collections');
   let menu = $state(null);
@@ -50,6 +54,99 @@
   const view = $derived(org.collections.find((c) => c.id === org.viewId) ?? org.collections[0] ?? null);
   const rows = $derived(view ? savedRows(view.items, query, sortKey, sortDir) : []);
   const selected = $derived(view?.items.find((it) => it.id === selectedId) ?? null);
+
+  // Highlight-to-decode side bar (same as History / Repeater): selecting decodable
+  // text in a pane opens MiniDecoder. Clear it when a different saved request is
+  // opened or the detail is closed, so a stale decode never lingers.
+  let miniDecode = $state(null);
+  $effect(() => {
+    selectedId;
+    miniDecode = null;
+  });
+
+  // Saved requests can carry the extension / original variants captured at save time,
+  // so the detail shows the same Wire / Extension / Original switcher the live views do.
+  function buildVariants(wire, orig, ext) {
+    const list = [{ id: 'final', label: 'Wire', raw: wire ?? '' }];
+    if (ext && ext !== wire) list.push({ id: 'decoded', label: 'Extension', raw: ext });
+    if (orig && orig !== wire) list.push({ id: 'original', label: 'Original', raw: orig });
+    return list.length > 1 ? list : null;
+  }
+
+  // A whole Intruder run saved as one record keeps every result, shown as a table like
+  // Intruder's own results list; the picked row drives the request/response panes.
+  const runRows = $derived(Array.isArray(selected?.results) && selected.results.length ? selected.results : null);
+  let runSel = $state(null);
+  $effect(() => {
+    selectedId;
+    runSel = null;
+  });
+  // Search inside a saved run's table (payload, status, row number or error).
+  let runQuery = $state('');
+  $effect(() => {
+    selectedId;
+    runQuery = '';
+  });
+  const runShown = $derived.by(() => {
+    if (!runRows) return null;
+    const q = runQuery.trim().toLowerCase();
+    if (!q) return runRows;
+    return runRows.filter(
+      (r) =>
+        String(r.n).includes(q) ||
+        String(r.status ?? '').includes(q) ||
+        (r.payloads ?? []).join(', ').toLowerCase().includes(q) ||
+        String(r.error ?? '').toLowerCase().includes(q),
+    );
+  });
+  const runRow = $derived(runRows ? (runRows.find((r) => r.n === runSel) ?? runShown?.[0] ?? runRows[0]) : null);
+
+  // ---- Resizable table columns ----
+  // Saved requests: the 7 sortable columns plus Note. Widths are px and remembered.
+  const COLS = [...SAVED_COLUMNS, { key: 'note', label: 'Note', plain: true }];
+  const SAVED_W = [44, 82, 64, 160, 260, 56, 120, 46];
+  const RUN_W = [56, 260, 84, 84, 84];
+  let savedW = $state(loadColumnWidths('organizer.saved', SAVED_W));
+  let runW = $state(loadColumnWidths('organizer.run', RUN_W));
+  const savedCols = $derived(columnTemplate(savedW));
+  const runCols = $derived(columnTemplate(runW));
+
+  // Drag a header grip to resize that column; double-click it to reset to the default.
+  let colDrag = null;
+  const widthsOf = (which) => (which === 'saved' ? savedW : runW);
+  const storeKeyOf = (which) => (which === 'saved' ? 'organizer.saved' : 'organizer.run');
+  function gripDown(e, which, i) {
+    e.preventDefault();
+    e.stopPropagation();
+    colDrag = { which, i, startX: e.clientX, startW: widthsOf(which)[i] };
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+  }
+  function gripMove(e) {
+    if (!colDrag) return;
+    widthsOf(colDrag.which)[colDrag.i] = clampCol(colDrag.startW + (e.clientX - colDrag.startX));
+  }
+  function gripUp(e) {
+    if (!colDrag) return;
+    saveColumnWidths(storeKeyOf(colDrag.which), widthsOf(colDrag.which));
+    try {
+      e.currentTarget.releasePointerCapture?.(e.pointerId);
+    } catch {
+      // the pointer was already released
+    }
+    colDrag = null;
+  }
+  function gripReset(which, i) {
+    const defaults = which === 'saved' ? SAVED_W : RUN_W;
+    widthsOf(which)[i] = defaults[i];
+    saveColumnWidths(storeKeyOf(which), widthsOf(which));
+  }
+
+  // What the panes show: the picked run row, else the record itself.
+  const shownReq = $derived(runRow ? runRow.request ?? '' : selected?.request ?? '');
+  const shownRes = $derived(runRow ? runRow.response ?? '' : selected?.response ?? '');
+  const src = $derived(runRow ?? selected);
+  const reqVariants = $derived(src ? buildVariants(shownReq, src.requestOriginal, src.requestExtension) : null);
+  const resVariants = $derived(src ? buildVariants(shownRes, src.responseOriginal, src.responseExtension) : null);
 
   function addCollection() {
     const name = newCol.trim();
@@ -161,6 +258,65 @@
         { label: 'Delete…', danger: true, run: () => deleteSaved(it) },
       ],
     };
+  }
+
+  // Right-click menus on the saved request's Request / Response panes, matching the
+  // ones in Repeater (copy, send to Repeater/Intruder/Decoder/Comparer).
+  const itemUrl = (it) => `${it.target}${it.path ?? ''}`;
+  const itemTitle = (it) => it.name || it.host;
+  function openReqMenu(e) {
+    if (!selected) return;
+    e.preventDefault();
+    const raw = shownReq || '';
+    const body = splitMessage(raw).body;
+    menu = {
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        { label: 'Send to Repeater', run: () => store.sendSavedToRepeater(selected) },
+        { label: 'Send to Intruder', run: () => store.sendSavedToIntruder(selected) },
+        { label: 'Send to Decoder', run: () => store.sendStringToDecoder(raw) },
+        { label: 'Send to Comparer', run: () => store.addToComparer(raw, `${itemTitle(selected)} req`, 'req') },
+        'separator',
+        { label: 'Copy URL', run: () => store.copyText(itemUrl(selected), 'URL') },
+        { label: 'Copy as cURL', run: () => store.copyText(toCurl(raw, selected.target), 'cURL command') },
+        { label: 'Copy request body', disabled: !body, run: () => store.copyText(body, 'Request body') },
+        { label: 'Copy raw request', run: () => store.copyText(raw, 'Request') },
+      ],
+    };
+  }
+  function openResMenu(e) {
+    if (!selected) return;
+    const raw = shownRes || '';
+    if (!raw) return; // nothing saved: leave the native menu
+    e.preventDefault();
+    const body = splitMessage(raw).body;
+    menu = {
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        { label: 'Copy response body', disabled: !body, run: () => store.copyText(body, 'Response body') },
+        { label: 'Copy raw response', run: () => store.copyText(raw, 'Response') },
+        { label: 'Send response to Decoder', run: () => store.sendStringToDecoder(raw) },
+        { label: 'Send response to Comparer', run: () => store.addToComparer(raw, `${itemTitle(selected)} res`, 'res') },
+        'separator',
+        { label: 'Send to Repeater', run: () => store.sendSavedToRepeater(selected) },
+        { label: 'Send to Intruder', run: () => store.sendSavedToIntruder(selected) },
+        { label: 'Copy URL', run: () => store.copyText(itemUrl(selected), 'URL') },
+      ],
+    };
+  }
+
+  // Ctrl/Cmd+R sends the selected saved request to Repeater (same convention as
+  // History/Repeater). Without this, the keystroke used to fall through to the webview
+  // and reload the app back to the project chooser.
+  function onKey(e) {
+    if (!(e.ctrlKey || e.metaKey) || (e.key !== 'r' && e.key !== 'R')) return;
+    if (tab !== 'collections' || !selected) return;
+    const el = document.activeElement;
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
+    e.preventDefault();
+    store.sendSavedToRepeater(selected);
   }
 
   // Draggable divider between the table (top) and the request/response detail (bottom).
@@ -315,14 +471,28 @@
 
           <div class="panes" bind:this={panes} style="grid-template-rows: {selected ? `${split}fr 5px ${1 - split}fr` : '1fr'}">
             <div class="pane table-pane">
-              <div class="rtable" role="table">
+              <div class="rtable" role="table" style="--cols: {savedCols}">
                 <div class="rrow rhead" role="row">
-                  {#each SAVED_COLUMNS as col (col.key)}
-                    <button class="th" class:sorted={sortKey === col.key} onclick={() => sortBy(col.key)} title="Sort by {col.label}">
-                      {col.label}{#if sortKey === col.key}<span class="arrow">{sortDir > 0 ? '↑' : '↓'}</span>{/if}
-                    </button>
+                  {#each COLS as col, i (col.key)}
+                    <div class="thwrap">
+                      {#if col.plain}
+                        <span class="th plain">{col.label}</span>
+                      {:else}
+                        <button class="th" class:sorted={sortKey === col.key} onclick={() => sortBy(col.key)} title="Sort by {col.label}">
+                          {col.label}{#if sortKey === col.key}<span class="arrow">{sortDir > 0 ? '↑' : '↓'}</span>{/if}
+                        </button>
+                      {/if}
+                      <!-- svelte-ignore a11y_no_static_element_interactions -->
+                      <span
+                        class="grip"
+                        title="Drag to resize, double-click to reset"
+                        onpointerdown={(e) => gripDown(e, 'saved', i)}
+                        onpointermove={gripMove}
+                        onpointerup={gripUp}
+                        ondblclick={() => gripReset('saved', i)}
+                      ></span>
+                    </div>
                   {/each}
-                  <span class="th plain">Note</span>
                 </div>
                 <div class="rbody">
                   {#each rows as { it, n } (it.id)}
@@ -376,14 +546,72 @@
                   </button>
                   <button class="icbtn close" title="Close detail" aria-label="Close detail" onclick={() => (selectedId = null)}>×</button>
                 </div>
-                <div class="msgs">
-                  <SplitPane storeKey="organizer" left={reqPane} right={resPane} />
-                  {#snippet reqPane()}
-                    <MessageView bind:this={reqRef} title="Request" raw={selected.request} placeholder="No request saved" preferPretty />
-                  {/snippet}
-                  {#snippet resPane()}
-                    <MessageView bind:this={resRef} title="Response" raw={selected.response} placeholder="No response saved" preferPretty />
-                  {/snippet}
+                {#if runRows}
+                  <!-- A saved Intruder run: browse its results like Intruder's own table. -->
+                  <div class="runrows" style="--cols: {runCols}">
+                    <div class="runbar">
+                      <span class="dim">{runQuery ? `${runShown.length} of ${runRows.length}` : `${runRows.length}`} results</span>
+                      <span class="grow"></span>
+                      <label class="search runsearch">
+                        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
+                        <input placeholder="Search payload, status…" bind:value={runQuery} spellcheck="false" aria-label="Search results" />
+                        {#if runQuery}<button class="clear" aria-label="Clear search" onclick={() => (runQuery = '')}>×</button>{/if}
+                      </label>
+                    </div>
+                    <div class="runrow rh">
+                      {#each ['#', 'Payload', 'Status', 'Length', 'Time'] as label, i (label)}
+                        <div class="thwrap">
+                          <span class="rcell">{label}</span>
+                          <!-- svelte-ignore a11y_no_static_element_interactions -->
+                          <span
+                            class="grip"
+                            title="Drag to resize, double-click to reset"
+                            onpointerdown={(e) => gripDown(e, 'run', i)}
+                            onpointermove={gripMove}
+                            onpointerup={gripUp}
+                            ondblclick={() => gripReset('run', i)}
+                          ></span>
+                        </div>
+                      {/each}
+                    </div>
+                    <div class="runbody">
+                      {#each runShown as r (r.n)}
+                        <button class="runrow" class:sel={r.n === runRow?.n} class:failed={r.error} onclick={() => (runSel = r.n)}>
+                          <span class="rcell dim mono">{r.n}</span>
+                          <span class="rcell mono pay" title={(r.payloads ?? []).join(', ')}>{(r.payloads ?? []).join(', ') || '-'}</span>
+                          <span class="rcell"><span class="rstatus {r.status ? statusClass(r.status) : ''}">{r.error ? 'ERR' : r.status}</span></span>
+                          <span class="rcell dim mono">{r.length ?? 0} B</span>
+                          <span class="rcell dim mono">{r.timeMs ?? 0} ms</span>
+                        </button>
+                      {:else}
+                        <p class="runempty dim">No result matches "{runQuery}".</p>
+                      {/each}
+                    </div>
+                  </div>
+                {/if}
+                <div class="msgs" class:with-decoder={miniDecode}>
+                  <div class="msgs-panes">
+                    <SplitPane storeKey="organizer" left={reqPane} right={resPane} />
+                    {#snippet reqPane()}
+                      <!-- svelte-ignore a11y_no_static_element_interactions -->
+                      <div class="ctxwrap" oncontextmenu={openReqMenu}>
+                        <MessageView bind:this={reqRef} title={runRow ? `Request #${runRow.n}` : 'Request'} raw={shownReq} variants={reqVariants}
+                          placeholder={runRow?.trimmed ? 'Request not kept for this row (size cap)' : 'No request saved'} preferPretty
+                          ondecode={(t) => (miniDecode = { text: t })} onsend={(t) => store.sendStringToDecoder(t)} />
+                      </div>
+                    {/snippet}
+                    {#snippet resPane()}
+                      <!-- svelte-ignore a11y_no_static_element_interactions -->
+                      <div class="ctxwrap" oncontextmenu={openResMenu}>
+                        <MessageView bind:this={resRef} title={runRow ? `Response #${runRow.n}` : 'Response'} raw={runRow?.error ? '' : shownRes} variants={resVariants}
+                          placeholder={runRow?.error ? runRow.error : runRow?.trimmed ? 'Response not kept for this row (size cap)' : 'No response saved'} preferPretty
+                          ondecode={(t) => (miniDecode = { text: t })} onsend={(t) => store.sendStringToDecoder(t)} />
+                      </div>
+                    {/snippet}
+                  </div>
+                  {#if miniDecode}
+                    <aside class="decoder-dock"><MiniDecoder text={miniDecode.text} onclose={() => (miniDecode = null)} /></aside>
+                  {/if}
                 </div>
               </div>
             {/if}
@@ -465,6 +693,8 @@
     </div>
   {/if}
 </div>
+
+<svelte:window onkeydown={onKey} />
 
 {#if menu}
   <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={() => (menu = null)} />
@@ -776,7 +1006,8 @@
   }
   .rrow {
     display: grid;
-    grid-template-columns: 44px 82px 64px minmax(110px, 1fr) minmax(0, 1.7fr) 56px minmax(0, 0.9fr) 46px;
+    /* Set on .rtable from the remembered column widths (drag a header grip). */
+    grid-template-columns: var(--cols);
     align-items: center;
     min-height: 28px;
     padding: 0 6px;
@@ -963,10 +1194,140 @@
   .icbtn.danger:hover {
     color: var(--red);
   }
-  .msgs {
+  /* Header grip: drag to resize a column, double-click to reset it. */
+  .thwrap {
+    position: relative;
     display: flex;
+    align-items: center;
+    min-width: 0;
+  }
+  .thwrap > .th,
+  .thwrap > .rcell {
+    flex: 1;
+    min-width: 0;
+  }
+  .grip {
+    position: absolute;
+    top: 0;
+    right: -4px;
+    bottom: 0;
+    width: 9px;
+    cursor: col-resize;
+    touch-action: none;
+    z-index: 2;
+  }
+  .grip::after {
+    content: '';
+    position: absolute;
+    top: 5px;
+    bottom: 5px;
+    left: 4px;
+    width: 1px;
+    background: var(--border);
+  }
+  .grip:hover::after {
+    background: var(--accent);
+  }
+  /* A saved Intruder run: its results as a compact table above the message panes. */
+  .runbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+  }
+  .runsearch {
+    width: 230px;
+  }
+  .runempty {
+    padding: 10px 12px;
+    font-size: 12px;
+  }
+  .runrows {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    max-height: 230px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+  }
+  .runbody {
+    min-height: 0;
+    overflow: auto;
+  }
+  .runrow {
+    display: grid;
+    grid-template-columns: var(--cols);
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 0 12px;
+    height: 26px;
+    border: 0;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 45%, transparent);
+    background: none;
+    color: var(--text);
+    font-size: 12px;
+    text-align: left;
+    cursor: default;
+  }
+  .runrow.rh {
+    position: sticky;
+    top: 0;
+    color: var(--text-faint);
+    font: 600 10.5px var(--sans);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    background: var(--bg-elev);
+  }
+  .runbody .runrow:hover {
+    background: var(--bg-hover);
+  }
+  .runbody .runrow.sel {
+    background: var(--accent-soft);
+  }
+  .runrow .rcell {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .runrow .pay {
+    color: var(--text);
+  }
+  .runrow.failed .rstatus {
+    color: var(--red);
+  }
+  .rstatus {
+    font: 600 11.5px var(--mono);
+  }
+  /* Grid (not flex) so the panes fill the full width, and a second column opens for
+     the decoder dock when a selection is being decoded (same layout as History). */
+  .msgs {
+    display: grid;
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(0, 1fr);
     flex: 1;
     min-height: 0;
+  }
+  .msgs.with-decoder {
+    /* The dock column sizes to the MiniDecoder's own (draggable) width. */
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .msgs-panes {
+    display: grid;
+    grid-template-rows: minmax(0, 1fr);
+    min-width: 0;
+    min-height: 0;
+  }
+  .decoder-dock {
+    min-width: 0;
+    min-height: 0;
+  }
+  /* Transparent to layout (MessageView stays the SplitPane grid child) but still on
+     the DOM path, so right-clicking anywhere in the pane reaches oncontextmenu. */
+  .ctxwrap {
+    display: contents;
   }
 
   /* ---------- Notes ---------- */

@@ -74,7 +74,7 @@ function orgApply(a) {
       const it = a.item ?? {};
       const [method = 'GET', path = '/'] = String(it.request ?? '').split('\n')[0].trim().split(/\s+/).filter(Boolean);
       const host = String(it.target ?? '').replace(/^[a-z]+:\/\//i, '').split('/')[0];
-      const saved = { id: `req-${++orgSeq}`, name: it.name || `${method} ${host}${path}`, method, host, path, target: it.target ?? '', request: it.request ?? '', response: it.response ?? '', status: it.status ?? null, label: it.label ?? '', note: it.note ?? '', color: it.color ?? '', source: it.source ?? '', savedAt: Date.now() };
+      const saved = { id: `req-${++orgSeq}`, name: it.name || `${method} ${host}${path}`, method, host, path, target: it.target ?? '', request: it.request ?? '', response: it.response ?? '', requestOriginal: it.requestOriginal ?? '', requestExtension: it.requestExtension ?? '', responseOriginal: it.responseOriginal ?? '', responseExtension: it.responseExtension ?? '', results: it.results ?? null, status: it.status ?? null, label: it.label ?? '', note: it.note ?? '', color: it.color ?? '', source: it.source ?? '', savedAt: Date.now() };
       c.items.push(saved);
       collectionId = c.id;
       itemId = saved.id;
@@ -122,16 +122,21 @@ const backend = {
     if (tab != null) sent.push({ id: sent.length + 1, tabId: tab, ts: Date.now(), target, raw, error: null, ...res });
     return res;
   },
+  // Intruder sends go through their own command (intruder-scope extensions apply there).
+  intruder_send: ({ raw }) => {
+    const line = raw.split('\n')[0];
+    return { status: 200, durationMs: 1, length: 2, responseRaw: `HTTP/1.1 200 OK\n\nsent: ${line}`, responseImage: null };
+  },
   cancel_send: () => true,
   repeater_history: ({ tab }) => sent.filter((e) => e.tabId === tab).map((e) => ({ ...e, responseRaw: '' })),
   repeater_entry: ({ id }) => sent.find((e) => e.id === id),
   clear_repeater_history: () => null,
   project_info: () => ({ name: 'demo', path: '/tmp/demo.intip' }),
   blank_project: () => ({ name: 'scratch', path: '' }),
-  save_project_as: ({ path }) => (savedAs.push(path), { name: 'demo', path: '/tmp/demo.cegat', rawSize: 1048576, compressedSize: 131072, percent: 88, summary: '1.0 MB -> 128.0 KB (88% smaller)' }),
+  save_project_as: ({ path }) => (savedAs.push(path), { name: 'demo', path: '/tmp/demo.ngintip', rawSize: 1048576, compressedSize: 131072, percent: 88, summary: '1.0 MB -> 128.0 KB (88% smaller)' }),
   default_project_dir: () => '/Users/me/Documents/Ngintip',
   path_exists: ({ path }) => existing.has(path),
-  save_project: () => ({ name: 'demo', path: '/tmp/demo.cegat', rawSize: 1048576, compressedSize: 131072, percent: 88, summary: '1.0 MB -> 128.0 KB (88% smaller)' }),
+  save_project: () => ({ name: 'demo', path: '/tmp/demo.ngintip', rawSize: 1048576, compressedSize: 131072, percent: 88, summary: '1.0 MB -> 128.0 KB (88% smaller)' }),
   get_config: () => ({ auth: { enabled: false, username: '', password: '' }, upstream: '', invisible: false, autoContentLength: true, hostOverrides: [] }),
   set_auto_content_length: () => null,
   get_scope: () => ['*.example.com'],
@@ -178,7 +183,14 @@ const backend = {
     requestTruncatedView: id === 1,
     responseTruncatedView: false,
     // Flow 2 was edited in Intercept, so it keeps an Original request variant.
-    variants: id === 2 ? { reqOriginal: 'GET /v1/login-ORIGINAL HTTP/2\nHost: api.example.com\n\n' } : {},
+    variants:
+      id === 2
+        ? {
+            reqOriginal: 'GET /v1/login-ORIGINAL HTTP/2\nHost: api.example.com\n\n',
+            // A decode_* extension's readable view of the (encrypted) response.
+            resExtension: 'HTTP/2 200 OK\nContent-Type: application/json\n\n{"decoded":true,"user":"a"}',
+          }
+        : {},
   }),
   flow_body: ({ id, side }) => `FULL ${side} body for ${id} ` + 'x'.repeat(50),
   flow_image: () => null,
@@ -227,6 +239,8 @@ vi.mock('@tauri-apps/api/event', () => ({
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(), save: vi.fn() }));
 const { open: openDialog, save: saveDialog } = await import('@tauri-apps/plugin-dialog');
 
+const { BRAND } = await import('./lib/brand.js');
+const APP_VERSION = BRAND.version; // from package.json, like the UI
 const { default: App } = await import('./App.svelte');
 const { store } = await import('./lib/store.svelte.js');
 
@@ -266,6 +280,12 @@ beforeAll(async () => {
     disconnect() {}
   };
   Object.defineProperty(navigator, 'clipboard', { value: { writeText: vi.fn().mockResolvedValue(undefined) }, configurable: true });
+  // Settings > Project checks GitHub for the latest release when it mounts; keep it
+  // off the real network in tests (same version back -> "latest", no update banner).
+  globalThis.fetch = vi.fn(async () => ({
+    ok: true,
+    json: async () => ({ tag_name: `v${APP_VERSION}`, html_url: `https://github.com/seclab-id/ngintip/releases/tag/v${APP_VERSION}` }),
+  }));
   window.addEventListener('error', (e) => errors.push(e.error));
   app = mount(App, { target: document.body });
   await settle();
@@ -356,13 +376,30 @@ describe('UI smoke test', () => {
     await click(row2);
     const request = $$('.msgs .panel')[0];
     const tabs = () => [...request.querySelectorAll('.modes.variants .mode')].map((b) => b.textContent.trim());
-    expect(tabs()).toEqual(['Final', 'Original']);
+    expect(tabs()).toEqual(['Wire', 'Original']);
     await click([...request.querySelectorAll('.modes.variants .mode')].find((b) => b.textContent.trim() === 'Original'));
     expect(request.querySelector('pre.code').textContent).toContain('/v1/login-ORIGINAL');
     // A flow with no variants shows no switcher.
     const row1 = $$('.table .row:not(.head)').find((r) => r.textContent.includes('/v1/users'));
     await click(row1);
     expect($$('.msgs .panel')[0].querySelector('.modes.variants')).toBeNull();
+  });
+
+  it('offers a decoded extension view alongside the real wire message', async () => {
+    store.view = 'history';
+    await settle();
+    const row2 = $$('.table .row:not(.head)').find((r) => r.textContent.includes('/v1/login'));
+    await click(row2);
+    const response = $$('.msgs .panel')[1];
+    const tabs = () => [...response.querySelectorAll('.modes.variants .mode')].map((b) => b.textContent.trim());
+    // The response carries a decoded view, offered alongside the wire message.
+    expect(tabs()).toEqual(['Wire', 'Extension']);
+    // The wire message is shown by default, so nothing that crossed the wire is hidden.
+    expect(response.querySelector('.modes.variants .mode.active').textContent.trim()).toBe('Wire');
+    expect(response.textContent).toContain('eyJhbGciOiJIUzI1NiJ9');
+    // Clicking Extension shows the extension's readable view.
+    await click([...response.querySelectorAll('.modes.variants .mode')].find((b) => b.textContent.trim() === 'Extension'));
+    expect(response.textContent).toContain('decoded');
   });
 
   it('closes the request/response detail with the X button', async () => {
@@ -701,6 +738,67 @@ describe('UI smoke test', () => {
     expect($('.menu')).toBeNull();
   });
 
+  it('send to Repeater seeds the decoded request, else the wire request', async () => {
+    // With a decoded view, the Repeater tab starts from readable plaintext (so you
+    // edit plaintext; encode_* re-encrypts on send).
+    store.sendToRepeater({
+      summary: { scheme: 'https', host: 'api.example.com' },
+      requestRaw: 'POST /x HTTP/1.1\nHost: api.example.com\n\n<CIPHERTEXT>',
+      variants: { reqExtension: 'POST /x HTTP/1.1\nHost: api.example.com\n\n{"plain":true}' },
+    });
+    let tab = store.repeater.tabs.at(-1);
+    expect(tab.raw).toContain('{"plain":true}');
+    expect(tab.raw).not.toContain('<CIPHERTEXT>');
+    store.closeRepeaterTab(tab.id);
+    await settle();
+    // No decoded view -> the real (wire) request is used.
+    store.sendToRepeater({ summary: { scheme: 'https', host: 'h' }, requestRaw: 'RAW-WIRE', variants: {} });
+    tab = store.repeater.tabs.at(-1);
+    expect(tab.raw).toBe('RAW-WIRE');
+    store.closeRepeaterTab(tab.id);
+    await settle();
+  });
+
+  it('send to Intruder seeds the decoded request (saved too), else the wire request', async () => {
+    // History -> Intruder uses the decoded view when present (mark positions on plaintext;
+    // intruder-scope encode_* re-encrypts each attack request on send).
+    const orig = backend.get_flow;
+    backend.get_flow = ({ id }) => ({
+      summary: { id, scheme: 'https', host: 'api.example.com' },
+      requestRaw: 'POST /x HTTP/1.1\nHost: api.example.com\n\n<CIPHERTEXT>',
+      variants: { reqExtension: 'POST /x HTTP/1.1\nHost: api.example.com\n\n{"plain":true}' },
+    });
+    await store.sendFlowToIntruder(1);
+    await settle();
+    let itab = store.intruder.tabs.at(-1);
+    expect(itab.raw).toContain('{"plain":true}');
+    expect(itab.raw).not.toContain('<CIPHERTEXT>');
+    store.closeIntruderTab(itab.id);
+    backend.get_flow = orig;
+    await settle();
+
+    // A saved History item carries the decoded form in requestExtension.
+    store.sendSavedToIntruder({ name: 'x', target: 'https://h', request: 'WIRE', requestExtension: 'PLAINTEXT-EXT' });
+    itab = store.intruder.tabs.at(-1);
+    expect(itab.raw).toBe('PLAINTEXT-EXT');
+    store.closeIntruderTab(itab.id);
+    await settle();
+
+    // A saved Repeater / Intruder item carries the typed form in requestOriginal.
+    store.sendSavedToRepeater({ name: 'x', target: 'https://h', request: 'WIRE', requestOriginal: 'TYPED-PLAINTEXT' });
+    const rtab = store.repeater.tabs.at(-1);
+    expect(rtab.raw).toBe('TYPED-PLAINTEXT');
+    store.closeRepeaterTab(rtab.id);
+    await settle();
+
+    // No variants -> the wire request is used as-is.
+    store.sendSavedToIntruder({ name: 'x', target: 'https://h', request: 'ONLY-WIRE' });
+    itab = store.intruder.tabs.at(-1);
+    expect(itab.raw).toBe('ONLY-WIRE');
+    store.closeIntruderTab(itab.id);
+    await settle();
+  });
+
   it('Cmd/Ctrl+R sends the selected request to Repeater', async () => {
     store.view = 'history';
     await settle();
@@ -799,6 +897,38 @@ describe('UI smoke test', () => {
     await click([...document.querySelectorAll('.modal button')].find((b) => b.textContent.includes('Clear all')));
     await settle();
     expect(store.intercept.filter.rules.length).toBe(0);
+  });
+
+  it('Intercept beautifies the body for display but forwards the exact wire unless edited', async () => {
+    const { invoke } = await import('@tauri-apps/api/core');
+    store.view = 'intercept';
+    const raw = 'POST /pretty HTTP/1.1\nHost: c.com\nContent-Type: application/json\nContent-Length: 17\n\n{"a":1,"b":[2,3]}';
+    listeners.intercept({ payload: { key: 501, id: 77, phase: 'request', method: 'POST', scheme: 'https', host: 'c.com', path: '/pretty', status: null, raw } });
+    await settle();
+    store.selectHeld(501);
+    await settle();
+    // The body is shown beautified (indented JSON)...
+    expect(store.intercept.draft).toContain('"a": 1');
+    expect(store.intercept.draft).not.toBe(raw);
+    // ...but beautifying is not an edit, so no "edited" badge appears.
+    expect($('.intercept .edited')).toBeNull();
+    // Forwarding an unedited (only-beautified) message sends null = the exact wire bytes.
+    await store.forwardHeld();
+    const fwd = invoke.mock.calls.filter((c) => c[0] === 'intercept_forward').at(-1);
+    expect(fwd[1].raw).toBeNull();
+  });
+
+  it('Settings > Project shows the app version and opens the releases page', async () => {
+    const { invoke } = await import('@tauri-apps/api/core');
+    store.settingsSection = 'project';
+    store.view = 'settings';
+    await settle();
+    const row = $('.settings .kv.version');
+    expect(row).toBeTruthy();
+    expect(row.querySelector('.vval').textContent).toContain(APP_VERSION);
+    await click(buttonWith('Releases'));
+    const opened = invoke.mock.calls.filter((c) => c[0] === 'open_url').at(-1);
+    expect(opened[1].url).toContain('seclab-id/ngintip');
   });
 
   it('edits and sends in Repeater', async () => {
@@ -1338,15 +1468,15 @@ describe('UI smoke test', () => {
     expect(calls).toContain('set_extensions');
     expect(store.extensions.list.some((e) => e.name === 'decrypt')).toBe(true);
     expect(text()).toContain('/tmp/decrypt.py');
-    // Scope surface toggles (Proxy / Intercept / Repeater) -> set_extensions.
+    // Scope surface toggles (Proxy / Intercept / Repeater / Intruder) -> set_extensions.
     const surfBtns = $$('.ext .trow .scope .surf');
-    expect(surfBtns.length).toBe(3);
-    // A new extension defaults to all three surfaces on.
+    expect(surfBtns.length).toBe(4);
+    // A new extension defaults to all surfaces on.
     expect(surfBtns.every((b) => b.classList.contains('on'))).toBe(true);
-    // Turning Proxy off narrows the scope to the other two surfaces.
+    // Turning Proxy off narrows the scope to the other three surfaces.
     await click(surfBtns[0]);
     await settle();
-    expect(store.extensions.list[0].scope).toBe('interceptor,repeater');
+    expect(store.extensions.list[0].scope).toBe('interceptor,repeater,intruder');
     // Test panel: open, run, see transformed output.
     await click(buttonWith('Test'));
     await click(buttonWith('Run test'));
@@ -1437,9 +1567,9 @@ describe('UI smoke test', () => {
     expect(saveDialog).toHaveBeenCalled();
   });
 
-  it('Project menu "Save As" writes a compressed .cegat and reports the size drop', async () => {
+  it('Project menu "Save As" writes a compressed .ngintip and reports the size drop', async () => {
     saveDialog.mockClear();
-    saveDialog.mockResolvedValueOnce('/tmp/demo.cegat');
+    saveDialog.mockResolvedValueOnce('/tmp/demo.ngintip');
     listeners.menu({ payload: 'save_as' });
     await settle();
     expect(saveDialog).toHaveBeenCalled();
@@ -1786,7 +1916,7 @@ describe('UI smoke test', () => {
     expect(savedAs.at(-1)).toBe('/Users/me/Documents/Ngintip/project_pentest_x.ngintip');
     expect($('#np-name')).toBeNull();
     expect(store.chooser).toBe(false);
-    expect(store.project.path).toBe('/tmp/demo.cegat');
+    expect(store.project.path).toBe('/tmp/demo.ngintip');
   });
 
   it('New project: Random gives a dated name, Change… picks the folder, an existing file asks first', async () => {
@@ -2459,12 +2589,67 @@ describe('UI smoke test', () => {
     expect(store.organizer.activeId).toBe(other().id);
     expect(colBtn('Other').textContent).toContain('active');
     expect(store.organizerTargetHint).toBe('Other');
-    // Send to Repeater from the row menu (no inline buttons).
+    // Send to Repeater from the row menu (no inline buttons). The first send fills the
+    // lone untouched default tab in place instead of opening a second, blank tab.
     const beforeTabs = store.repeater.tabs.length;
     await menuOn(rowsEl()[0]);
     await pick('Send to Repeater');
     expect(store.view).toBe('repeater');
-    expect(store.repeater.tabs.length).toBe(beforeTabs + 1);
+    expect(store.repeater.tabs.length).toBe(beforeTabs); // the blank default tab was reused
+    const seeded = store.repeater.tabs.find((t) => t.id === store.repeater.activeId);
+    expect(seeded.name).not.toBe(String(seeded.id)); // seeded from the saved item, not left blank
+  });
+
+  it('organizer: Request/Response panes have a custom right-click menu, and Ctrl+R sends to Repeater', async () => {
+    store.view = 'organizer';
+    await settle();
+    await click($$('.organizer .col-item').find((b) => b.textContent.includes('Targets')));
+    await settle();
+    await click($$('.organizer .rbody .rrow')[0]);
+    await settle();
+    const panels = $$('.organizer .detail .panel');
+    expect(panels.length).toBe(2); // request + response, each wrapped so right-click is caught
+    const ctx = async (el) => {
+      el.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 20, clientY: 20 }));
+      await settle();
+    };
+    const labels = () => $$('.menu .item').map((b) => b.textContent.trim());
+    // Request pane: send + copy actions (same set Repeater offers).
+    await ctx(panels[0]);
+    let ls = labels();
+    expect(ls.some((l) => l.startsWith('Send to Repeater'))).toBe(true);
+    expect(ls.some((l) => l.startsWith('Copy as cURL'))).toBe(true);
+    expect(ls.some((l) => l.startsWith('Copy raw request'))).toBe(true);
+    // Response pane: its own menu.
+    await ctx(panels[1]);
+    ls = labels();
+    expect(ls.some((l) => l.startsWith('Copy raw response'))).toBe(true);
+    expect(ls.some((l) => l.startsWith('Send response to Comparer'))).toBe(true);
+    // Ctrl+R with a saved request selected sends it to Repeater (never reloads the app).
+    const ev = new KeyboardEvent('keydown', { key: 'r', ctrlKey: true, bubbles: true, cancelable: true });
+    window.dispatchEvent(ev);
+    await settle();
+    expect(store.view).toBe('repeater');
+  });
+
+  it('swallows webview reload shortcuts inside the desktop app (prevents the Ctrl+R-to-onboarding crash)', async () => {
+    store.view = 'settings';
+    await settle();
+    // Plain browser (no Tauri globals): reload is left alone.
+    const browserEv = new KeyboardEvent('keydown', { key: 'r', ctrlKey: true, bubbles: true, cancelable: true });
+    window.dispatchEvent(browserEv);
+    expect(browserEv.defaultPrevented).toBe(false);
+    // Inside the Tauri webview: Ctrl+R, Cmd+R and F5 are all swallowed so no reload wipes state.
+    window.__TAURI_INTERNALS__ = {};
+    try {
+      for (const init of [{ key: 'r', ctrlKey: true }, { key: 'R', metaKey: true }, { key: 'F5' }]) {
+        const ev = new KeyboardEvent('keydown', { ...init, bubbles: true, cancelable: true });
+        window.dispatchEvent(ev);
+        expect(ev.defaultPrevented).toBe(true);
+      }
+    } finally {
+      delete window.__TAURI_INTERNALS__;
+    }
   });
 
   it('context menu: nested "Move to" opens on hover / ArrowRight and closes when leaving it', async () => {
@@ -2589,10 +2774,12 @@ describe('UI smoke test', () => {
     const before = store.organizerCount;
     await ctx($$('.intruder .results .rows .row')[0]);
     expect(labels().some((l) => l.startsWith('Copy payload'))).toBe(true);
+    // Per-result save (marked intruder(each)) and a "save all results" entry are offered.
+    expect(labels().some((l) => l.startsWith('Save all 1 results to Organizer'))).toBe(true);
     await click($$('.menu .item').find((b) => b.textContent.trim().startsWith('Save to Organizer')));
     expect(store.organizerCount).toBe(before + 1);
     const saved = store.organizer.collections.flatMap((c) => c.items).at(-1);
-    expect(saved).toMatchObject({ source: 'intruder', label: 'admin', status: 200 });
+    expect(saved).toMatchObject({ source: 'intruder(each)', label: 'admin', status: 200 });
     expect(saved.response).toContain('ok');
     // The result's response and request panes each get their own menu.
     const panes = $$('.intruder .resp [style*="contents"]');
@@ -2601,6 +2788,272 @@ describe('UI smoke test', () => {
     await ctx(panes[0]);
     expect(labels().some((l) => l.startsWith('Copy as cURL'))).toBe(true);
     t.results = [];
+    t.selected = null;
+  });
+
+  it('raw mode is per tab and tells the backend to skip extensions on that send', async () => {
+    const { invoke } = await import('@tauri-apps/api/core');
+    // The toggle only appears where an enabled extension actually covers that surface.
+    store.extensions.enabled = false;
+    store.view = 'repeater';
+    await settle();
+    expect($('.repeater .rawmode')).toBeNull();
+    store.extensions.enabled = true;
+    store.extensions.list = [{ id: 'e1', name: 'enc', scope: 'all', enabled: true, running: true, error: null, requirements: [], path: '/tmp/e.py' }];
+    await settle();
+    expect($('.repeater .rawmode')).toBeTruthy();
+
+    // Off by default: the send asks for extensions.
+    const rep = store.repeater.tabs.find((t) => t.id === store.repeater.activeId);
+    expect(rep.rawMode).toBe(false);
+    await store.sendRepeater(rep);
+    let call = invoke.mock.calls.filter((c) => c[0] === 'send_raw').at(-1);
+    expect(call[1].bypassExt).toBe(false);
+
+    // Ticking the box flips it for this tab only, and the tab shows a RAW badge.
+    await click($('.repeater .rawmode input'));
+    expect(rep.rawMode).toBe(true);
+    await store.sendRepeater(rep);
+    call = invoke.mock.calls.filter((c) => c[0] === 'send_raw').at(-1);
+    expect(call[1].bypassExt).toBe(true);
+    expect($('.repeater .tab .rawtag')).toBeTruthy();
+    // A second tab is unaffected: raw mode is per tab.
+    store.addRepeaterTab({ name: 'other', target: 'https://h', raw: 'GET / HTTP/1.1\nHost: h\n\n' });
+    await settle();
+    expect(store.repeater.tabs.at(-1).rawMode).toBe(false);
+    store.closeRepeaterTab(store.repeater.tabs.at(-1).id);
+    rep.rawMode = false;
+
+    // Same switch in Intruder, reaching intruder_send.
+    store.view = 'intruder';
+    await settle();
+    const t = store.intruder.tabs.find((x) => x.id === store.intruder.activeId);
+    expect($('.intruder .rawmode')).toBeTruthy();
+    t.rawMode = true;
+    t.raw = `GET /u?id=§x§ HTTP/1.1\nHost: h\n\n`;
+    t.sets = ['a'];
+    t.concurrency = 1;
+    await settle();
+    await store.startAttack(t);
+    for (let i = 0; i < 60 && t.running; i++) await settle();
+    const ic = invoke.mock.calls.filter((c) => c[0] === 'intruder_send').at(-1);
+    expect(ic[1].bypassExt).toBe(true);
+    t.rawMode = false;
+    t.results = [];
+    store.extensions.enabled = false;
+    store.extensions.list = [];
+    await settle();
+  });
+
+  it('intruder: arrow keys still browse results after focus leaves the list (clicking the detail panes)', async () => {
+    store.view = 'intruder';
+    await settle();
+    const t = store.intruder.tabs.find((x) => x.id === store.intruder.activeId);
+    t.results = [1, 2, 3].map((n) => ({ n, status: 200, length: n, timeMs: n, payloads: [`p${n}`], requestRaw: `GET /?q=p${n} HTTP/1.1\nHost: x\n\n`, responseRaw: `HTTP/1.1 200 OK\n\nbody ${n}` }));
+    t.selected = 1;
+    await settle();
+    // Clicking inside the result detail moves focus off the list (the request/response
+    // panes are not focusable, so focus falls back to <body>); the rows-only listener
+    // never saw the keys again, which is what made "↑ ↓ to browse" look broken.
+    document.activeElement?.blur?.();
+    const press = async (k) => {
+      const ev = new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true });
+      document.body.dispatchEvent(ev);
+      await settle();
+      return ev.defaultPrevented;
+    };
+    expect(await press('ArrowDown')).toBe(true);
+    expect(t.selected).toBe(2);
+    expect(await press('ArrowDown')).toBe(true);
+    expect(t.selected).toBe(3);
+    expect(await press('ArrowUp')).toBe(true);
+    expect(t.selected).toBe(2);
+    t.results = [];
+    t.selected = null;
+  });
+
+  // Two results; #2 simulates an intruder-scope extension: the request sent on the wire
+  // differs from the generated one, and the arrived response differs from the decoded one.
+  const twoExtResults = () => [
+    { n: 1, status: 200, length: 2, timeMs: 5, payloads: ['a'], requestRaw: 'GET /?q=a HTTP/1.1\nHost: x\n\n', responseRaw: 'HTTP/1.1 200 OK\n\nplain', requestFinal: null, responseOriginal: null },
+    { n: 2, status: 200, length: 2, timeMs: 6, payloads: ['b'], requestRaw: 'GET /?q=b HTTP/1.1\nHost: x\n\n', responseRaw: 'HTTP/1.1 200 OK\n\nDECODED', requestFinal: 'GET /?q=ENC HTTP/1.1\nHost: x\n\n', responseOriginal: 'HTTP/1.1 200 OK\n\nENCRYPTED' },
+  ];
+
+  it('intruder: "save all results" stores ONE record holding every result, noting which tab', async () => {
+    store.view = 'intruder';
+    await settle();
+    const t = store.intruder.tabs.find((x) => x.id === store.intruder.activeId);
+    t.results = twoExtResults();
+    t.selected = 1;
+    await settle();
+    const before = store.organizerCount;
+    $$('.intruder .results .rows .row')[0].dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 30, clientY: 30 }));
+    await settle();
+    await click($$('.menu .item').find((b) => b.textContent.trim().startsWith('Save all')));
+    await settle();
+    // One record for the whole run, not one per result.
+    expect(store.organizerCount).toBe(before + 1);
+    const rec = store.organizer.collections.flatMap((c) => c.items).at(-1);
+    expect(rec.source).toBe('intruder(all)');
+    // Every result is kept as a table row, not concatenated into one giant message.
+    expect(rec.results.length).toBe(2);
+    expect(rec.results.map((r) => r.n)).toEqual([1, 2]);
+    expect(rec.results[1]).toMatchObject({ status: 200, timeMs: 6, payloads: ['b'] });
+    expect(rec.results[1].request).toContain('q=ENC'); // the extension-applied request sent
+    expect(rec.results[1].requestOriginal).toContain('q=b'); // pre-extension
+    expect(rec.results[1].response).toContain('ENCRYPTED');
+    expect(rec.results[1].responseExtension).toContain('DECODED');
+    // The record's own request/response are the first row's, so method/path stay real.
+    expect(rec.request).toContain('q=a');
+    expect(rec.method).toBe('GET');
+    // The note says which Intruder tab the run came from.
+    expect(rec.note).toContain(`Intruder tab "${t.name}"`);
+    expect(rec.note).toContain('2 results');
+
+    // Opening it in the Organizer shows the run as a table; picking a row drives the panes.
+    const col = store.organizer.collections.find((c) => c.items.some((i) => i.id === rec.id));
+    store.view = 'organizer';
+    store.viewCollection(col.id);
+    await settle();
+    const savedRow = $$('.organizer .rbody .rrow').find((el) => el.textContent.includes('2 results'));
+    await click(savedRow);
+    await settle();
+    const runRows = $$('.organizer .runbody .runrow');
+    expect(runRows.length).toBe(2);
+    expect($('.organizer .detail').textContent).toContain('Request #1');
+    await click(runRows[1]);
+    await settle();
+    expect($('.organizer .detail').textContent).toContain('Request #2');
+    expect($('.organizer .detail').textContent).toContain('q=ENC');
+
+    // The run table can be searched: only the matching payload row stays.
+    const runSearch = $('.organizer .runsearch input');
+    runSearch.value = 'b';
+    runSearch.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    expect($$('.organizer .runbody .runrow').length).toBe(1);
+    expect($('.organizer .runbar').textContent).toContain('1 of 2');
+    runSearch.value = 'nope';
+    runSearch.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    expect($('.organizer .runempty')).toBeTruthy();
+    runSearch.value = '';
+    runSearch.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    expect($$('.organizer .runbody .runrow').length).toBe(2);
+
+    // Both tables have draggable column grips; dragging one widens that column.
+    const drag = async (grip, dx) => {
+      grip.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: 100, pointerId: 1 }));
+      grip.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientX: 100 + dx, pointerId: 1 }));
+      grip.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientX: 100 + dx, pointerId: 1 }));
+      await settle();
+    };
+    const savedCols = () => $('.organizer .rtable').style.getPropertyValue('--cols');
+    const firstBefore = savedCols();
+    await drag($$('.organizer .rtable .rhead .grip')[0], 30);
+    expect(savedCols()).not.toBe(firstBefore);
+    expect(savedCols().startsWith('74px ')).toBe(true); // 44 default + 30
+    const runColsOf = () => $('.organizer .runrows').style.getPropertyValue('--cols');
+    const runBefore = runColsOf();
+    await drag($$('.organizer .runrows .rh .grip')[0], 20);
+    expect(runColsOf()).not.toBe(runBefore);
+    expect(runColsOf().startsWith('76px ')).toBe(true); // 56 default + 20
+    t.results = [];
+    t.selected = null;
+  });
+
+  it('intruder: export menu saves the run to a NEW collection named after the tab, and renaming the tab renames it', async () => {
+    store.view = 'intruder';
+    await settle();
+    const t = store.intruder.tabs.find((x) => x.id === store.intruder.activeId);
+    store.renameIntruderTab(t, 'atk');
+    t.results = twoExtResults();
+    t.selected = null;
+    await settle();
+    const activeBefore = store.organizer.activeId;
+    const colsBefore = store.organizer.collections.length;
+    // The Export button is enabled once the attack has results.
+    const exportBtn = $('.intruder .toolbar button.export');
+    expect(exportBtn.disabled).toBe(false);
+    await click(exportBtn);
+    const labels = $$('.menu .item').map((b) => b.textContent.trim());
+    expect(labels.some((l) => l.startsWith('Export as JSON'))).toBe(true);
+    expect(labels.some((l) => l.startsWith('Export as XML'))).toBe(true);
+    await click($$('.menu .item').find((b) => b.textContent.trim().startsWith('Save to Organizer (new collection)')));
+    await settle();
+    // A new collection named "<tab> intruder" holding one record per result...
+    expect(store.organizer.collections.length).toBe(colsBefore + 1);
+    const col = store.organizer.collections.find((c) => c.id === t.collectionId);
+    expect(col.name).toBe('atk intruder');
+    expect(col.items.length).toBe(2);
+    expect(col.items[0].source).toBe('intruder(each)');
+    // ...which does not steal the active collection.
+    expect(store.organizer.activeId).toBe(activeBefore);
+    // Renaming the tab renames the linked collection.
+    store.renameIntruderTab(t, 'atk2');
+    await settle();
+    expect(store.organizer.collections.find((c) => c.id === t.collectionId).name).toBe('atk2 intruder');
+    t.results = [];
+    t.selected = null;
+  });
+
+  it('intruder: exports the finished run as JSON and as well-formed XML', async () => {
+    const { invoke } = await import('@tauri-apps/api/core');
+    store.view = 'intruder';
+    await settle();
+    const t = store.intruder.tabs.find((x) => x.id === store.intruder.activeId);
+    store.renameIntruderTab(t, 'exp');
+    t.results = twoExtResults();
+    t.selected = null;
+    await settle();
+    const written = () => {
+      const call = invoke.mock.calls.filter((c) => c[0] === 'save_binary').at(-1);
+      return decodeURIComponent(escape(atob(call[1].data)));
+    };
+    const pick = async (label) => {
+      await click($('.intruder .toolbar button.export'));
+      await click($$('.menu .item').find((b) => b.textContent.trim().startsWith(label)));
+      await settle();
+    };
+    saveDialog.mockResolvedValueOnce('/tmp/attack.json');
+    await pick('Export as JSON');
+    const json = JSON.parse(written());
+    expect(json.tab).toBe('exp');
+    expect(json.count).toBe(2);
+    expect(json.results[1].request).toContain('q=ENC'); // the wire request that was sent
+    expect(json.results[1].requestOriginal).toContain('q=b'); // pre-extension
+    expect(json.results[1].responseDecoded).toContain('DECODED');
+
+    saveDialog.mockResolvedValueOnce('/tmp/attack.xml');
+    await pick('Export as XML');
+    const xml = written();
+    const doc = new DOMParser().parseFromString(xml, 'application/xml');
+    expect(doc.querySelector('parsererror')).toBeNull(); // well-formed
+    expect(doc.documentElement.getAttribute('tab')).toBe('exp');
+    expect(doc.querySelectorAll('result').length).toBe(2);
+    expect(xml).toContain('<payload>b</payload>');
+    t.results = [];
+    t.selected = null;
+  });
+
+  it('intruder: right-clicking the empty results area opens a custom menu (save all / clear), not the native one', async () => {
+    store.view = 'intruder';
+    await settle();
+    const t = store.intruder.tabs.find((x) => x.id === store.intruder.activeId);
+    t.results = [{ n: 1, status: 200, length: 2, timeMs: 5, payloads: ['a'], requestRaw: 'GET / HTTP/1.1\nHost: x\n\n', responseRaw: 'HTTP/1.1 200 OK\n\nok' }];
+    t.selected = null;
+    await settle();
+    // Right-click the rows container itself (the empty space below the rows).
+    const ev = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 40, clientY: 300 });
+    $('.intruder .rows').dispatchEvent(ev);
+    await settle();
+    expect(ev.defaultPrevented).toBe(true); // our menu, not the webview's Reload / Inspect
+    const labels = $$('.menu .item').map((b) => b.textContent.trim());
+    expect(labels.some((l) => l.startsWith('Save all 1 results to Organizer'))).toBe(true);
+    expect(labels.some((l) => l.startsWith('Clear results'))).toBe(true);
+    await click($$('.menu .item').find((b) => b.textContent.trim().startsWith('Clear results')));
+    expect(t.results.length).toBe(0);
     t.selected = null;
   });
 

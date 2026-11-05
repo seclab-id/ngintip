@@ -1,4 +1,4 @@
-//! MCP (Model Context Protocol) server over HTTP, so an LLM can drive Cegat:
+//! MCP (Model Context Protocol) server over HTTP, so an LLM can drive Ngintip:
 //! read/search history, send to Repeater (recorded), run parallel batches and
 //! Intruder attacks, view/trigger/configure the passive scan, organize saved
 //! requests in the Organizer, and read the project Vault.

@@ -201,18 +201,20 @@
     return () => (stale = true);
   });
 
-  // Version switcher data (Original / Extension alongside Final), when the flow was
-  // edited in Intercept or transformed by an extension. Null hides the switcher.
+  // Version switcher data (Extension / Original alongside Wire), when the flow was
+  // edited in Intercept or an extension produced a readable view. Null hides the
+  // switcher. "Extension" is the readable form a decode_* extension made; "Wire" is
+  // the real message that actually crossed the wire.
   function buildVariants(finalRaw, v, side) {
     if (!v || finalRaw == null) return null;
     const orig = side === 'req' ? v.reqOriginal : v.resOriginal;
-    const ext = side === 'req' ? v.reqExtension : v.resExtension;
-    const list = [{ id: 'final', label: 'Final', raw: finalRaw }];
-    // Only show a version alongside Final when it actually differs (i.e. the
-    // interceptor or an extension really changed it). An unchanged flow has no
-    // switcher at all — it's just the original message.
+    const decoded = side === 'req' ? v.reqExtension : v.resExtension;
+    const list = [{ id: 'final', label: 'Wire', raw: finalRaw }];
+    // Only show a version alongside Wire when it actually differs (i.e. the
+    // interceptor edited it or an extension decoded it). An unchanged flow has no
+    // switcher at all; it's just the original message.
+    if (decoded && decoded !== finalRaw) list.push({ id: 'decoded', label: 'Extension', raw: decoded });
     if (orig && orig !== finalRaw) list.push({ id: 'original', label: 'Original', raw: orig });
-    if (ext && ext !== finalRaw) list.push({ id: 'extension', label: 'Extension', raw: ext });
     return list.length > 1 ? list : null;
   }
   let reqVariants = $derived(buildVariants(detail?.requestRaw, detail?.variants, 'req'));

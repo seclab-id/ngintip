@@ -210,6 +210,8 @@
   let exposed = $derived(store.exposed);
 
   onMount(async () => {
+    // Check (once per session) which release is the latest; shown in the Project card.
+    store.checkUpdate();
     [ca, interfaces] = await Promise.all([api.caInfo(), api.listInterfaces()]);
     custom = !interfaces.some((i) => i.ip === host);
   });
@@ -297,7 +299,7 @@
     }
   }
 
-  // CA install steps per platform; starts on the one Cegat runs on.
+  // CA install steps per platform; starts on the one Ngintip runs on.
   const PLATFORMS = ['macOS', 'Windows', 'Linux', 'Firefox', 'Burp Suite', 'Android / iOS'];
   const ua = navigator.userAgent;
   let platform = $state(/Windows/.test(ua) ? 'Windows' : /Linux/.test(ua) ? 'Linux' : 'macOS');
@@ -382,6 +384,20 @@
       <button class="btn sm" onclick={() => store.openProject()}>Open project…</button>
       <button class="btn sm" onclick={() => store.saveProjectAs()}>Save as…</button>
     </div>
+    <div class="kv version">
+      <span class="dim">Version</span>
+      <span class="mono vval">
+        v{store.update.current}
+        {#if store.update.newer}
+          <span class="upd">update available: v{store.update.latest}</span>
+        {:else if store.update.checked && store.update.latest}
+          <span class="dim">(latest)</span>
+        {/if}
+      </span>
+      <button class="btn ghost sm" class:primary={store.update.newer} onclick={() => store.openReleases()}>
+        {store.update.newer ? 'Get update' : 'Releases'}
+      </button>
+    </div>
   </section>
 
   <section class="card">
@@ -433,7 +449,7 @@
       <span class="dim">seconds</span>
     </div>
     {#if store.autoSave.enabled && !store.project.path}
-      <p class="error">Save the project to a file first (Project → Save as…) — auto-save won't prompt for a location.</p>
+      <p class="error">Save the project to a file first (Project → Save as…) - auto-save won't prompt for a location.</p>
     {:else if store.autoSave.enabled}
       <p class="dim status-line">Saving every {store.autoSave.interval}s to <span class="mono path">{store.project.path}</span>.</p>
     {:else}
@@ -1223,6 +1239,15 @@
   }
   .kv.wide {
     grid-template-columns: 110px 1fr auto;
+  }
+  .kv .vval {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .kv .upd {
+    color: var(--amber);
+    font-size: 11.5px;
   }
   .platforms {
     display: flex;

@@ -16,7 +16,7 @@ pub struct Config {
     /// Auto-add / recompute Content-Length on Repeater & Intruder sends. Turn off
     /// to send the Content-Length exactly as written (e.g. request smuggling).
     pub auto_content_length: bool,
-    /// MCP server (lets an LLM drive Cegat): the last on/off state, its port
+    /// MCP server (lets an LLM drive Ngintip): the last on/off state, its port
     /// (0 = 8082) and the docs path served for the LLM. On/off is informational only:
     /// whether the server runs is a per-project switch (project setting `mcp`), never
     /// carried over to another or a new project.

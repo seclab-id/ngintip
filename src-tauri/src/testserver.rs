@@ -182,7 +182,8 @@ const INDEX: &str = r#"<!doctype html><meta charset="utf-8"><meta name="viewport
 
 // Page that AES-CBC encrypts a JSON body in the browser and POSTs it to /test-enc.
 // Key is the 16-byte "ngintip-demo-key" (AES-128); the random IV goes in X-Enc-IV.
-// The matching decrypt extension is examples/aes_decrypt_extension.py.
+// A matching decrypt extension lives in the e2e tests (AES_DECRYPT_EXT in e2e.rs);
+// see examples/template_extension.py for how to write one against your own scheme.
 const TEST_ENC_PAGE: &str = r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Ngintip /test-enc</title>
 <body style="font:15px/1.6 system-ui;max-width:680px;margin:6vh auto;padding:0 16px;color:#222">

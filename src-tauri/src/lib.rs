@@ -37,9 +37,9 @@ pub struct AppState {
     /// App-wide settings and the file they're saved to.
     pub config: Mutex<config::Config>,
     pub config_path: std::path::PathBuf,
-    /// The `.cegat` document the project is saved to/from (None until saved).
+    /// The `.ngintip` document the project is saved to/from (None until saved).
     pub document: Mutex<Option<std::path::PathBuf>>,
-    /// Running MCP server (lets an LLM drive Cegat), if enabled.
+    /// Running MCP server (lets an LLM drive Ngintip), if enabled.
     pub mcp: Mutex<Option<commands::McpRunning>>,
     /// Process/system resource stats for the Usage panel.
     pub usage: Mutex<usage::Usage>,
@@ -111,7 +111,7 @@ fn build_menu(app: &tauri::App) -> tauri::Result<()> {
         .item(&MenuItemBuilder::with_id("export_burp", "Export Burp XML\u{2026}").build(&h)?)
         .build()?;
 
-    // Project: save the whole project. `.cegat` files are compressed on save.
+    // Project: save the whole project. `.ngintip` files are compressed on save.
     let project_menu = SubmenuBuilder::new(&h, "Project")
         .item(&MenuItemBuilder::with_id("save", "Save Project").accelerator("CmdOrCtrl+S").build(&h)?)
         .item(&MenuItemBuilder::with_id("save_as", "Save Project As\u{2026}").accelerator("Shift+CmdOrCtrl+S").build(&h)?)
@@ -302,6 +302,7 @@ pub fn run() {
             commands::set_auto_content_length,
             commands::set_upstream,
             commands::send_raw,
+            commands::intruder_send,
             commands::repeater_history,
             commands::repeater_entry,
             commands::clear_repeater_history,

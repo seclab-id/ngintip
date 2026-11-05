@@ -166,6 +166,12 @@ fn e2e_xor_b64_encode(plain: &[u8]) -> String {
     STANDARD.encode(x)
 }
 
+fn e2e_xor_b64_decode(b64: &str) -> Vec<u8> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let raw = STANDARD.decode(b64.trim()).unwrap_or_default();
+    raw.iter().enumerate().map(|(i, b)| b ^ E2E_XOR_KEY[i % E2E_XOR_KEY.len()]).collect()
+}
+
 /// Origin server. `/echo` answers with what it received:
 /// the request line, each header on its own line, a blank line, then the body.
 async fn spawn_origin() -> SocketAddr {
@@ -284,6 +290,18 @@ async fn origin(req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
                 .header("content-type", "application/octet-stream")
                 .header("x-encrypted", "xor-b64")
                 .body(body::full(e2e_xor_b64_encode(plain)))
+                .unwrap());
+        }
+        // Decrypts the (xor-b64) request body and replies with an encrypted
+        // "echo:<plaintext>", for testing encode_request + decode_response round-trips.
+        "/echo-enc" => {
+            let body = req.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+            let plain = e2e_xor_b64_decode(&String::from_utf8_lossy(&body));
+            let reply = format!("echo:{}", String::from_utf8_lossy(&plain));
+            return Ok(Response::builder()
+                .header("content-type", "application/octet-stream")
+                .header("x-encrypted", "xor-b64")
+                .body(body::full(e2e_xor_b64_encode(reply.as_bytes())))
                 .unwrap());
         }
         // Size of the request body (read in chunks, never buffered whole).
@@ -564,6 +582,96 @@ async fn intercepts_and_edits_a_response() {
     assert_eq!(flows[0]["status"], 418, "History shows what the client got");
 }
 
+/// Interceptor decode/encode: the editor shows the decrypted body (decode_response),
+/// and an edit leaves re-encrypted (encode_response). Guards on ctx.host, proving the
+/// request host reaches the hook even though a response carries no Host header.
+const INTERCEPT_ENC_EXT: &str = r#"
+import base64
+KEY = b"e2e-key"
+def _xor(d):
+    return bytes(b ^ KEY[i % len(KEY)] for i, b in enumerate(d))
+def _ok(ctx):
+    return ctx is not None and "127.0.0.1" in (ctx.host or "")
+def decode_response(res, ctx=None):
+    if _ok(ctx) and res.body:
+        try:
+            res.body = _xor(base64.b64decode(res.text))
+        except Exception:
+            pass
+def encode_response(res, ctx=None):
+    if _ok(ctx) and res.body:
+        res.body = base64.b64encode(_xor(res.body)).decode()
+"#;
+
+#[tokio::test]
+async fn intercept_shows_decoded_response_and_reencodes_edits() {
+    if crate::extensions::detect_python().is_none() {
+        eprintln!("skipping: no python interpreter");
+        return;
+    }
+    use crate::intercept::{Decision, Phase};
+
+    let sdir = temp_dir("ext-int-enc");
+    let script = sdir.join("int.py");
+    std::fs::write(&script, INTERCEPT_ENC_EXT).unwrap();
+
+    let h = Arc::new(Harness::start("ext-int-enc").await);
+    h.ctx.extensions.configure(sdir.clone(), None, None);
+    h.ctx.extensions.set_extensions(vec![crate::extensions::ExtensionSpec {
+        id: "int".into(),
+        name: "int".into(),
+        path: script.to_string_lossy().into_owned(),
+        enabled: true,
+        scope: "all".into(),
+        requirements: vec![],
+        body: String::new(),
+    }]);
+    h.ctx.extensions.set_enabled(true);
+    assert!(h.ctx.extensions.active());
+    h.ctx.intercept.set_enabled(true);
+
+    // Scenario A: forwarding unchanged sends the ORIGINAL ciphertext, not the decoded
+    // plaintext the editor shows.
+    let client = tokio::spawn({
+        let h = h.clone();
+        async move { h.get(&h.url("/encrypted")).await }
+    });
+    let req = next_held(&h, Phase::Request).await;
+    h.ctx.intercept.resolve(req.key, Decision::Forward { raw: None, hold_response: true });
+    let res = next_held(&h, Phase::Response).await;
+    assert!(res.raw.contains("SECRET-42"), "editor shows the decoded body: {}", res.raw);
+    let original = res.original.clone().expect("Original kept");
+    assert!(!original.contains("SECRET-42"), "Original is the ciphertext");
+    h.ctx.intercept.resolve(res.key, Decision::Forward { raw: None, hold_response: false });
+    let out = client.await.unwrap();
+    assert!(!out.contains("SECRET-42"), "unchanged forward sends ciphertext, not plaintext:\n{out}");
+    let body = out.split("\r\n\r\n").nth(1).unwrap_or("");
+    assert!(
+        String::from_utf8_lossy(&e2e_xor_b64_decode(body)).contains("SECRET-42"),
+        "the forwarded ciphertext still decrypts to the original"
+    );
+
+    // Scenario B: editing the decoded body re-encrypts it on the wire (encode_response).
+    let client = tokio::spawn({
+        let h = h.clone();
+        async move { h.get(&h.url("/encrypted")).await }
+    });
+    let req = next_held(&h, Phase::Request).await;
+    h.ctx.intercept.resolve(req.key, Decision::Forward { raw: None, hold_response: true });
+    let res = next_held(&h, Phase::Response).await;
+    let edited = res.raw.replace("SECRET-42", "EDITED-99");
+    h.ctx.intercept.resolve(res.key, Decision::Forward { raw: Some(edited), hold_response: false });
+    let out = client.await.unwrap();
+    assert!(!out.contains("EDITED-99"), "the wire is encrypted, not the edited plaintext:\n{out}");
+    let body = out.split("\r\n\r\n").nth(1).unwrap_or("");
+    assert!(
+        String::from_utf8_lossy(&e2e_xor_b64_decode(body)).contains("EDITED-99"),
+        "the client receives the re-encrypted edit"
+    );
+
+    let _ = std::fs::remove_dir_all(&sdir);
+}
+
 // A Python extension that base64-decodes + XOR-decrypts response bodies (key
 // "e2e-key"), matching the /encrypted origin endpoint above.
 const DECRYPT_EXT: &str = r#"
@@ -580,6 +688,73 @@ def process_response(res):
         pass
     return None
 "#;
+
+/// A display-only decode extension: it turns the ciphertext into readable plaintext
+/// for the UI (decode_response) but defines no process_* hook, so it never changes
+/// what crosses the wire.
+const DECODE_EXT: &str = r#"
+import base64
+KEY = b"e2e-key"
+def _xor(d):
+    return bytes(b ^ KEY[i % len(KEY)] for i, b in enumerate(d))
+def decode_response(res, ctx):
+    if res.body:
+        try:
+            res.body = _xor(base64.b64decode(res.body))
+        except Exception:
+            pass
+"#;
+
+#[tokio::test]
+async fn decode_hook_shows_plaintext_without_changing_the_wire() {
+    if crate::extensions::detect_python().is_none() {
+        eprintln!("skipping: no python interpreter");
+        return;
+    }
+    let sdir = temp_dir("ext-decode");
+    let script = sdir.join("decode.py");
+    std::fs::write(&script, DECODE_EXT).unwrap();
+
+    let h = Arc::new(Harness::start("ext-decode").await);
+    h.ctx.extensions.configure(sdir.clone(), None, None);
+    h.ctx.extensions.set_extensions(vec![crate::extensions::ExtensionSpec {
+        id: "dec".into(),
+        name: "decode".into(),
+        path: script.to_string_lossy().into_owned(),
+        enabled: true,
+        scope: "both".into(),
+        requirements: vec![],
+        body: String::new(),
+    }]);
+    h.ctx.extensions.set_enabled(true);
+    assert!(h.ctx.extensions.active(), "extension worker should be running");
+
+    // Fetch the encrypted endpoint through the proxy.
+    let out = h.get(&h.url("/encrypted")).await;
+    // decode_* is display-only: the client still receives the UNCHANGED ciphertext.
+    assert!(!out.contains("SECRET-42"), "the wire must stay encrypted:\n{out}");
+
+    let flows = h.wait_events(proxy::FLOW_EVENT, 1).await;
+    let id = flows[0]["id"].as_u64().unwrap();
+    let flow = h.ctx.store.get(id).unwrap().unwrap();
+    // The recorded flow is still the ciphertext, and decode set no Original variant
+    // (it changed nothing on the wire).
+    assert!(!String::from_utf8_lossy(&flow.res_body).contains("SECRET-42"), "recorded response stays encrypted");
+    assert!(flow.variants.res_original.is_none(), "decode sets no Original; it is display-only");
+
+    // The "Decoded" view get_flow surfaces: run the decode hook on the recorded
+    // response, exactly as get_flow does, and it yields the readable plaintext.
+    let txt = crate::raw::response_text_for_processing(&flow);
+    let hc = crate::extensions::HookCtx { host: flow.summary.host.clone(), ..Default::default() };
+    let decoded = h
+        .ctx
+        .extensions
+        .decode(crate::extensions::Phase::Response, txt.as_bytes(), crate::extensions::Surface::Proxy, &hc)
+        .expect("a decoded view");
+    assert!(String::from_utf8_lossy(&decoded).contains("SECRET-42"), "the decoded view is the plaintext");
+
+    let _ = std::fs::remove_dir_all(&sdir);
+}
 
 #[tokio::test]
 async fn extension_decrypts_a_recorded_response_with_original_variant() {
@@ -620,6 +795,70 @@ async fn extension_decrypts_a_recorded_response_with_original_variant() {
     let original = flow.variants.res_original.expect("Original response variant captured");
     assert!(original.to_ascii_lowercase().contains("x-encrypted: xor-b64"), "Original keeps the encrypted headers:\n{original}");
     assert!(!original.contains("SECRET-42"), "Original body is still ciphertext, not the plaintext");
+
+    let _ = std::fs::remove_dir_all(&sdir);
+}
+
+/// Repeater: type plaintext, it leaves encrypted (encode_request), and the response
+/// comes back decrypted (decode_response). The extension guards on ctx.host, so this
+/// also proves the request host is threaded into the hook ctx on both directions.
+const REPEATER_ENC_EXT: &str = r#"
+import base64
+KEY = b"e2e-key"
+def _xor(d):
+    return bytes(b ^ KEY[i % len(KEY)] for i, b in enumerate(d))
+def _ok(ctx):
+    return ctx is not None and "127.0.0.1" in (ctx.host or "")
+def encode_request(req, ctx=None):
+    if _ok(ctx) and req.text.strip()[:1] in ("{", "["):
+        req.text = base64.b64encode(_xor(req.text.encode())).decode()
+def decode_response(res, ctx=None):
+    if _ok(ctx) and res.body:
+        try:
+            res.body = _xor(base64.b64decode(res.text))
+        except Exception:
+            pass
+"#;
+
+#[tokio::test]
+async fn repeater_encodes_the_sent_request_and_decodes_the_response() {
+    if crate::extensions::detect_python().is_none() {
+        eprintln!("skipping: no python interpreter");
+        return;
+    }
+    let sdir = temp_dir("ext-rep-enc");
+    let script = sdir.join("rep.py");
+    std::fs::write(&script, REPEATER_ENC_EXT).unwrap();
+
+    let h = Arc::new(Harness::start("ext-rep-enc").await);
+    h.ctx.extensions.configure(sdir.clone(), None, None);
+    h.ctx.extensions.set_extensions(vec![crate::extensions::ExtensionSpec {
+        id: "rep".into(),
+        name: "rep".into(),
+        path: script.to_string_lossy().into_owned(),
+        enabled: true,
+        scope: "all".into(),
+        requirements: vec![],
+        body: String::new(),
+    }]);
+    h.ctx.extensions.set_enabled(true);
+    assert!(h.ctx.extensions.active());
+
+    // Send a PLAINTEXT request through the Repeater path (extensions applied).
+    let target = format!("http://{}", h.origin);
+    let raw = "POST /echo-enc HTTP/1.1\r\nHost: HOSTVALUE\r\nContent-Type: application/json\r\n\r\n{\"ping\":\"hello\"}"
+        .replace("HOSTVALUE", &h.origin.to_string());
+    let res = crate::commands::send_and_record(&h.ctx, 1, &target, &raw, true).await.expect("send ok");
+
+    // The response shown is DECODED (decode_response ran via ctx.host).
+    assert!(res.response_raw.contains("echo:") && res.response_raw.contains("hello"), "decoded response:\n{}", res.response_raw);
+    // The request actually sent was ENCRYPTED (encode_request ran): the plaintext key
+    // is not on the wire.
+    let sent = res.request_final.expect("a sent (encoded) request");
+    assert!(!sent.contains("\"ping\""), "the sent request body is encrypted, not plaintext:\n{sent}");
+    // The arrived response kept as Original is still ciphertext.
+    let original = res.response_original.expect("an Original response");
+    assert!(!original.contains("echo:"), "Original response is the ciphertext:\n{original}");
 
     let _ = std::fs::remove_dir_all(&sdir);
 }
@@ -692,8 +931,33 @@ async fn extension_interpreter_venv_and_console_are_per_project() {
     let _ = std::fs::remove_dir_all(&sdir);
 }
 
-// The shipped AES decrypt extension, embedded so the test and the example stay in sync.
-const AES_DECRYPT_EXT: &str = include_str!("../../examples/aes_decrypt_extension.py");
+// A process_*-style AES decrypt extension for the built-in test server's /test-enc
+// page: it rewrites the request ON THE WIRE, which is what this test asserts. It lives
+// here rather than in examples/ because the shipped examples use the decode_*/encode_*
+// model instead (read decrypted, send re-encrypted, wire untouched).
+const AES_DECRYPT_EXT: &str = r#"
+import base64
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
+
+KEY = b"ngintip-demo-key"  # 16 bytes -> AES-128
+
+
+def process_request(req):
+    iv_b64 = req.header("X-Enc-IV")
+    if not iv_b64 or not req.body.strip():
+        return None
+    try:
+        iv = base64.b64decode(iv_b64)
+        ct = base64.b64decode(req.body.strip())
+        req.set_header("X-Ngintip", "set-spesific-headers")
+        req.body = unpad(AES.new(KEY, AES.MODE_CBC, iv).decrypt(ct), AES.block_size)
+    except Exception as exc:  # not our ciphertext / wrong key: leave it untouched
+        print("AES decrypt failed:", exc)
+        return None
+    print("decrypted request body (%d bytes)" % len(req.body))
+    return None
+"#;
 
 #[tokio::test]
 async fn extension_decrypts_an_aes_request_end_to_end() {
@@ -1369,14 +1633,14 @@ async fn chains_through_socks5_proxy() {
 
 /// Opt-in load test: fire many requests through the proxy and report throughput.
 /// Run with: `cargo test --release stress_many_requests -- --ignored --nocapture`
-/// Tune with CEGAT_STRESS_N and CEGAT_STRESS_CONC.
+/// Tune with NGINTIP_STRESS_N and NGINTIP_STRESS_CONC.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn stress_many_requests() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-    let n = env("CEGAT_STRESS_N", 5000);
-    let conc = env("CEGAT_STRESS_CONC", 128);
+    let n = env("NGINTIP_STRESS_N", 5000);
+    let conc = env("NGINTIP_STRESS_CONC", 128);
 
     let h = Harness::start("stress").await;
     // Pooled keep-alive client through the proxy, so the measurement is proxy
@@ -1421,8 +1685,8 @@ async fn stress_many_requests() {
     assert_eq!(h.ctx.store.summaries().unwrap().len(), n, "every flow persisted");
 
     // Save a real, openable project so the run can be browsed in the UI:
-    //   CEGAT_STRESS_FILE=/path/to/stress.cegat cargo test --release stress_many_requests -- --ignored --nocapture
-    if let Ok(file) = std::env::var("CEGAT_STRESS_FILE") {
+    //   NGINTIP_STRESS_FILE=/path/to/stress.ngintip cargo test --release stress_many_requests -- --ignored --nocapture
+    if let Ok(file) = std::env::var("NGINTIP_STRESS_FILE") {
         h.ctx.store.save_as(Path::new(&file)).unwrap();
         println!("[stress] saved {n} flows to {file} (open it from the project chooser)");
     }
@@ -1540,7 +1804,7 @@ fn stress_compression_stats() {
 
     fn build(n: usize) -> (usize, usize) {
         let dir = temp_dir(&format!("stress-{n}"));
-        let store = Store::open(&dir.join("s.cegat")).unwrap();
+        let store = Store::open(&dir.join("s.ngintip")).unwrap();
         for i in 0..n {
             let uri: Uri = format!("https://api.example.com/v1/users/{}/orders?page={}", i % 5000, i % 20).parse().unwrap();
             let mut rh = HeaderMap::new();
@@ -1581,12 +1845,12 @@ fn stress_compression_stats() {
 }
 
 #[test]
-fn compressed_cegat_round_trips_and_shrinks() {
+fn compressed_ngintip_round_trips_and_shrinks() {
     use crate::commands::{compress_bytes, decompress_bytes, is_compressed};
 
     // Build a real project with some repetitive, compressible content.
     let dir = temp_dir("compress");
-    let store = Store::open(&dir.join("p.cegat")).unwrap();
+    let store = Store::open(&dir.join("p.ngintip")).unwrap();
     let uri: http::Uri = "https://example.com/api".parse().unwrap();
     for _ in 0..200 {
         let body = bytes::Bytes::from_static(b"{\"token\":\"aaaaaaaaaaaaaaaaaaaaaaaa\",\"ok\":true}");
@@ -1607,13 +1871,13 @@ fn compressed_cegat_round_trips_and_shrinks() {
     let back = decompress_bytes(&packed).unwrap();
     assert_eq!(back, raw);
 
-    // The legacy "CEGATC" compressed format is no longer supported: a file with
-    // that magic is not recognized as a project and does not decompress.
+    // A file carrying any other 6-byte magic (e.g. a previous compressed format) is
+    // not recognized as a project and does not decompress.
     let mut legacy = packed.clone();
-    legacy[..6].copy_from_slice(b"CEGATC");
-    assert!(!is_compressed(&legacy), "legacy CEGATC magic must not be recognized");
-    assert!(decompress_bytes(&legacy).is_err(), "legacy CEGATC must not decompress");
-    let dest = dir.join("restored.cegat");
+    legacy[..6].copy_from_slice(b"OLDFMT");
+    assert!(!is_compressed(&legacy), "an unknown compressed magic must not be recognized");
+    assert!(decompress_bytes(&legacy).is_err(), "an unknown compressed magic must not decompress");
+    let dest = dir.join("restored.ngintip");
     std::fs::write(&dest, &back).unwrap();
     assert_eq!(Store::open(&dest).unwrap().summaries().unwrap().len(), 200);
 

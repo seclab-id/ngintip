@@ -44,7 +44,7 @@
   // large image/blob would otherwise lag the viewer just by highlighting it.
   let bodyShown = $state(false);
   // Which captured version is shown: 'final' (the sent/stored message) or an earlier
-  // one (Original / Extension). Only History passes `variants`.
+  // one (Extension / Original). Only History passes `variants`.
   let variantId = $state('final');
   let showVariants = $derived(Array.isArray(variants) && variants.length > 1);
   let variantRaw = $derived.by(() => {
@@ -58,6 +58,9 @@
     raw;
     showingFull = false;
     full = null;
+    // Default to the real (wire) message; a decoded view, when present, sits one click
+    // away in the switcher. Keeping the wire default means a security tool never hides
+    // what actually crossed the wire (passive findings, anomalies) behind a decode.
     variantId = 'final';
     lazyImage = null;
     loadingImage = false;
@@ -384,7 +387,7 @@
     border-radius: 7px;
     background: var(--bg-soft);
   }
-  /* The version switcher (Final / Original / Extension) gets an accent tint so it
+  /* The version switcher (Wire / Extension / Original) gets an accent tint so it
      reads as distinct from the Raw/Pretty/Preview modes. */
   .modes.variants {
     background: color-mix(in srgb, var(--accent) 14%, var(--bg-soft));

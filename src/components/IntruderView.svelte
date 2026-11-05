@@ -9,7 +9,9 @@
   import { fmtSize, statusClass } from '../lib/format.js';
   import { ATTACK_TYPES, MARK, PAYLOAD_TYPES, MAX_REQUESTS, parseTemplate, wrapPosition, clearPositions, defaultPayloadConfig, countPayloads } from '../lib/intruder.js';
   import { tick } from 'svelte';
-  import { brandKey } from '../lib/brand.js';
+  import { BRAND, brandKey } from '../lib/brand.js';
+  import * as api from '../lib/api.js';
+  import { save } from '@tauri-apps/plugin-dialog';
 
   const iv = store.intruder;
   let tab = $derived(iv.tabs.find((t) => t.id === iv.activeId) ?? iv.tabs[0]);
@@ -17,6 +19,18 @@
   // Right-click menus: attack tab, request template, result rows and the result's
   // request / response panes (instead of the webview's default Inspect menu).
   let menu = $state(null);
+
+  // Inline tab rename (double-click a tab, or Rename from its menu). A collection
+  // created from the tab follows the new name (see store.renameIntruderTab).
+  let renaming = $state(null);
+  function focusSelect(node) {
+    node.focus();
+    node.select();
+  }
+  function finishRename(t, value) {
+    store.renameIntruderTab(t, value);
+    renaming = null;
+  }
 
   /** Full URL of a raw request: an absolute request-target, or the tab target + path. */
   function urlOf(raw) {
@@ -38,6 +52,7 @@
         { label: 'Clear positions', disabled: !positions.length, run: clearPos },
         'separator',
         { label: 'Save to Organizer', hint: store.organizerTargetHint, run: () => store.saveIntruderToOrganizer(tab) },
+        { label: `Save all ${tab.results.length} results to Organizer`, hint: store.organizerTargetHint, disabled: !tab.results.length, run: () => store.saveAllIntruderResultsToOrganizer(tab) },
         { label: 'Send to Repeater', run: () => store.addRepeaterTab({ name: tab.name, target: tab.target, raw: base }) },
         { label: 'Send to Decoder', run: () => store.sendStringToDecoder(base) },
         { label: 'Send to Comparer', run: () => store.addToComparer(base, `${tab.name} template`, 'req') },
@@ -58,6 +73,7 @@
     const label = `${tab.name} #${r.n}`;
     const items = [
       { label: 'Save to Organizer', hint: store.organizerTargetHint, run: () => store.saveIntruderResultToOrganizer(tab, r) },
+      { label: `Save all ${tab.results.length} results to Organizer`, hint: store.organizerTargetHint, disabled: !tab.results.length, run: () => store.saveAllIntruderResultsToOrganizer(tab) },
       { label: 'Send request to Repeater', disabled: !reqRaw, run: () => store.addRepeaterTab({ name: label, target: tab.target, raw: reqRaw }) },
       'separator',
     ];
@@ -82,13 +98,156 @@
     menu = { x, y, items };
   }
 
+  /** Menu for the results area itself (the empty space below the rows), so a right-click
+   *  there gets attack-wide actions instead of the webview's Reload / Inspect menu. */
+  function openResultsMenu(e) {
+    // A right-click on a row is handled by that row's own menu; ignore it here.
+    if (e.target.closest('.row')) return;
+    e.preventDefault();
+    const n = tab.results.length;
+    menu = {
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        { label: `Save all ${n} results to Organizer`, hint: store.organizerTargetHint, disabled: !n, run: () => store.saveAllIntruderResultsToOrganizer(tab) },
+        { label: 'Save results to a new collection', hint: `${tab.name} intruder`, disabled: !n, run: () => store.saveIntruderRunToCollection(tab) },
+        { label: 'Save template to Organizer', hint: store.organizerTargetHint, run: () => store.saveIntruderToOrganizer(tab) },
+        'separator',
+        { label: 'Export as JSON', disabled: !n, run: () => exportResults('json') },
+        { label: 'Export as XML', disabled: !n, run: () => exportResults('xml') },
+        'separator',
+        { label: 'Clear results', disabled: !n || tab.running, run: clearResults },
+      ],
+    };
+  }
+  function clearResults() {
+    if (tab.running) return;
+    tab.results = [];
+    tab.selected = null;
+    tab.sent = 0;
+    tab.total = 0;
+  }
+
+  // ---- Export (finished attack) ----
+  /** Wire request / response of a row, matching what the result detail shows. */
+  const rowWireReq = (r) => r.requestFinal || r.requestRaw || '';
+  const rowWireRes = (r) => (r.error ? '' : r.responseOriginal || r.responseRaw || '');
+
+  function resultsJson() {
+    return JSON.stringify(
+      {
+        tool: `${BRAND.name} Intruder`,
+        tab: tab.name,
+        target: tab.target,
+        attack: tab.type,
+        exportedAt: new Date().toISOString(),
+        count: tab.results.length,
+        results: tab.results.map((r) => {
+          const req = rowWireReq(r);
+          const res = rowWireRes(r);
+          const out = {
+            n: r.n,
+            payloads: r.payloads ?? [],
+            status: r.status ?? 0,
+            length: r.length ?? 0,
+            timeMs: r.timeMs ?? 0,
+            error: r.error ?? null,
+            request: req,
+            response: res,
+          };
+          // Only when an extension changed it: the pre-encode request / decoded response.
+          if (r.requestFinal && r.requestRaw) out.requestOriginal = r.requestRaw;
+          if (r.responseOriginal && r.responseRaw) out.responseDecoded = r.responseRaw;
+          return out;
+        }),
+      },
+      null,
+      2,
+    );
+  }
+
+  // XML 1.0 forbids most control characters; drop them and escape the rest.
+  const xmlText = (s) =>
+    String(s ?? '')
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  const xmlAttr = (s) => xmlText(s).replace(/"/g, '&quot;');
+
+  function resultsXml() {
+    const rows2 = tab.results.map((r) => {
+      const parts = [
+        `  <result n="${r.n}" status="${r.status ?? 0}" length="${r.length ?? 0}" timeMs="${r.timeMs ?? 0}">`,
+        ...(r.payloads ?? []).map((p) => `    <payload>${xmlText(p)}</payload>`),
+        r.error ? `    <error>${xmlText(r.error)}</error>` : '',
+        `    <request>${xmlText(rowWireReq(r))}</request>`,
+        `    <response>${xmlText(rowWireRes(r))}</response>`,
+        r.requestFinal && r.requestRaw ? `    <requestOriginal>${xmlText(r.requestRaw)}</requestOriginal>` : '',
+        r.responseOriginal && r.responseRaw ? `    <responseDecoded>${xmlText(r.responseRaw)}</responseDecoded>` : '',
+        '  </result>',
+      ];
+      return parts.filter(Boolean).join('\n');
+    });
+    return [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      `<intruder tool="${xmlAttr(BRAND.name)}" tab="${xmlAttr(tab.name)}" target="${xmlAttr(tab.target)}" attack="${xmlAttr(tab.type)}" exportedAt="${xmlAttr(new Date().toISOString())}" count="${tab.results.length}">`,
+      ...rows2,
+      '</intruder>',
+      '',
+    ].join('\n');
+  }
+
+  async function exportResults(fmt) {
+    if (!tab.results.length) return;
+    const safe = String(tab.name).replace(/[^\w.-]+/g, '_') || 'attack';
+    const path = await save({
+      title: `Export Intruder results as ${fmt.toUpperCase()}`,
+      defaultPath: `${BRAND.id}-intruder-${safe}.${fmt}`,
+      filters: [{ name: `${fmt.toUpperCase()} file`, extensions: [fmt] }],
+    });
+    if (!path) return;
+    try {
+      const text = fmt === 'json' ? resultsJson() : resultsXml();
+      await api.saveBinary(path, btoa(unescape(encodeURIComponent(text))));
+      store.notice = { text: `Exported ${tab.results.length} results as ${fmt.toUpperCase()}`, error: false };
+    } catch (e) {
+      store.notice = { text: String(e), error: true };
+    }
+    setTimeout(() => (store.notice = null), 2500);
+  }
+
+  /** The Export button's drop-down, anchored under it. */
+  function openExportMenu(e) {
+    const r = e.currentTarget.getBoundingClientRect();
+    const n = tab.results.length;
+    menu = {
+      x: r.left,
+      y: r.bottom + 4,
+      items: [
+        { label: 'Export as JSON', hint: `${n} results`, run: () => exportResults('json') },
+        { label: 'Export as XML', hint: `${n} results`, run: () => exportResults('xml') },
+        'separator',
+        {
+          label: 'Save to Organizer (new collection)',
+          hint: `${tab.name} intruder`,
+          run: () => store.saveIntruderRunToCollection(tab),
+        },
+        { label: 'Save all results as one record', hint: store.organizerTargetHint, run: () => store.saveAllIntruderResultsToOrganizer(tab) },
+      ],
+    };
+  }
+
   function openTabMenu(t, x, y) {
     iv.activeId = t.id;
     menu = {
       x,
       y,
       items: [
+        { label: 'Rename', run: () => (renaming = t.id) },
         { label: 'Save to Organizer', hint: store.organizerTargetHint, run: () => store.saveIntruderToOrganizer(t) },
+        { label: `Save all ${t.results.length} results to Organizer`, hint: store.organizerTargetHint, disabled: !t.results.length, run: () => store.saveAllIntruderResultsToOrganizer(t) },
+        { label: 'Save results to a new collection', hint: `${t.name} intruder`, disabled: !t.results.length, run: () => store.saveIntruderRunToCollection(t) },
         { label: 'Send to Repeater', run: () => store.addRepeaterTab({ name: t.name, target: t.target, raw: clearPositions(t.raw) }) },
         'separator',
         { label: 'Duplicate', run: () => store.duplicateIntruderTab(t) },
@@ -162,6 +321,26 @@
   });
   let selected = $derived(tab.results.find((r) => r.n === tab.selected));
 
+  // When an intruder-scope extension changed a request/response, the result keeps the
+  // sent (Wire) and typed/arrived forms so the detail shows a Wire / Original / Extension
+  // switcher (same idea as History). Returns null when there is nothing to switch.
+  function reqVariants(r) {
+    if (!r) return null;
+    const wire = r.requestFinal || r.requestRaw || '';
+    const orig = r.requestRaw || '';
+    const list = [{ id: 'final', label: 'Wire', raw: wire }];
+    if (orig && orig !== wire) list.push({ id: 'original', label: 'Original', raw: orig });
+    return list.length > 1 ? list : null;
+  }
+  function resVariants(r) {
+    if (!r || r.error) return null;
+    const wire = r.responseOriginal || r.responseRaw || '';
+    const decoded = r.responseOriginal ? r.responseRaw || '' : '';
+    const list = [{ id: 'final', label: 'Wire', raw: wire }];
+    if (decoded && decoded !== wire) list.push({ id: 'decoded', label: 'Extension', raw: decoded });
+    return list.length > 1 ? list : null;
+  }
+
   function sortBy(k) {
     if (sortKey === k) sortDir = -sortDir;
     else ((sortKey = k), (sortDir = 1));
@@ -171,8 +350,18 @@
   // scrolling the table; Home / End jump to the first / last, PageUp / PageDown by 10.
   let rowsEl = $state();
   const ROW_KEYS = { ArrowDown: 1, ArrowUp: -1, PageDown: 10, PageUp: -10, Home: 0, End: 0 };
-  async function onRowsKey(e) {
+  // Arrow browsing listens on the window, not just the rows list: the result detail's
+  // request / response panes are not focusable, so clicking one moves focus to <body>
+  // and a listener on the list would never see the keys again - that is why
+  // "↑ ↓ to browse" stopped working after clicking a pane.
+  async function onResultsKey(e) {
     if (!(e.key in ROW_KEYS) || !rows.length || e.metaKey || e.ctrlKey || e.altKey) return;
+    const el = document.activeElement;
+    // Never steal arrows from something being typed in (payload lists, the request
+    // template, a find bar) or from a dropdown.
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable)) return;
+    // Only while browsing results: the detail is open, or focus is in the results pane.
+    if (tab.selected == null && !(resultsEl && el && resultsEl.contains(el))) return;
     e.preventDefault();
     const last = rows.length - 1;
     const step = ROW_KEYS[e.key];
@@ -317,12 +506,30 @@
   }
 </script>
 
+<svelte:window onkeydown={onResultsKey} />
+
 <div class="intruder">
   <div class="tabs" role="tablist">
     {#each iv.tabs as t (t.id)}
-      <div class="tab" class:active={t.id === tab.id} role="tab" tabindex="0" aria-selected={t.id === tab.id} onclick={() => (iv.activeId = t.id)} oncontextmenu={(e) => (e.preventDefault(), openTabMenu(t, e.clientX, e.clientY))} onkeydown={(e) => e.key === 'Enter' && (iv.activeId = t.id)}>
+      <div class="tab" class:active={t.id === tab.id} role="tab" tabindex="0" aria-selected={t.id === tab.id} title="Double-click to rename" onclick={() => (iv.activeId = t.id)} ondblclick={() => (renaming = t.id)} oncontextmenu={(e) => (e.preventDefault(), openTabMenu(t, e.clientX, e.clientY))} onkeydown={(e) => e.key === 'Enter' && (iv.activeId = t.id)}>
         {#if t.running}<span class="spinner"></span>{/if}
-        <span class="name">{t.name}</span>
+        {#if renaming === t.id}
+          <input
+            class="rename"
+            value={t.name}
+            use:focusSelect
+            onclick={(e) => e.stopPropagation()}
+            onblur={(e) => finishRename(t, e.currentTarget.value)}
+            onkeydown={(e) => {
+              e.stopPropagation();
+              if (e.key === 'Enter') finishRename(t, e.currentTarget.value);
+              if (e.key === 'Escape') renaming = null;
+            }}
+          />
+        {:else}
+          <span class="name">{t.name}</span>
+        {/if}
+        {#if t.rawMode}<span class="rawtag" title="Raw mode: extensions are skipped for this attack">RAW</span>{/if}
         <button class="close" aria-label="Close tab" onclick={(e) => (e.stopPropagation(), store.closeIntruderTab(t.id))}>×</button>
       </div>
     {/each}
@@ -343,6 +550,19 @@
       {#if tab.results.length}<span class="dim">{tab.results.length} sent</span>{/if}
     {/if}
     {#if tab.error}<span class="error">{tab.error}</span>{/if}
+    <span class="tgrow"></span>
+    {#if store.extActiveOn('intruder')}
+      <label class="rawmode" class:on={tab.rawMode} title="Raw mode: skip extensions for this attack. Each request is sent exactly as generated and responses are shown exactly as they arrived (also drops the per-request Python round trip).">
+        <input type="checkbox" bind:checked={tab.rawMode} disabled={tab.running} />
+        Raw
+      </label>
+    {/if}
+    <button
+      class="btn sm export"
+      disabled={!tab.results.length || tab.running}
+      title={tab.results.length ? 'Export the results (JSON / XML) or save them to the Organizer' : 'Run an attack first'}
+      onclick={openExportMenu}
+    >Export</button>
   </div>
 
   <div class="body">
@@ -433,7 +653,7 @@
             <span class="cell th">Payload</span>
           </div>
           <!-- svelte-ignore a11y_no_static_element_interactions -->
-          <div class="rows" bind:this={rowsEl} onkeydown={onRowsKey}>
+          <div class="rows" bind:this={rowsEl} oncontextmenu={openResultsMenu}>
             {#if !tab.results.length}
               <div class="empty dim">Mark a position, add payloads, then Start attack.</div>
             {/if}
@@ -476,7 +696,8 @@
               <div style="display:contents" oncontextmenu={(e) => (e.preventDefault(), openResultMenu(selected, e.clientX, e.clientY, 'req'))}>
                 <MessageView
                   title="Request #{selected.n}"
-                  raw={selected.requestRaw ?? ''}
+                  raw={selected.requestFinal || selected.requestRaw || ''}
+                  variants={reqVariants(selected)}
                   placeholder="Request not kept for this row (large run)" />
               </div>
             {/snippet}
@@ -485,7 +706,8 @@
               <div style="display:contents" oncontextmenu={(e) => (e.preventDefault(), openResultMenu(selected, e.clientX, e.clientY, 'res'))}>
                 <MessageView
                   title="Response #{selected.n}"
-                  raw={selected.error ? '' : selected.responseRaw}
+                  raw={selected.error ? '' : selected.responseOriginal || selected.responseRaw}
+                  variants={resVariants(selected)}
                   placeholder={selected.error ? selected.error : 'Response not kept for this row (large run)'} />
               </div>
             {/snippet}
@@ -515,6 +737,51 @@
     border-bottom: 1px solid var(--border);
     background: var(--bg-elev);
     scrollbar-width: none;
+  }
+  /* Pushes the Export button to the right end of the toolbar. */
+  .tgrow {
+    flex: 1;
+  }
+  /* Raw mode: skipping extensions silently changes what is sent, so it is a visible
+     toggle in the bar and a badge on the tab, not a hidden preference. */
+  .rawmode {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0 7px;
+    height: 26px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-dim);
+    font-size: 12px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .rawmode input {
+    accent-color: var(--amber);
+  }
+  .rawmode.on {
+    border-color: color-mix(in srgb, var(--amber) 60%, transparent);
+    background: color-mix(in srgb, var(--amber) 12%, transparent);
+    color: var(--amber);
+  }
+  .rawtag {
+    padding: 0 4px;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--amber) 22%, transparent);
+    color: var(--amber);
+    font: 700 9px/14px var(--sans);
+    letter-spacing: 0.04em;
+  }
+  .rename {
+    width: 110px;
+    padding: 2px 5px;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    outline: none;
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
   }
   .tab {
     display: flex;

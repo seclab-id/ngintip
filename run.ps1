@@ -1,4 +1,4 @@
-# Jalankan Cegat di Windows (padanan run.sh).
+# Jalankan Ngintip di Windows (padanan run.sh).
 #   .\run.ps1          -> mode dev (hot reload)
 #   .\run.ps1 build    -> bundle release (.msi / .exe)
 param([ValidateSet('dev', 'build')][string]$Mode = 'dev')

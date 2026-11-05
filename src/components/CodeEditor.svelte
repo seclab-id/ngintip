@@ -60,6 +60,17 @@
     if (s.trim() && s.length <= 100_000 && autoDecode(s).length) onselect(s);
   }
 
+  // The shared `.scroll` container is the only scroller; the transparent textarea
+  // must stay pinned at the top-left so the caret lines up with the coloured <pre>
+  // underneath. The browser can nudge the textarea's own scroll when the caret moves
+  // right after a reflow (e.g. a side panel opening/closing beside it), which shifts
+  // the text out of line; pin it back so clicks always land where the colours show.
+  function pinScroll() {
+    if (!ta) return;
+    if (ta.scrollTop !== 0) ta.scrollTop = 0;
+    if (ta.scrollLeft !== 0) ta.scrollLeft = 0;
+  }
+
   function step(d) {
     if (count) matchIdx = (matchIdx + d + count) % count;
   }
@@ -100,6 +111,7 @@
         bind:value
         onmouseup={reportSelection}
         onkeyup={reportSelection}
+        onscroll={pinScroll}
         spellcheck="false"
         autocomplete="off"
         autocapitalize="off"

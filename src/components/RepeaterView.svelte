@@ -593,6 +593,7 @@
             {:else}
               <span class="name">{t.name}</span>
             {/if}
+            {#if t.rawMode}<span class="rawtag" title="Raw mode: extensions are skipped for this tab">RAW</span>{/if}
 
             <button class="close" aria-label="Close tab" onclick={(e) => close(e, t.id)}>×</button>
           </div>
@@ -649,6 +650,12 @@
       <span class="dim meta">{tab.response.durationMs} ms · {fmtSize(tab.response.length)}{#if currentTs} · {fmtDateTime(currentTs)}{/if}</span>
     {/if}
     <div class="spacer"></div>
+    {#if store.extActiveOn('repeater')}
+      <label class="rawmode" class:on={tab.rawMode} title="Raw mode: skip extensions for this tab. The request leaves exactly as typed and the response is shown exactly as it arrived (no decode, no re-encode).">
+        <input type="checkbox" bind:checked={tab.rawMode} />
+        Raw
+      </label>
+    {/if}
     <button class="btn ghost sm icbtn note-btn" class:has={!!tab.note} title="Note for this tab, its group, or all tabs (double-click a tab to rename)" aria-label="Note" onclick={openNotes}>
       <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" /></svg>
     </button>
@@ -660,7 +667,7 @@
     </button>
   </div>
 
-  <div class="grid" class:with-decoder={miniDecode}>
+  <div class="grid">
     <div class="rpanes">
       <SplitPane storeKey="repeater" left={reqPane} right={resPane} />
     </div>
@@ -906,6 +913,37 @@
     white-space: nowrap;
     text-overflow: ellipsis;
   }
+  /* Raw mode: skipping extensions silently changes what is sent, so it is a visible
+     toggle in the bar and a badge on the tab, not a hidden preference. */
+  .rawmode {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0 7px;
+    height: 24px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-dim);
+    font-size: 12px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .rawmode input {
+    accent-color: var(--amber);
+  }
+  .rawmode.on {
+    border-color: color-mix(in srgb, var(--amber) 60%, transparent);
+    background: color-mix(in srgb, var(--amber) 12%, transparent);
+    color: var(--amber);
+  }
+  .rawtag {
+    padding: 0 4px;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--amber) 22%, transparent);
+    color: var(--amber);
+    font: 700 9px/14px var(--sans);
+    letter-spacing: 0.04em;
+  }
   .rename {
     width: 110px;
     padding: 2px 5px;
@@ -1114,15 +1152,11 @@
     font-size: 12px;
   }
   .grid {
+    position: relative;
     display: grid;
     grid-template-columns: 1fr;
     min-height: 0;
     padding: 10px;
-  }
-  .grid.with-decoder {
-    /* The dock column sizes to the MiniDecoder's own (draggable) width. */
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 10px;
   }
   .rpanes {
     display: grid;
@@ -1130,9 +1164,21 @@
     min-width: 0;
     min-height: 0;
   }
+  /* The decoder FLOATS over the right edge instead of taking a grid column, so
+     opening or closing it never reflows (re-wraps) the request/response editors.
+     Resizing the editor under the caret is what made placing the cursor go wrong
+     after the decoder closed. */
   .decoder-dock {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    bottom: 10px;
+    z-index: 6;
     min-width: 0;
     min-height: 0;
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: -10px 0 28px rgb(0 0 0 / 0.28);
   }
   .error {
     padding: 14px;

@@ -30,7 +30,11 @@ export const regenerateCa = () => invoke('regenerate_ca');
 export const exportCa = (path) => invoke('export_ca', { path });
 export const openUrl = (url) => invoke('open_url', { url });
 // With `tab`, the send is recorded in that tab's history (see repeaterHistory).
-export const sendRaw = (target, raw, tab = null) => invoke('send_raw', { target, raw, tab });
+// `bypassExt` is the tab's raw mode: skip extensions entirely for this send.
+export const sendRaw = (target, raw, tab = null, bypassExt = false) => invoke('send_raw', { target, raw, tab, bypassExt });
+// One Intruder attack request: no Repeater history, but intruder-scope extensions apply
+// (request_final / response_original come back so Wire/Original views survive a save).
+export const intruderSend = (target, raw, bypassExt = false) => invoke('intruder_send', { target, raw, bypassExt });
 export const cancelSend = (tab) => invoke('cancel_send', { tab });
 export const repeaterHistory = (tab) => invoke('repeater_history', { tab });
 export const repeaterEntry = (id) => invoke('repeater_entry', { id });

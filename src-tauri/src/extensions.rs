@@ -67,11 +67,74 @@ pub enum Phase {
     Response,
 }
 
-impl Phase {
-    fn hook(self) -> &'static str {
-        match self {
-            Phase::Request => "request",
-            Phase::Response => "response",
+/// Which pass an extension hook belongs to. `Process` edits the message on the wire
+/// (the original `process_*` hooks). `Decode` turns the wire form into the readable
+/// form shown in the UI without changing what is sent. `Encode` turns the edited
+/// readable form back into the wire form, on send.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Stage {
+    Process,
+    Decode,
+    Encode,
+}
+
+impl Stage {
+    /// The Python function name for this (stage, phase), e.g. `decode_request`.
+    fn hook(self, phase: Phase) -> &'static str {
+        match (self, phase) {
+            (Stage::Process, Phase::Request) => "process_request",
+            (Stage::Process, Phase::Response) => "process_response",
+            (Stage::Decode, Phase::Request) => "decode_request",
+            (Stage::Decode, Phase::Response) => "decode_response",
+            (Stage::Encode, Phase::Request) => "encode_request",
+            (Stage::Encode, Phase::Response) => "encode_response",
+        }
+    }
+}
+
+/// Extra per-call context sent to a hook (the surface comes from the `Surface` arg).
+/// Empty by default: process hooks carry no host/path, display/send fill what they know.
+#[derive(Default)]
+pub struct HookCtx {
+    pub host: String,
+    pub path: String,
+    pub flow_id: Option<u64>,
+    pub edited: bool,
+}
+
+/// Which hooks a script actually defines, scanned from its source so a worker is only
+/// called for hooks it has (a process-only extension pays nothing for decode/encode).
+#[derive(Default, Clone, Copy)]
+struct HookDefs {
+    process_req: bool,
+    process_res: bool,
+    decode_req: bool,
+    decode_res: bool,
+    encode_req: bool,
+    encode_res: bool,
+}
+
+impl HookDefs {
+    fn scan(src: &str) -> Self {
+        let has = |name: &str| src.contains(&format!("def {name}(")) || src.contains(&format!("def {name} ("));
+        HookDefs {
+            process_req: has("process_request"),
+            process_res: has("process_response"),
+            decode_req: has("decode_request"),
+            decode_res: has("decode_response"),
+            encode_req: has("encode_request"),
+            encode_res: has("encode_response"),
+        }
+    }
+
+    fn has(&self, stage: Stage, phase: Phase) -> bool {
+        match (stage, phase) {
+            (Stage::Process, Phase::Request) => self.process_req,
+            (Stage::Process, Phase::Response) => self.process_res,
+            (Stage::Decode, Phase::Request) => self.decode_req,
+            (Stage::Decode, Phase::Response) => self.decode_res,
+            (Stage::Encode, Phase::Request) => self.encode_req,
+            (Stage::Encode, Phase::Response) => self.encode_res,
         }
     }
 }
@@ -85,6 +148,7 @@ pub enum Surface {
     Proxy,
     Interceptor,
     Repeater,
+    Intruder,
 }
 
 impl Surface {
@@ -93,13 +157,14 @@ impl Surface {
             Surface::Proxy => "proxy",
             Surface::Interceptor => "interceptor",
             Surface::Repeater => "repeater",
+            Surface::Intruder => "intruder",
         }
     }
 }
 
 /// Whether an extension's scope covers this surface. Scope is a comma/space separated
-/// set of surface tokens ("proxy", "interceptor", "repeater"); the legacy values
-/// "both" and "all" (and an empty scope) match every surface.
+/// set of surface tokens ("proxy", "interceptor", "repeater", "intruder"); the legacy
+/// values "both" and "all" (and an empty scope) match every surface.
 fn scope_matches(scope: &str, surface: Surface) -> bool {
     let s = scope.trim();
     if s.is_empty() || s.eq_ignore_ascii_case("both") || s.eq_ignore_ascii_case("all") {
@@ -128,8 +193,8 @@ pub struct ExtensionSpec {
     pub path: String,
     pub enabled: bool,
     /// Where it runs: a comma-separated set of "proxy" (live history traffic),
-    /// "interceptor" (held messages) and "repeater" (Repeater sends); "all"/"both"
-    /// (or empty) means every surface.
+    /// "interceptor" (held messages), "repeater" (Repeater sends) and "intruder"
+    /// (Intruder attack requests); "all"/"both" (or empty) means every surface.
     #[serde(default = "default_scope")]
     pub scope: String,
     /// pip requirements to install into the venv (e.g. ["pycryptodome"]).
@@ -180,6 +245,9 @@ struct Loaded {
     spec: ExtensionSpec,
     worker: Option<Worker>,
     error: Option<String>,
+    /// Hooks the script defines (scanned at worker start), so we skip calling a worker
+    /// for a hook it does not have.
+    defines: HookDefs,
 }
 
 #[derive(Default)]
@@ -317,6 +385,9 @@ impl Inner {
                     continue;
                 }
             };
+            // Scan the source for which hooks it defines, so we only call ones it has.
+            let src = if !spec.body.is_empty() { spec.body.clone() } else { std::fs::read_to_string(&script).unwrap_or_default() };
+            self.loaded[i].defines = HookDefs::scan(&src);
             match spawn_worker(&python, &runner, &script, &spec.name, logs.clone()) {
                 Ok(worker) => {
                     self.loaded[i].worker = Some(worker);
@@ -330,19 +401,22 @@ impl Inner {
         }
     }
 
-    fn transform(&mut self, phase: Phase, raw: &[u8], surface: Surface, logs: &Logs) -> Option<Vec<u8>> {
+    fn run_stage(&mut self, stage: Stage, phase: Phase, raw: &[u8], surface: Surface, ctx: &HookCtx, logs: &Logs) -> Option<Vec<u8>> {
         let mut cur = raw.to_vec();
         let mut changed = false;
+        let hook = stage.hook(phase);
+        let env = CtxEnv { surface: surface.token(), host: &ctx.host, path: &ctx.path, flow_id: ctx.flow_id, edited: ctx.edited };
         for i in 0..self.loaded.len() {
             if !self.loaded[i].spec.enabled
                 || self.loaded[i].worker.is_none()
                 || !scope_matches(&self.loaded[i].spec.scope, surface)
+                || !self.loaded[i].defines.has(stage, phase)
             {
                 continue;
             }
             let name = self.loaded[i].spec.name.clone();
             let worker = self.loaded[i].worker.as_mut().unwrap();
-            match worker_call(worker, phase, &cur) {
+            match worker_call(worker, hook, &env, &cur) {
                 Ok(out) => {
                     if out != cur {
                         changed = true;
@@ -352,7 +426,7 @@ impl Inner {
                 Err(e) => {
                     self.loaded[i].error = Some(e.clone());
                     self.loaded[i].worker = None; // died / timed out; drop it
-                    push_log(logs, format!("[{name}] {} error: {e}", phase.hook()));
+                    push_log(logs, format!("[{name}] {hook} error: {e}"));
                 }
             }
         }
@@ -430,7 +504,7 @@ pub struct TestResult {
 
 /// Run the script once on `raw` in a throwaway process (stdin closed after one line,
 /// so it exits), with a timeout. Returns (transformed bytes, printed lines).
-fn run_once(python: &str, runner: &Path, script: &str, phase: Phase, raw: &[u8]) -> Result<(Vec<u8>, Vec<String>), String> {
+fn run_once(python: &str, runner: &Path, script: &str, hook: &str, raw: &[u8]) -> Result<(Vec<u8>, Vec<String>), String> {
     let mut child = Command::new(python)
         .arg(runner)
         .arg(script)
@@ -440,7 +514,7 @@ fn run_once(python: &str, runner: &Path, script: &str, phase: Phase, raw: &[u8])
         .spawn()
         .map_err(|e| format!("spawn failed: {e}"))?;
 
-    let line = serde_json::to_string(&Msg { hook: phase.hook(), data: STANDARD.encode(raw) }).map_err(|e| e.to_string())?;
+    let line = serde_json::to_string(&Msg { hook, data: STANDARD.encode(raw), ctx: None }).map_err(|e| e.to_string())?;
     {
         let mut stdin = child.stdin.take().ok_or("no stdin")?;
         stdin.write_all(line.as_bytes()).map_err(|e| format!("write: {e}"))?;
@@ -480,6 +554,20 @@ fn run_once(python: &str, runner: &Path, script: &str, phase: Phase, raw: &[u8])
 struct Msg<'a> {
     hook: &'a str,
     data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ctx: Option<CtxEnv<'a>>,
+}
+
+/// The `ctx` object handed to a hook (mirrors runner.py's Ctx).
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+struct CtxEnv<'a> {
+    surface: &'a str,
+    host: &'a str,
+    path: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flow_id: Option<u64>,
+    edited: bool,
 }
 
 #[derive(Deserialize)]
@@ -492,8 +580,8 @@ struct Reply {
 }
 
 /// One request/response over a worker's pipes, with a timeout.
-fn worker_call(w: &mut Worker, phase: Phase, raw: &[u8]) -> Result<Vec<u8>, String> {
-    let msg = Msg { hook: phase.hook(), data: STANDARD.encode(raw) };
+fn worker_call(w: &mut Worker, hook: &str, ctx: &CtxEnv, raw: &[u8]) -> Result<Vec<u8>, String> {
+    let msg = Msg { hook, data: STANDARD.encode(raw), ctx: Some(*ctx) };
     let line = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
     w.stdin.write_all(line.as_bytes()).map_err(|e| format!("write: {e}"))?;
     w.stdin.write_all(b"\n").map_err(|e| format!("write: {e}"))?;
@@ -588,7 +676,7 @@ impl Extensions {
     pub fn set_extensions(&self, specs: Vec<ExtensionSpec>) {
         let mut inner = self.inner.lock().unwrap();
         inner.stop_all();
-        inner.loaded = specs.into_iter().map(|spec| Loaded { spec, worker: None, error: None }).collect();
+        inner.loaded = specs.into_iter().map(|spec| Loaded { spec, worker: None, error: None, defines: HookDefs::default() }).collect();
         inner.restart_workers(&self.logs);
         self.refresh(&inner);
     }
@@ -599,7 +687,7 @@ impl Extensions {
     pub fn load(&self, specs: Vec<ExtensionSpec>, enabled: bool, saved_logs: Vec<String>) {
         let mut inner = self.inner.lock().unwrap();
         inner.stop_all();
-        inner.loaded = specs.into_iter().map(|spec| Loaded { spec, worker: None, error: None }).collect();
+        inner.loaded = specs.into_iter().map(|spec| Loaded { spec, worker: None, error: None, defines: HookDefs::default() }).collect();
         inner.enabled = enabled;
         if let Ok(mut l) = self.logs.lock() {
             l.clear();
@@ -695,10 +783,24 @@ impl Extensions {
         self.enabled.load(Ordering::Relaxed) && self.has_workers.load(Ordering::Relaxed)
     }
 
-    /// Transform a message; returns the new bytes only when something changed.
+    /// Modify a message on the wire (`process_*` hooks); new bytes only when changed.
     pub fn transform(&self, phase: Phase, raw: &[u8], surface: Surface) -> Option<Vec<u8>> {
+        self.run(Stage::Process, phase, raw, surface, &HookCtx::default())
+    }
+
+    /// Readable (decoded) form for the UI (`decode_*` hooks); does not change the wire.
+    pub fn decode(&self, phase: Phase, raw: &[u8], surface: Surface, ctx: &HookCtx) -> Option<Vec<u8>> {
+        self.run(Stage::Decode, phase, raw, surface, ctx)
+    }
+
+    /// Wire form from an edited readable message on send (`encode_*` hooks).
+    pub fn encode(&self, phase: Phase, raw: &[u8], surface: Surface, ctx: &HookCtx) -> Option<Vec<u8>> {
+        self.run(Stage::Encode, phase, raw, surface, ctx)
+    }
+
+    fn run(&self, stage: Stage, phase: Phase, raw: &[u8], surface: Surface, ctx: &HookCtx) -> Option<Vec<u8>> {
         let mut inner = self.inner.lock().unwrap();
-        let result = inner.transform(phase, raw, surface, &self.logs);
+        let result = inner.run_stage(stage, phase, raw, surface, ctx, &self.logs);
         // A worker may have died / timed out mid-call; keep the fast-path flag honest.
         let any = inner.any_worker();
         drop(inner);
@@ -755,7 +857,21 @@ impl Extensions {
         if let Err(e) = std::fs::write(&runner, RUNNER) {
             return TestResult { error: Some(format!("could not write runner: {e}")), ..Default::default() };
         }
-        match run_once(&python, &runner, &script, phase, raw) {
+        // Pick the hook the script actually defines for this phase: prefer the wire
+        // `process_*`, else `decode_*`, else `encode_*`, so a decode/encode-only
+        // extension still dry-runs its real hook instead of a silent passthrough.
+        let src = std::fs::read_to_string(&script).unwrap_or_default();
+        let defs = HookDefs::scan(&src);
+        let stage = if defs.has(Stage::Process, phase) {
+            Stage::Process
+        } else if defs.has(Stage::Decode, phase) {
+            Stage::Decode
+        } else if defs.has(Stage::Encode, phase) {
+            Stage::Encode
+        } else {
+            Stage::Process
+        };
+        match run_once(&python, &runner, &script, stage.hook(phase), raw) {
             Ok((out, logs)) => TestResult {
                 changed: out != raw,
                 output: String::from_utf8_lossy(&out).into_owned(),
@@ -807,26 +923,34 @@ mod tests {
     }
 
     #[test]
-    fn scope_matches_covers_the_three_surfaces() {
+    fn scope_matches_covers_the_surfaces() {
         use Surface::*;
         // Legacy / catch-all values match every surface.
         for scope in ["all", "both", "", "  ", "ALL"] {
             assert!(scope_matches(scope, Proxy), "{scope:?} proxy");
             assert!(scope_matches(scope, Interceptor), "{scope:?} interceptor");
             assert!(scope_matches(scope, Repeater), "{scope:?} repeater");
+            assert!(scope_matches(scope, Intruder), "{scope:?} intruder");
         }
         // A single surface matches only itself.
         assert!(scope_matches("proxy", Proxy));
         assert!(!scope_matches("proxy", Interceptor));
         assert!(!scope_matches("proxy", Repeater));
+        assert!(!scope_matches("proxy", Intruder));
         assert!(scope_matches("interceptor", Interceptor));
         assert!(!scope_matches("interceptor", Proxy));
         assert!(scope_matches("repeater", Repeater));
         assert!(!scope_matches("repeater", Proxy));
+        assert!(scope_matches("intruder", Intruder));
+        assert!(!scope_matches("intruder", Repeater));
+        assert!(!scope_matches("repeater", Intruder));
         // Combinations (comma / space / mixed case) match each listed surface.
         assert!(scope_matches("proxy,repeater", Proxy));
         assert!(scope_matches("proxy,repeater", Repeater));
         assert!(!scope_matches("proxy,repeater", Interceptor));
+        assert!(scope_matches("repeater,intruder", Intruder));
+        assert!(scope_matches("repeater,intruder", Repeater));
+        assert!(!scope_matches("repeater,intruder", Proxy));
         assert!(scope_matches("Interceptor Repeater", Interceptor));
         assert!(scope_matches("Interceptor Repeater", Repeater));
         assert!(!scope_matches("interceptor,repeater", Proxy));
@@ -855,14 +979,66 @@ mod tests {
         }
         // The hook receives an HttpMessage from the new API and edits it in place.
         let (mut w, dir) = worker("def process_request(req):\n    req.set_header('X-Test', '1')\n    req.method = 'PUT'\n");
-        let out = worker_call(&mut w, Phase::Request, b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let ctx = CtxEnv { surface: "test", host: "", path: "", flow_id: None, edited: false };
+        let out = worker_call(&mut w, "process_request", &ctx, b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
         let out = String::from_utf8_lossy(&out);
         assert!(out.starts_with("PUT /a HTTP/1.1"), "method edited: {out}");
         assert!(out.contains("X-Test: 1"), "header added: {out}");
         // No response hook -> passthrough unchanged.
         let res = b"HTTP/1.1 200 OK\r\n\r\n";
-        assert_eq!(worker_call(&mut w, Phase::Response, res).unwrap(), res);
+        assert_eq!(worker_call(&mut w, "process_response", &ctx, res).unwrap(), res);
         let _ = w.child.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decode_and_encode_hooks_with_ctx() {
+        if detect_python().is_none() {
+            eprintln!("skipping: no python");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ext-dec-{}-{}", std::process::id(), rand_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("c.py");
+        // decode: readable view (uppercase body) only for host "api.t"; never on the wire.
+        // encode: on send, append a marker that depends on ctx.edited.
+        // No process_* hook, so the process path must be a no-op for this extension.
+        std::fs::write(
+            &script,
+            "def decode_request(req, ctx):\n    if ctx.host == 'api.t':\n        req.text = req.text.upper()\n\n\
+             def encode_request(req, ctx):\n    req.text = req.text + ('|edited' if ctx.edited else '|same')\n",
+        )
+        .unwrap();
+        let ext = Extensions::default();
+        ext.configure(dir.clone(), None, None);
+        ext.set_extensions(vec![ExtensionSpec {
+            id: "c".into(),
+            name: "c".into(),
+            path: script.to_string_lossy().into_owned(),
+            enabled: true,
+            scope: "all".into(),
+            requirements: vec![],
+            body: String::new(),
+        }]);
+        ext.set_enabled(true);
+
+        // Content-Length is present (as on real captured requests), so a no-op hook
+        // re-serializes to identical bytes and is correctly reported as "no change".
+        let raw = b"POST /x HTTP/1.1\r\nHost: api.t\r\nContent-Length: 5\r\n\r\nhello";
+        // Process stage: this extension defines no process_* hook -> no change.
+        assert!(ext.transform(Phase::Request, raw, Surface::Proxy).is_none(), "process must be a no-op");
+        // Decode for the matching host uppercases the body for display.
+        let ctx = HookCtx { host: "api.t".into(), ..Default::default() };
+        let decoded = ext.decode(Phase::Request, raw, Surface::Proxy, &ctx).expect("decoded");
+        assert!(String::from_utf8_lossy(&decoded).contains("HELLO"), "decoded body upper");
+        // A different host is out of the decode's own scope -> no change.
+        let other = HookCtx { host: "other".into(), ..Default::default() };
+        assert!(ext.decode(Phase::Request, raw, Surface::Proxy, &other).is_none(), "host guard");
+        // Encode reflects ctx.edited.
+        let edited = ext.encode(Phase::Request, raw, Surface::Repeater, &HookCtx { edited: true, ..Default::default() }).expect("encoded");
+        assert!(String::from_utf8_lossy(&edited).contains("|edited"));
+        let same = ext.encode(Phase::Request, raw, Surface::Repeater, &HookCtx { edited: false, ..Default::default() }).expect("encoded");
+        assert!(String::from_utf8_lossy(&same).contains("|same"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -944,7 +1120,7 @@ mod tests {
         // by shrinking the timeout via a hung hook and asserting we recover.
         let (mut w, dir) = worker("import time\ndef process_request(raw):\n    time.sleep(60)\n    return raw\n");
         // Manually drive a call with a short deadline by racing the reply channel.
-        let msg = super::Msg { hook: "request", data: STANDARD.encode(b"x") };
+        let msg = super::Msg { hook: "process_request", data: STANDARD.encode(b"x"), ctx: None };
         let line = serde_json::to_string(&msg).unwrap();
         w.stdin.write_all(line.as_bytes()).unwrap();
         w.stdin.write_all(b"\n").unwrap();

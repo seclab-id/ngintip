@@ -1,5 +1,5 @@
 <script>
-  import { tick } from 'svelte';
+  import { tick, untrack } from 'svelte';
   import CodeEditor from './CodeEditor.svelte';
   import ContextMenu from './ContextMenu.svelte';
   import Modal from './Modal.svelte';
@@ -61,8 +61,27 @@
   let isRequest = $derived(selected?.phase !== 'response');
   // A held response that is a redirect can be followed into Repeater.
   let canFollow = $derived(!!(selected && !isRequest && redirectInfo(selected.raw)));
-  let edited = $derived(selected && it.draft !== selected.raw);
+  // The held body is shown beautified for readability (see the auto-beautify effect
+  // below). That reformat is NOT counted as an edit: `edited` (and the forwarded
+  // bytes, see store.forwardHeld) treat the draft as unchanged while it still equals
+  // the raw wire or its beautified form. Only a real content change counts.
+  let origPretty = $derived(selected ? prettyBody(selected.raw) : null);
+  let edited = $derived(!!selected && it.draft !== selected.raw && it.draft !== origPretty);
   let beautified = $derived(selected ? prettyBody(it.draft) : null);
+
+  // Beautify the body (JSON / XML / HTML) the first time each held message is shown,
+  // so request/response bodies are readable immediately. A body that can't be
+  // prettified is left exactly as it arrived; the Original tab and Reset always keep
+  // the true wire bytes, and forwarding sends them unless you actually edit.
+  const autoBeautified = new Set();
+  $effect(() => {
+    const key = it.selectedKey;
+    if (key == null || autoBeautified.has(key)) return;
+    autoBeautified.add(key);
+    untrack(() => {
+      if (origPretty && origPretty !== it.draft) it.draft = origPretty;
+    });
+  });
   // Compare the editable draft against what arrived.
   let tab = $state('edited');
   let menu = $state(null); // right-click menu on a queued item

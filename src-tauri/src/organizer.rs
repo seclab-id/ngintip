@@ -45,13 +45,31 @@ pub struct SavedRequest {
     pub path: String,
     /// `scheme://host[:port]` the request is sent to.
     pub target: String,
+    /// The request as it went on the wire (after any extension transform).
     pub request: String,
+    /// The response as shown (the Wire bytes, or the extension-decoded form for History).
     pub response: String,
+    /// Optional captured variants so the saved detail can show the same Wire / Extension /
+    /// Original switcher the live views do. `request`/`response` above are the primary
+    /// (Wire) form; these are only stored when they differ, so older projects stay small.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub request_original: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub request_extension: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub response_original: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub response_extension: String,
+    /// A whole Intruder run saved as one record: every result row (n, payload, status,
+    /// length, time, request/response). The UI shows these as a table, like Intruder's
+    /// own results list, instead of one giant concatenated message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results: Option<Value>,
     pub status: Option<u16>,
     pub label: String,
     pub note: String,
     pub color: String,
-    /// Where it came from: history, repeater, intruder or mcp.
+    /// Where it came from: history, repeater, intruder, intruder(each) or mcp.
     pub source: String,
     pub saved_at: u64,
     /// The first version stored the request text here; folded into `request` on load.
@@ -89,6 +107,16 @@ pub struct NewItem {
     pub target: String,
     pub request: String,
     pub response: String,
+    #[serde(default)]
+    pub request_original: String,
+    #[serde(default)]
+    pub request_extension: String,
+    #[serde(default)]
+    pub response_original: String,
+    #[serde(default)]
+    pub response_extension: String,
+    #[serde(default)]
+    pub results: Option<Value>,
     pub status: Option<u16>,
     pub label: String,
     pub note: String,
@@ -224,6 +252,11 @@ impl SavedRequest {
             target: n.target.trim().to_string(),
             request: n.request,
             response: n.response,
+            request_original: n.request_original,
+            request_extension: n.request_extension,
+            response_original: n.response_original,
+            response_extension: n.response_extension,
+            results: n.results,
             status: n.status,
             label: n.label.trim().to_string(),
             note: n.note,

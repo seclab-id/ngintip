@@ -22,6 +22,18 @@
 
   onMount(() => store.init());
 
+  // A full page reload in the desktop webview throws away all in-memory state and
+  // drops the user back on the project chooser - it looks like a crash. WebView2 on
+  // Windows (and other webviews) still honour Ctrl/Cmd+R, Ctrl+Shift+R and F5, and
+  // views without their own key handler (e.g. Organizer) let the keystroke through.
+  // Swallow the reload shortcuts whenever we're running inside the Tauri app; a plain
+  // dev browser at localhost:1420 keeps its normal reload.
+  function guardReload(e) {
+    if (!('__TAURI_INTERNALS__' in window) && !('__TAURI__' in window)) return;
+    const isReload = e.key === 'F5' || ((e.ctrlKey || e.metaKey) && (e.key === 'r' || e.key === 'R'));
+    if (isReload) e.preventDefault();
+  }
+
   // Count up while a project is saving/opening, so a long save shows how long it has
   // been running (0.0s and climbing) rather than a static spinner.
   let busy = $derived(store.decompressing || store.saving);
@@ -37,6 +49,8 @@
     return () => clearInterval(id);
   });
 </script>
+
+<svelte:window onkeydown={guardReload} />
 
 {#if store.chooser}
   <ProjectChooser />

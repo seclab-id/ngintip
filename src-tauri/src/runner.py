@@ -8,15 +8,28 @@ newline-delimited JSON protocol on stdin/stdout:
     -> {"ok": true,  "data": "<base64 transformed message>"}
     -> {"ok": false, "error": "<message>"}
 
-A script defines either or both hooks, which receive an editable message object:
+A script defines any of these hooks, each receiving an editable message object
+and an optional context (see Ctx below):
 
-    def process_request(req):   ...   # req is an HttpMessage (a request)
-    def process_response(res):  ...   # res is an HttpMessage (a response)
+    # change the message on the wire (runs once per flow; side effects OK):
+    def process_request(req, ctx=None):   ...
+    def process_response(res, ctx=None):  ...
 
-The hook may mutate the message in place and return None (recommended), or
-return a new HttpMessage / bytes / str. Returning None with no changes is a
-no-op. Anything printed goes to stderr (the Debug console), so print() never
-corrupts the protocol on stdout.
+    # display only: wire -> readable, NEVER changes what is sent. Used to show a
+    # decrypted/decoded body in the UI while the real encrypted bytes stay the wire:
+    def decode_request(req, ctx=None):    ...
+    def decode_response(res, ctx=None):   ...
+
+    # on send: readable -> wire. Runs only when an edited (or composed) message is
+    # sent (Repeater send, Intercept forward), to re-encrypt/re-encode it:
+    def encode_request(req, ctx=None):    ...
+    def encode_response(res, ctx=None):   ...
+
+The second `ctx` argument is optional: a one-arg hook (e.g. `process_request(req)`)
+still works. The hook may mutate the message in place and return None
+(recommended), or return a new HttpMessage / bytes / str. Returning None with no
+changes is a no-op (the message passes through unchanged). Anything printed goes
+to stderr (the Debug console), so print() never corrupts the protocol on stdout.
 
 The message API (see also examples/template_extension.py):
 
@@ -38,6 +51,7 @@ Content-Length is recomputed automatically when the message is serialized.
 import sys
 import json
 import base64
+import inspect
 import importlib.util
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -227,6 +241,55 @@ class HttpMessage:
         return head.encode("latin-1", "replace") + b"\r\n" + self._body
 
 
+# State shared across every hook call in this long-lived worker, so an extension
+# can carry data between flows (e.g. a session key harvested from a login response
+# and reused to decrypt later flows). Survives for the worker's lifetime only.
+_STATE = {}
+
+
+class Ctx:
+    """The optional second argument to a hook. Read-only facts about where this
+    message is being handled, plus `state` (persistent dict) and `log()`."""
+
+    def __init__(self, data):
+        data = data or {}
+        # "proxy" | "interceptor" | "repeater" | "intruder" | "test"
+        self.surface = data.get("surface", "")
+        self.host = data.get("host", "")
+        self.path = data.get("path", "")
+        self.flow_id = data.get("flowId")
+        # True when the human actually changed the message before this send (encode
+        # hooks); False for display (decode) and untouched pass-through.
+        self.edited = bool(data.get("edited", False))
+        self.state = _STATE
+
+    def log(self, *args):
+        print(*args, file=sys.stderr)
+
+
+# Message "hook" name -> (python function name, is_request). The legacy
+# "request"/"response" names map to process_* so older hosts keep working.
+_HOOKS = {
+    "request": ("process_request", True),
+    "response": ("process_response", False),
+    "process_request": ("process_request", True),
+    "process_response": ("process_response", False),
+    "decode_request": ("decode_request", True),
+    "decode_response": ("decode_response", False),
+    "encode_request": ("encode_request", True),
+    "encode_response": ("encode_response", False),
+}
+
+
+def _call(fn, msg, ctx):
+    """Call a hook with (msg, ctx) if it accepts a second argument, else (msg)."""
+    try:
+        nparams = len(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):
+        nparams = 1
+    return fn(msg, ctx) if nparams >= 2 else fn(msg)
+
+
 def _load(path):
     spec = importlib.util.spec_from_file_location("ngintip_ext", path)
     module = importlib.util.module_from_spec(spec)
@@ -256,11 +319,6 @@ def main():
         print("failed to load extension: %r" % (exc,), file=sys.stderr)
         return 1
 
-    handlers = {
-        "request": (getattr(module, "process_request", None), True),
-        "response": (getattr(module, "process_response", None), False),
-    }
-
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -268,12 +326,15 @@ def main():
         try:
             envelope = json.loads(line)
             raw = base64.b64decode(envelope["data"])
-            fn, is_request = handlers.get(envelope.get("hook"), (None, True))
+            func_name, is_request = _HOOKS.get(envelope.get("hook"), (None, True))
+            fn = getattr(module, func_name, None) if func_name else None
             if fn is None:
+                # Script does not define this hook: pass through unchanged.
                 out = raw
             else:
                 msg = HttpMessage(raw, is_request)
-                out = _result_bytes(fn(msg), msg)
+                ctx = Ctx(envelope.get("ctx"))
+                out = _result_bytes(_call(fn, msg, ctx), msg)
             reply = {"ok": True, "data": base64.b64encode(out).decode("ascii")}
         except Exception as exc:
             reply = {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}

@@ -13,11 +13,12 @@ import { generate, MAX_REQUESTS, defaultPayloadConfig, clearPositions } from './
 import { followRequest, redirectInfo } from './redirect.js';
 import { BRAND, brandKey } from './brand.js';
 import { newInterceptRule, normalizeInterceptRule } from './interceptfilter.js';
+import { prettyBody } from './message.js';
 import { normalizeEntry, templateFields, newField, kindInfo, cloneFields } from './vault.js';
 import { dirOf } from './projectName.js';
 
 // Extension scope surfaces (must match Rust's Surface tokens), in canonical order.
-export const EXT_SURFACES = ['proxy', 'interceptor', 'repeater'];
+export const EXT_SURFACES = ['proxy', 'interceptor', 'repeater', 'intruder'];
 /** Parse an extension scope string into the set of surfaces it covers. Empty, "all"
  *  and the legacy "both" all mean every surface. */
 export function extScopeSet(scope) {
@@ -133,8 +134,129 @@ function makeTab(id, fields = {}) {
     pos: null,
     draft: null,
     loadingEntry: false,
+    // Raw mode: skip extensions entirely for this tab's sends, so the request leaves
+    // exactly as typed and the response is shown exactly as it arrived. Per tab and
+    // per session: deliberately not persisted, so a forgotten bypass cannot outlive
+    // the app and silently change what you send next time.
+    rawMode: false,
     ...fields,
   };
+}
+
+/** A still-default, untouched Repeater tab: its request is the default, nothing was
+ *  sent from it and it was not renamed/grouped/noted. Safe to fill in place when the
+ *  first real request arrives, instead of leaving a blank tab beside it. */
+function isPristineTab(t) {
+  return (
+    !!t &&
+    t.raw === DEFAULT_RAW &&
+    !t.response &&
+    !t.error &&
+    (t.history?.length ?? 0) === 0 &&
+    !(t.note && t.note.trim()) &&
+    !t.group &&
+    t.target === 'https://example.com' &&
+    t.name === String(t.id)
+  );
+}
+
+/** Compare dotted version strings (a leading "v" is ignored). >0 if a is newer. */
+function compareVersions(a, b) {
+  const pa = String(a).replace(/^v/i, '').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b).replace(/^v/i, '').split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d < 0 ? -1 : 1;
+  }
+  return 0;
+}
+
+/** The readable/plaintext request to seed a new Repeater / Intruder tab from a saved
+ *  item: the decoded view (History saves), then the typed request (Repeater / Intruder
+ *  saves), then the wire request. Lets you edit plaintext while encode_* re-encrypts. */
+function savedEditableRequest(item) {
+  return item.requestExtension || item.requestOriginal || item.request || '';
+}
+
+/** Organizer save fields for a Repeater tab, keeping the Wire / Original / Extension
+ *  variants: the typed request stays as Original, the extension-transformed one sent on
+ *  the wire is the primary; the arrived response is Wire and its decoded form Extension. */
+function repeaterSaveFields(tab) {
+  const typed = tab.raw ?? '';
+  const sent = tab.response?.requestFinal ?? typed; // Wire = what actually went out
+  const resWire = tab.response?.responseOriginal ?? tab.response?.responseRaw ?? '';
+  const resDecoded = tab.response?.responseOriginal ? (tab.response?.responseRaw ?? '') : '';
+  return {
+    name: tab.name,
+    target: tab.target,
+    request: sent,
+    requestOriginal: sent !== typed ? typed : '',
+    response: resWire,
+    responseExtension: resDecoded,
+    status: tab.response?.status ?? null,
+  };
+}
+
+/** Organizer save fields for one Intruder result. Marked `intruder(each)` so a single
+ *  saved result is distinct from saving the whole template. The sent (extension-applied)
+ *  request is the primary with the generated one as Original; the arrived response is
+ *  Wire and its decoded form Extension. */
+function intruderResultSaveFields(tab, r) {
+  const generated = r.requestRaw || clearPositions(tab.raw);
+  const sent = r.requestFinal ?? generated; // Wire = what actually went out
+  const resWire = r.error ? '' : r.responseOriginal ?? r.responseRaw ?? '';
+  const resDecoded = r.error ? '' : r.responseOriginal ? (r.responseRaw ?? '') : '';
+  return {
+    name: `${tab.name} #${r.n}`,
+    target: tab.target,
+    request: sent,
+    requestOriginal: sent !== generated ? generated : '',
+    response: resWire,
+    responseExtension: resDecoded,
+    status: r.status || null,
+    label: (r.payloads ?? []).join(', '),
+    source: 'intruder(each)',
+  };
+}
+
+/** Name of the Organizer collection an Intruder run creates (follows the tab name). */
+const intruderCollectionName = (tab) => `${tab.name} intruder`;
+
+/** Cap on the message text kept across a whole saved run, so one record can never
+ *  balloon the project file. Rows past it keep their table metadata but drop their
+ *  request/response text (flagged `trimmed`). */
+const RUN_TEXT_CAP = 2_000_000;
+
+/** One row of a saved Intruder run: the table columns plus the message variants, so the
+ *  Organizer can show the run as a table and drive the panes from the selected row. */
+function intruderRunRows(tab) {
+  let used = 0;
+  return tab.results.map((r) => {
+    const generated = r.requestRaw || '';
+    const sent = r.requestFinal || generated;
+    const resWire = r.error ? '' : r.responseOriginal || r.responseRaw || '';
+    const resDecoded = r.error ? '' : r.responseOriginal ? r.responseRaw || '' : '';
+    const row = {
+      n: r.n,
+      // Spread: the live row is reactive state, and the saved record must be plain data.
+      payloads: [...(r.payloads ?? [])],
+      status: r.status ?? 0,
+      length: r.length ?? 0,
+      timeMs: r.timeMs ?? 0,
+      error: r.error ?? null,
+    };
+    const size = sent.length + resWire.length + resDecoded.length;
+    if (used + size > RUN_TEXT_CAP) {
+      row.trimmed = true;
+      return row;
+    }
+    used += size;
+    row.request = sent;
+    if (sent !== generated) row.requestOriginal = generated;
+    row.response = resWire;
+    if (resDecoded) row.responseExtension = resDecoded;
+    return row;
+  });
 }
 
 /** Tabs saved by older versions in localStorage, removed once read. */
@@ -181,6 +303,12 @@ function makeIntruderTab(id, fields = {}) {
     sent: 0,
     error: '',
     selected: null,
+    // The Organizer collection created from this attack ("Save to Organizer (new
+    // collection)"), so renaming the tab renames that collection too.
+    collectionId: null,
+    // Raw mode: skip extensions for this attack (also drops the per-request Python
+    // round trip from a bulk run). Per tab and per session, never persisted.
+    rawMode: false,
     ...fields,
   };
 }
@@ -220,7 +348,7 @@ class Store {
   confirmDialog = $state.raw(null); // { title, message, yes, no, danger, resolve }
   // The open New project dialog (see askNewProject()); NewProjectDialog in App renders it.
   newProjectDialog = $state.raw(null); // { dir, resolve }
-  // True while a compressed .cegatc project is being decompressed (shows overlay).
+  // True while a compressed .ngintipc project is being decompressed (shows overlay).
   decompressing = $state(false);
   // True while the project is being snapshotted + compressed to disk (shows overlay).
   saving = $state(false);
@@ -338,6 +466,16 @@ class Store {
 
   // Intruder attack tabs (in memory for the session).
   intruder = $state({ tabs: [makeIntruderTab(1)], activeId: 1 });
+  // App version + the latest published GitHub release, for the sidebar version chip.
+  // `newer` is true once a later release is found; checked lazily, once per session.
+  update = $state({
+    current: BRAND.version,
+    latest: null,
+    newer: false,
+    checking: false,
+    checked: false,
+    url: `https://github.com/${BRAND.repo}/releases`,
+  });
 
   // Held messages (oldest first), keyed by `key`; a request and its response share `id`.
   // `draft` is the editable copy of the selected one.
@@ -633,7 +771,7 @@ class Store {
     await this.#flushHistoryFilter();
     await this.#flushNotes();
     await this.#flushVault();
-    // A .cegat is compressed; show the overlay while it's expanded and opened.
+    // A .ngintip is compressed; show the overlay while it's expanded and opened.
     this.decompressing = true;
     try {
       // Let the overlay paint before the (blocking) backend work runs.
@@ -698,7 +836,14 @@ class Store {
     const it = this.intercept;
     const item = it.queue.find((q) => q.key === it.selectedKey);
     if (!item) return;
-    await api.interceptForward(item.key, it.draft === item.raw ? null : it.draft, holdResponse && item.phase === 'request');
+    // The body is shown beautified for readability, but beautifying is not an edit:
+    // forward the EXACT wire bytes unless the content actually changed (draft differs
+    // from both the raw wire and its beautified form). Only a real edit is sent on
+    // (and re-encoded by any interceptor extension).
+    const raw = item.raw ?? '';
+    const pretty = prettyBody(raw);
+    const unchanged = it.draft === raw || (pretty != null && it.draft === pretty);
+    await api.interceptForward(item.key, unchanged ? null : it.draft, holdResponse && item.phase === 'request');
     this.#removeHeld(item.key);
   }
 
@@ -780,7 +925,7 @@ class Store {
   }
 
   // The single History search matches summary fields (path/method/status/host…)
-  // immediately and, debounced, also full-text searches request/response bodies —
+  // immediately and, debounced, also full-text searches request/response bodies -
   // the two are unioned in the table. Called on every keystroke.
   searchFilter() {
     clearTimeout(this.#searchTimer);
@@ -1168,7 +1313,7 @@ class Store {
     }
   }
 
-  // Save (compress) the project to its current .cegat document; falls back to
+  // Save (compress) the project to its current .ngintip document; falls back to
   // "Save as" when the project hasn't been saved to a file yet. Returns whether
   // the project was actually written (false if a Save-as dialog was cancelled).
   async saveProject() {
@@ -1177,7 +1322,7 @@ class Store {
     return await this.#runSave(() => api.saveProject());
   }
 
-  // Choose a path and save (compress) the project to it as a .cegat document.
+  // Choose a path and save (compress) the project to it as a .ngintip document.
   // Returns whether it was saved (false if cancelled or on error).
   async saveProjectAs() {
     const path = await save({
@@ -1217,7 +1362,7 @@ class Store {
   }
 
   // Close the current project and return to the project chooser. The working copy
-  // stays on disk (in the app data dir), so nothing is lost — Save writes it out
+  // stays on disk (in the app data dir), so nothing is lost - Save writes it out
   // to a .ngintip document.
   async closeProject() {
     clearTimeout(this.#autoSaveTimer);
@@ -1367,7 +1512,7 @@ class Store {
     this.passiveScope = Array.isArray(scope) ? scope : [...DEFAULT_PASSIVE_SCOPE];
     this.passiveInScopeOnly = inScopeOnly === true;
     this.passiveCollapsed = Array.isArray(collapsed) ? collapsed : [];
-    // Findings and which flows were scanned are historical: kept in the .cegat.
+    // Findings and which flows were scanned are historical: kept in the .ngintip.
     this.passiveFindings = Array.isArray(findings) ? findings : [];
     this.#passiveScanned = new Set(Array.isArray(scanned) ? scanned : []);
     this.passive = { scanning: false, done: 0, total: 0 };
@@ -1556,7 +1701,7 @@ class Store {
     // the filtered table), so it shows even when a filter would hide the row. If a
     // filter is hiding it, say so instead of wiping their filters.
     if (this.filtersActive && !this.#flowVisible(flowId)) {
-      this.#notify(`Request #${flowId} is hidden by an active History filter — showing its detail below`);
+      this.#notify(`Request #${flowId} is hidden by an active History filter - showing its detail below`);
     }
     // Highlight the match in the right pane once History has loaded the detail.
     this.pendingFinding = finding ? { flowId, where: finding.where, match: finding.match } : null;
@@ -1658,16 +1803,71 @@ class Store {
 
   async sendFlowToIntruder(id) {
     const detail = await api.getFlow(id);
-    if (detail) this.sendToIntruder({ target: `${detail.summary.scheme}://${detail.summary.host}`, raw: detail.requestRaw });
+    if (!detail) return;
+    const { scheme, host } = detail.summary;
+    // Seed with the decoded request when an extension produced one, so positions are
+    // marked on readable plaintext and encode_* re-encrypts each attack request on send
+    // (same as Send to Repeater). Falls back to the real (wire) request otherwise.
+    const raw = detail.variants?.reqExtension || detail.requestRaw;
+    this.sendToIntruder({ target: `${scheme}://${host}`, raw });
+  }
+
+  /** Look up the latest published release on GitHub and flag if it is newer than the
+   *  running version. Runs at most once per session (pass true to force a recheck).
+   *  Network failure is silent: the chip just shows the current version. */
+  async checkUpdate(force = false) {
+    const u = this.update;
+    if (u.checking || (u.checked && !force)) return;
+    u.checking = true;
+    try {
+      const res = await fetch(`https://api.github.com/repos/${BRAND.repo}/releases/latest`, {
+        headers: { Accept: 'application/vnd.github+json' },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const latest = String(data.tag_name || '').replace(/^v/i, '').trim();
+        if (latest) {
+          u.latest = latest;
+          u.newer = compareVersions(latest, u.current) > 0;
+          if (data.html_url) u.url = data.html_url;
+        }
+      }
+    } catch {
+      // offline, blocked, or no releases yet: keep showing the current version only
+    } finally {
+      u.checking = false;
+      u.checked = true;
+    }
+  }
+
+  /** Open the releases page (the newer release when there is one) in the browser. */
+  openReleases() {
+    api.openUrl(this.update.url || `https://github.com/${BRAND.repo}/releases`).catch(() => {});
   }
 
   sendToRepeater(detail) {
     const { scheme, host } = detail.summary;
-    this.addRepeaterTab({ name: host, target: `${scheme}://${host}`, raw: detail.requestRaw });
+    // Seed with the decoded request when an extension produced one, so you edit
+    // readable plaintext in Repeater; encode_* re-encrypts it on send. Falls back
+    // to the real (wire) request when there is no decoded view.
+    const raw = detail.variants?.reqExtension || detail.requestRaw;
+    this.addRepeaterTab({ name: host, target: `${scheme}://${host}`, raw });
   }
 
   addRepeaterTab(fields = {}) {
     const rep = this.repeater;
+    // Seeding the first real request (Send to Repeater / Ctrl+R from History, or from
+    // Intercept/Intruder): if the only tab is still the untouched default, fill it in
+    // place instead of opening a second tab beside the empty one. The "+" button passes
+    // no raw, so a deliberate blank tab is never consumed this way.
+    if (fields.raw != null && rep.tabs.length === 1 && isPristineTab(rep.tabs[0])) {
+      const t = rep.tabs[0];
+      api.clearRepeaterHistory(t.id).catch(() => {}); // the id is reused; drop stale history
+      Object.assign(t, makeTab(t.id, fields));
+      rep.activeId = t.id;
+      this.view = 'repeater';
+      return;
+    }
     const id = Math.max(0, ...rep.tabs.map((t) => t.id)) + 1;
     rep.tabs.push(makeTab(id, fields));
     rep.activeId = id;
@@ -1809,11 +2009,13 @@ class Store {
 
   /** Save `item` ({ name, target, request, response, status, label, note, color, source })
    *  into `collection` (an id or a name), else the active collection, else "Saved". */
-  async saveRequestToCollection(item, collection = null) {
+  async saveRequestToCollection(item, collection = null, quiet = false) {
     const r = await this.#organizerOp({ op: 'save', collection, item });
     if (!r) return null;
-    const col = this.organizer.collections.find((c) => c.id === r.collectionId);
-    this.#notify(`Saved to "${col?.name ?? 'collection'}"`);
+    if (!quiet) {
+      const col = this.organizer.collections.find((c) => c.id === r.collectionId);
+      this.#notify(`Saved to "${col?.name ?? 'collection'}"`);
+    }
     return r.itemId;
   }
   removeSavedRequest(itemId) {
@@ -1829,27 +2031,46 @@ class Store {
     const to = this.organizer.collections.find((c) => c.id === toId);
     this.#notify(`Moved to "${to?.name ?? 'collection'}"`);
   }
-  /** Replay a saved request in a new Repeater / Intruder tab. */
+  /** Replay a saved request in a new Repeater / Intruder tab. Seed the editable
+   *  plaintext form so encode_* re-encrypts on send: the decoded view for a History
+   *  save (requestExtension), or the typed request for a Repeater / Intruder save
+   *  (requestOriginal), falling back to the wire request. */
   sendSavedToRepeater(item) {
-    this.addRepeaterTab({ name: item.name || item.host, target: item.target, raw: item.request });
+    this.addRepeaterTab({ name: item.name || item.host, target: item.target, raw: savedEditableRequest(item) });
   }
   sendSavedToIntruder(item) {
-    this.addIntruderTab({ name: item.name || item.host, target: item.target, raw: item.request });
+    this.addIntruderTab({ name: item.name || item.host, target: item.target, raw: savedEditableRequest(item) });
   }
 
-  /** Save the right-clicked History flow into the Organizer (request + response). */
+  /** Save the right-clicked History flow into the Organizer (request + response).
+   *  Keeps the extension / original variants so the saved detail shows the same
+   *  Wire / Extension / Original switcher History does. */
   async saveFlowToOrganizer(id, collectionId) {
     const detail = await api.getFlow(id);
     if (!detail) return;
     const { scheme, host, path, status, color, note } = detail.summary;
+    const v = detail.variants ?? {};
     return this.saveRequestToCollection(
-      { name: `${host}${path ?? ''}`, target: `${scheme}://${host}`, request: detail.requestRaw, response: detail.responseRaw, status: status || null, color, note, source: 'history' },
+      {
+        name: `${host}${path ?? ''}`,
+        target: `${scheme}://${host}`,
+        request: detail.requestRaw,
+        response: detail.responseRaw,
+        requestOriginal: v.reqOriginal ?? '',
+        requestExtension: v.reqExtension ?? '',
+        responseOriginal: v.resOriginal ?? '',
+        responseExtension: v.resExtension ?? '',
+        status: status || null,
+        color,
+        note,
+        source: 'history',
+      },
       collectionId,
     );
   }
   saveRepeaterToOrganizer(tab, collectionId) {
     return this.saveRequestToCollection(
-      { name: tab.name, target: tab.target, request: tab.raw, response: tab.response?.responseRaw ?? '', status: tab.response?.status ?? null, note: tab.note ?? '', source: 'repeater' },
+      { ...repeaterSaveFields(tab), note: tab.note ?? '', source: 'repeater' },
       collectionId,
     );
   }
@@ -1857,22 +2078,64 @@ class Store {
     return this.saveRequestToCollection({ name: tab.name, target: tab.target, request: tab.raw, response: '', source: 'intruder' }, collectionId);
   }
   /** Save one Intruder result (the request actually sent + its response); the payload
-   *  becomes the label. Rows of a large run may not keep their raw: fall back to the
+   *  becomes the label. Marked `intruder(each)` so a per-result save is distinct from
+   *  saving the template. Rows of a large run may not keep their raw: fall back to the
    *  template without its markers. */
   saveIntruderResultToOrganizer(tab, r, collectionId) {
-    const payload = (r.payloads ?? []).join(', ');
+    return this.saveRequestToCollection(intruderResultSaveFields(tab, r), collectionId);
+  }
+  /** Save the whole attack as ONE Organizer record. Opening it shows the run as a table
+   *  (like Intruder's own results list); picking a row drives the request/response panes.
+   *  Its note says which Intruder tab the run came from. (Use saveIntruderRunToCollection
+   *  for one separate record per result.) */
+  async saveAllIntruderResultsToOrganizer(tab, collectionId) {
+    const n = tab.results.length;
+    if (!n) return null;
+    const rows = intruderRunRows(tab);
+    // The record's own request/response are the first row's, so the Organizer table
+    // still derives a real method/host/path and a non-table viewer shows something.
+    const first = rows[0] ?? {};
     return this.saveRequestToCollection(
       {
-        name: `${tab.name} #${r.n}`,
+        name: `${tab.name} (${n} result${n === 1 ? '' : 's'})`,
         target: tab.target,
-        request: r.requestRaw || clearPositions(tab.raw),
-        response: r.error ? '' : r.responseRaw ?? '',
-        status: r.status || null,
-        label: payload,
-        source: 'intruder',
+        request: first.request ?? '',
+        requestOriginal: first.requestOriginal ?? '',
+        response: first.response ?? '',
+        responseExtension: first.responseExtension ?? '',
+        results: rows,
+        status: tab.results.find((r) => r.status)?.status ?? null,
+        label: `${n} result${n === 1 ? '' : 's'}`,
+        note: `Saved from Intruder tab "${tab.name}" - ${n} result${n === 1 ? '' : 's'} (${tab.type}) against ${tab.target}.`,
+        source: 'intruder(all)',
       },
-      collectionId,
+      collectionId ?? null,
     );
+  }
+
+  /** Put every result of this run into its OWN new collection, named after the Intruder
+   *  tab ("<tab> intruder"). The collection is not forced active, and it stays linked to
+   *  the tab so renaming the tab renames it. Returns the collection id. */
+  async saveIntruderRunToCollection(tab) {
+    const n = tab.results.length;
+    if (!n) return null;
+    const name = intruderCollectionName(tab);
+    const colId = await this.addCollection(name);
+    if (!colId) return null;
+    for (const r of tab.results) await this.saveRequestToCollection(intruderResultSaveFields(tab, r), colId, true);
+    tab.collectionId = colId;
+    this.#notify(`Saved ${n} result${n === 1 ? '' : 's'} to a new collection "${name}"`);
+    return colId;
+  }
+
+  /** Rename an Intruder tab; a collection created from this tab follows the new name. */
+  renameIntruderTab(tab, name) {
+    const next = String(name ?? '').trim();
+    if (!next || next === tab.name) return;
+    tab.name = next;
+    if (tab.collectionId && this.organizer.collections.some((c) => c.id === tab.collectionId)) {
+      this.renameCollection(tab.collectionId, intruderCollectionName(tab));
+    }
   }
 
   // ---- Notes (Organizer > Notes) ----
@@ -2060,6 +2323,12 @@ class Store {
   extensionSurfaceOn(scope, surface) {
     return extScopeSet(scope).has(surface);
   }
+  /** True when at least one enabled extension would actually run on this surface, so a
+   *  "raw mode" toggle is only offered where it changes anything. */
+  extActiveOn(surface) {
+    const x = this.extensions;
+    return !!x.enabled && x.list.some((e) => e.enabled && extScopeSet(e.scope).has(surface));
+  }
   /** Toggle one surface in an extension's scope set (keeps at least one surface on). */
   async toggleExtensionSurface(id, surface) {
     await this.#pushExtensions(
@@ -2162,7 +2431,11 @@ class Store {
         const started = performance.now();
         let row;
         try {
-          const res = await api.sendRaw(tab.target, req.request);
+          // intruder_send applies intruder-scope extensions; request_final (sent on the
+          // wire) and response_original (as it arrived) come back so a saved result keeps
+          // its Wire / Original / Extension views.
+          const res = await api.intruderSend(tab.target, req.request, !!tab.rawMode);
+          const keep = i < KEEP_RESPONSES;
           row = {
             n: i + 1,
             payloads: req.payloads,
@@ -2170,8 +2443,10 @@ class Store {
             length: res.length,
             timeMs: res.durationMs ?? Math.round(performance.now() - started),
             error: null,
-            requestRaw: i < KEEP_RESPONSES ? req.request.slice(0, RESPONSE_CAP) : null,
-            responseRaw: i < KEEP_RESPONSES ? (res.responseRaw ?? '').slice(0, RESPONSE_CAP) : null,
+            requestRaw: keep ? req.request.slice(0, RESPONSE_CAP) : null,
+            responseRaw: keep ? (res.responseRaw ?? '').slice(0, RESPONSE_CAP) : null,
+            requestFinal: keep && res.requestFinal ? res.requestFinal.slice(0, RESPONSE_CAP) : null,
+            responseOriginal: keep && res.responseOriginal ? res.responseOriginal.slice(0, RESPONSE_CAP) : null,
           };
         } catch (e) {
           row = {
@@ -2183,6 +2458,8 @@ class Store {
             error: String(e),
             requestRaw: i < KEEP_RESPONSES ? req.request.slice(0, RESPONSE_CAP) : null,
             responseRaw: null,
+            requestFinal: null,
+            responseOriginal: null,
           };
         }
         results[i] = row;
@@ -2208,7 +2485,7 @@ class Store {
     await this.loadRepeaterHistory(tab);
     const lastId = tab.history.at(-1)?.id;
     try {
-      tab.response = await api.sendRaw(tab.target, tab.raw, tab.id);
+      tab.response = await api.sendRaw(tab.target, tab.raw, tab.id, !!tab.rawMode);
     } catch (e) {
       tab.response = null;
       // A user-initiated cancel isn't an error; show a quiet note instead.
