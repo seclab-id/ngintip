@@ -18,6 +18,7 @@
   import ProjectChooser from './components/ProjectChooser.svelte';
   import ConfirmDialog from './components/ConfirmDialog.svelte';
   import NewProjectDialog from './components/NewProjectDialog.svelte';
+  import UpdateDialog from './components/UpdateDialog.svelte';
   import { store } from './lib/store.svelte.js';
 
   onMount(() => store.init());
@@ -96,6 +97,12 @@
 
 {#if store.confirmDialog}
   <ConfirmDialog dialog={store.confirmDialog} />
+{/if}
+
+<!-- Held back while the project chooser owns the screen: the first thing a user sees
+     should be their own projects, not a dialog about ours. -->
+{#if store.updatePrompt && !store.chooser}
+  <UpdateDialog />
 {/if}
 
 {#if store.decompressing || store.saving}

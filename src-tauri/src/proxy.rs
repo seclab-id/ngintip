@@ -64,6 +64,22 @@ const RETRY_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Event name the UI listens on for each log line.
 pub const LOG_EVENT: &str = "log";
+
+/// Event name the UI listens on when the passive findings stored in the project were
+/// replaced by something other than the window, which today means an MCP `passive_scan`.
+///
+/// The window keeps its own in-memory copy of `passiveFindings` and writes the whole
+/// array back on any passive action, so without this the agent's findings were invisible
+/// to the operator and erased by their next click.
+pub const PASSIVE_EVENT: &str = "passive";
+
+/// Event name the UI listens on when an MCP tool replaced a per-project setting the
+/// window also caches and writes back wholesale. Carries the setting's key.
+///
+/// Without it the window shows the stale value AND overwrites the agent's write on the
+/// operator's next edit, which for `scope` is worse than a display bug: the Delete
+/// out-of-scope action decides what to delete from the window's cached copy.
+pub const SETTING_EVENT: &str = "setting";
 /// How many recent log lines the Logs view loads.
 const LOG_LIMIT: usize = 2000;
 
@@ -134,7 +150,9 @@ pub struct Ctx {
     /// the SNI / Host header as the destination.
     invisible: AtomicBool,
     /// Background writer that batches flow inserts; started on first use.
-    writer: OnceLock<mpsc::Sender<Flow>>,
+    /// Flows queued for the writer thread, each tagged with the store generation it
+    /// was captured under (see Store::generation).
+    writer: OnceLock<mpsc::Sender<(u64, Flow)>>,
     /// Hosts whose HTTP/2 upstream reset the stream (e.g. strict servers that send
     /// GOAWAY): we speak HTTP/1.1 to them directly for a while instead of failing
     /// an h2 attempt on every request. Re-probed after the TTL (self-healing).
@@ -298,6 +316,17 @@ impl Ctx {
         if !v.contains(&addr) {
             v.push(addr);
         }
+    }
+
+    /// The addresses listeners are actually bound to right now.
+    ///
+    /// Read-only on purpose. The MCP server is handed an `Arc<Ctx>` and nothing else, so
+    /// this is the whole of what it can learn about the proxy's own sockets: it cannot
+    /// bind, rebind or stop one, and the compiler keeps it that way. Reporting bound
+    /// addresses rather than configured ones also means "nothing is bound" is answerable,
+    /// which is the operationally useful statement.
+    pub fn bound_listeners(&self) -> Vec<SocketAddr> {
+        self.listeners.read().unwrap().clone()
     }
 
     /// Forget a listener address when its listener stops.
@@ -559,7 +588,10 @@ async fn forward(
     if ctx.is_self(&parts.uri) {
         return landing(&parts.uri, &ctx);
     }
-    let id = ctx.store.next_id();
+    // The generation is taken HERE, with the id, not when the flow is finally queued:
+    // between the two sits the whole upstream round trip, and a project switch inside it
+    // would otherwise make this request look like it belonged to the new project.
+    let (id, gen) = ctx.store.next_id_at();
     // Upstream host, for the "h2 recently broke here" check below.
     let target_host = parts.uri.host().unwrap_or_default().to_string();
 
@@ -647,7 +679,7 @@ async fn forward(
     let mut intercepted_request = false;
     if let (true, Payload::Full(bytes)) = (hold, &mut payload) {
         intercepted_request = true;
-        let held = Flow::request(id, &parts.method, &parts.uri, parts.version, &parts.headers, bytes.clone());
+        let held = Flow::request(id, &parts.method, &parts.uri, parts.version, &parts.headers, bytes.clone()).at(gen);
         let arrived = crate::raw::request_text(&held);
         let host = held.summary.host.clone();
         let path = held.summary.path.clone();
@@ -723,7 +755,7 @@ async fn forward(
 
     // Timing starts after any intercept pause.
     let started = Instant::now();
-    let mut flow = Flow::request(id, &parts.method, &parts.uri, parts.version, &parts.headers, Bytes::new());
+    let mut flow = Flow::request(id, &parts.method, &parts.uri, parts.version, &parts.headers, Bytes::new()).at(gen);
     flow.variants.req_original = req_original;
 
     // Extension transform of the outgoing request (buffered bodies only, in scope):
@@ -731,7 +763,7 @@ async fn forward(
     // intercepted requests, which were already transformed at the Interceptor surface.
     if ext_active && !intercepted_request {
         if let Payload::Full(bytes) = &mut payload {
-            let held = Flow::request(id, &parts.method, &parts.uri, parts.version, &parts.headers, bytes.clone());
+            let held = Flow::request(id, &parts.method, &parts.uri, parts.version, &parts.headers, bytes.clone()).at(gen);
             // The extension needs the real payload bytes (decoded, uncapped, no hex
             // view), or a binary/large body would be corrupted or truncated.
             let current = crate::raw::request_text_for_processing(&held);
@@ -781,6 +813,12 @@ async fn forward(
     }
     // Speak to the target the way the client spoke to us (Upgrade needs HTTP/1.1).
     let proto = if will_prefer_h2 { Proto::PreferHttp2 } else { Proto::Http1 };
+    // Going out over h2: the host belongs in `:authority` only. We add a `Host` above
+    // for History and the HTTP/1.1 fallback, so take it back off here (hyper re-adds it
+    // if the connection ends up HTTP/1.1). The flow was already recorded with it.
+    if will_prefer_h2 {
+        drop_redundant_host(&mut parts.headers, &parts.uri);
+    }
     // Snapshot the request so it can be replayed: an h2 stream reset retries over
     // HTTP/1.1, and a transient connect/TLS-handshake failure retries on a fresh
     // connection. Only replayable bodies (buffered or bodyless) get a snapshot.
@@ -1094,7 +1132,8 @@ impl Ctx {
     /// flood of traffic does not mean a commit per request.
     pub(crate) fn record_flow(self: &Arc<Self>, flow: Flow) {
         let tx = self.writer.get_or_init(|| {
-            let (tx, rx) = mpsc::channel::<Flow>();
+            // Each flow travels with the store generation it was captured under.
+            let (tx, rx) = mpsc::channel::<(u64, Flow)>();
             let ctx = self.clone();
             std::thread::spawn(move || {
                 while let Ok(first) = rx.recv() {
@@ -1105,20 +1144,41 @@ impl Ctx {
                             Err(_) => break,
                         }
                     }
-                    match ctx.store.push_batch(batch) {
-                        Ok(summaries) => {
-                            for s in &summaries {
-                                ctx.events.emit(FLOW_EVENT, s);
+                    // A batch can straddle a project switch, so it is grouped by the
+                    // generation each flow was captured under and each group is written
+                    // against its own. Nothing is attributed to the wrong project, and
+                    // nothing that could still be saved is thrown away.
+                    let mut rest = batch;
+                    while !rest.is_empty() {
+                        let gen = rest[0].0;
+                        let keep = rest.iter().take_while(|(g, _)| *g == gen).count();
+                        let tail = rest.split_off(keep);
+                        let group: Vec<Flow> = rest.into_iter().map(|(_, f)| f).collect();
+                        let n = group.len();
+                        match ctx.store.push_batch_at(group, Some(gen)) {
+                            // Captured under a project that is no longer open. Dropping
+                            // is the only safe answer, because the id came from that
+                            // project's counter and INSERT OR REPLACE would overwrite a
+                            // row here. Dropped capture is evidence lost, so say so.
+                            Ok(None) => ctx.log_warn(
+                                "store",
+                                format!("{n} flow(s) captured in the previous project were not saved; it is no longer open"),
+                            ),
+                            Ok(Some(summaries)) => {
+                                for s in &summaries {
+                                    ctx.events.emit(FLOW_EVENT, s);
+                                }
                             }
+                            Err(e) => ctx.log_error("store", format!("{n} captured flow(s) were NOT saved: {e:#}")),
                         }
-                        Err(e) => eprintln!("[store] {e:#}"),
+                        rest = tail;
                     }
                 }
             });
             tx
         });
-        if tx.send(flow).is_err() {
-            eprintln!("[store] writer thread is gone");
+        if tx.send((flow.gen, flow)).is_err() {
+            self.log_error("store", "the flow writer thread is gone; this flow was not saved");
         }
     }
 }
@@ -1288,6 +1348,28 @@ fn strip_hop_headers(headers: &mut HeaderMap) {
 
 /// The `Host` value for an authority, dropping the scheme's default port (443 for
 /// https, 80 for http) the way a browser does, so `site:443` becomes `site`.
+/// HTTP/2 carries the host in `:authority`; a `Host` header that merely repeats it is
+/// redundant, and a strict server treats the request as malformed (Microsoft's http.sys
+/// answers `400 Bad Request`, which is what SharePoint Online does). Drop it ONLY when
+/// it matches the authority, so a deliberately spoofed `Host` (Host-header injection
+/// testing) still reaches the target. Safe for the HTTP/1.1 fallback too: hyper puts the
+/// header back from the URI whenever a connection negotiates HTTP/1.1 (`set_host`).
+fn drop_redundant_host(headers: &mut HeaderMap, uri: &Uri) {
+    let Some(auth) = uri.authority() else { return };
+    // Compare both sides in canonical form, so the scheme's default port (":443" from a
+    // CONNECT authority) does not make an otherwise identical host look different.
+    let canonical = host_header_value(uri.scheme(), auth);
+    let redundant = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .and_then(|sent| sent.parse::<Authority>().ok())
+        .is_some_and(|sent| host_header_value(uri.scheme(), &sent).eq_ignore_ascii_case(&canonical));
+    if redundant {
+        headers.remove(header::HOST);
+    }
+}
+
 fn host_header_value(scheme: Option<&Scheme>, auth: &Authority) -> String {
     let default_port = match scheme.map(Scheme::as_str) {
         Some("https") => Some(443),
@@ -1384,6 +1466,38 @@ fn landing(uri: &Uri, ctx: &Ctx) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn host_headers(uri: &str, sent: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, HeaderValue::from_str(sent).unwrap());
+        drop_redundant_host(&mut h, &uri.parse::<Uri>().unwrap());
+        h
+    }
+
+    #[test]
+    fn h2_drops_a_host_that_only_repeats_the_authority() {
+        // Sending both `:authority` and a matching `Host` over h2 is malformed; strict
+        // servers (Microsoft http.sys / SharePoint Online) answer 400 Bad Request.
+        assert!(!host_headers("https://example.com/x", "example.com").contains_key(header::HOST));
+        // A CONNECT tunnel's authority keeps ":443" while the browser-style Host omits
+        // it; that is still the same host, so it must go.
+        assert!(!host_headers("https://example.com:443/x", "example.com").contains_key(header::HOST));
+        // ...and the other way round (authority without the port, Host with it).
+        assert!(!host_headers("https://example.com/x", "example.com:443").contains_key(header::HOST));
+        // Case and surrounding space do not make it a different host.
+        assert!(!host_headers("https://example.com/x", "  Example.COM  ").contains_key(header::HOST));
+        // A non-default port is part of the host and must match.
+        assert!(!host_headers("https://example.com:8443/x", "example.com:8443").contains_key(header::HOST));
+    }
+
+    #[test]
+    fn h2_keeps_a_host_that_does_not_match_the_authority() {
+        // Host-header injection is a thing we test for, so a deliberately spoofed Host
+        // has to survive and travel alongside :authority.
+        assert_eq!(host_headers("https://example.com/x", "evil.test").get(header::HOST).unwrap(), "evil.test");
+        // A different port is a different origin as far as the target is concerned.
+        assert_eq!(host_headers("https://example.com/x", "example.com:8443").get(header::HOST).unwrap(), "example.com:8443");
+    }
 
     #[test]
     fn detects_requests_to_self() {

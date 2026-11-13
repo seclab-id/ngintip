@@ -2,7 +2,27 @@
   import { store } from '../lib/store.svelte.js';
   import Modal from './Modal.svelte';
 
+  // HTTP and WebSocket holds share one queue in the UI, so both count toward "someone
+  // is waiting on you". Only meaningful while intercept is on: turning it off releases
+  // everything (Interceptor::set_enabled), so a stale queue cannot keep this alive.
+  const heldCount = $derived(store.intercept.enabled ? store.intercept.queue.length + store.wsIntercept.queue.length : 0);
+
   const titles = { history: 'HTTP History', intercept: 'Intercept', repeater: 'Repeater', intruder: 'Intruder', passive: 'Passive Scan', decoder: 'Decoder', logs: 'Logs', help: 'Guide', settings: 'Settings' };
+
+  /** Spell out what the warning means: which listener, and why its reach is a surprise
+   *  rather than something the address makes obvious. */
+  function exposureTitle() {
+    const l = store.exposedListener;
+    const where = l ? `${l.host}:${l.port}` : store.proxy.host;
+    const reach =
+      store.exposure === 'all'
+        ? `Listening on ${where}, which is every interface - including any network that connects later.`
+        : `Listening on ${where}, an address on a VPN interface, so the far side of the tunnel can reach the proxy.`;
+    const auth = store.config.auth.enabled
+      ? 'Authentication is on.'
+      : 'Anyone who can reach it can use it, with no authentication.';
+    return `${reach} ${auth} Click for Settings > Proxy listener.`;
+  }
 
   function toggle() {
     store.proxy.running ? store.stopProxy() : store.startProxy();
@@ -69,27 +89,41 @@
   <button class="btn sm theme" title="Theme: {store.theme} (click to change)" aria-label="Toggle theme" onclick={() => store.cycleTheme()}>
     {store.theme === 'dark' ? '☾' : store.theme === 'light' ? '☀' : '◐'}
   </button>
-  <button class="btn sm intercept" class:active={store.intercept.enabled} onclick={() => store.toggleIntercept()}>
+  <button
+    class="btn sm intercept"
+    class:active={store.intercept.enabled}
+    class:holding={heldCount > 0}
+    title={heldCount
+      ? `${heldCount} message${heldCount === 1 ? '' : 's'} held in Intercept - the client is waiting. Open Intercept to forward or drop.`
+      : 'Hold requests and responses for editing before they go on'}
+    onclick={() => store.toggleIntercept()}>
     Intercept {store.intercept.enabled ? 'on' : 'off'}
   </button>
-  {#if store.exposed}
+  {#if store.exposure}
     <button
       class="exposed"
       class:danger={!store.config.auth.enabled}
-      title="Listener {store.proxy.host} is reachable from the network{store.config.auth.enabled ? '' : ' with no authentication'}. Click for Settings."
-      onclick={() => (store.view = 'settings')}
+      title={exposureTitle()}
+      onclick={() => store.openListenerSettings()}
     >
-      ⚠ LAN{store.config.auth.enabled ? '' : ' · no auth'}
+      ⚠ {store.exposure === 'all' ? 'All interfaces' : 'VPN'}{store.config.auth.enabled ? '' : ' · no auth'}
     </button>
   {/if}
-  <div class="status" class:on={store.proxy.running}>
+  <button
+    class="status"
+    class:on={store.proxy.running}
+    title={store.proxy.running
+      ? `Listening on ${store.proxy.host}:${store.proxy.port}. Open the listener settings.`
+      : 'The proxy is not running. Open the listener settings.'}
+    onclick={() => store.openListenerSettings()}
+  >
     <span class="dot"></span>
     {#if store.proxy.running}
       Listening <span class="mono">{store.proxy.host}:{store.proxy.port}</span>
     {:else}
       Proxy stopped
     {/if}
-  </div>
+  </button>
   <button class="btn sm" onclick={toggle}>{store.proxy.running ? 'Stop' : 'Start'}</button>
 </header>
 
@@ -204,16 +238,25 @@
     flex-wrap: wrap;
     gap: 8px;
   }
+  /* A button, not a label: it is the shortest route to the listener settings, which is
+     where someone looks the moment they read it. */
   .status {
     display: flex;
     align-items: center;
     gap: 7px;
     height: 26px;
     padding: 0 10px;
+    border: 0;
     border-radius: 99px;
     background: var(--bg-soft);
     color: var(--text-dim);
+    font: inherit;
     font-size: 12px;
+    cursor: pointer;
+  }
+  .status:hover {
+    background: var(--bg-hover);
+    color: var(--text);
   }
   .status.on {
     color: var(--text);
@@ -238,6 +281,41 @@
     border-color: var(--amber);
     background: color-mix(in srgb, var(--amber) 14%, transparent);
     color: var(--amber);
+  }
+  /* Traffic is held right now and the client is sitting there waiting. Forgetting
+     intercept is on reads as "the app is broken" or "the network is down", so this
+     has to be noticeable from across the window, not just legible up close. */
+  .intercept.holding {
+    border-color: var(--red);
+    background: color-mix(in srgb, var(--red) 16%, transparent);
+    color: var(--red);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--red) 28%, transparent);
+    animation: held-nudge 1.7s ease-in-out infinite;
+  }
+  /* A burst, then a rest. A pill that shakes without pause is unbearable to sit next
+     to, and the pause is what makes the next burst register. */
+  @keyframes held-nudge {
+    0%,
+    16%,
+    100% {
+      transform: translateX(0);
+    }
+    2%,
+    8%,
+    14% {
+      transform: translateX(-2.5px);
+    }
+    5%,
+    11% {
+      transform: translateX(2.5px);
+    }
+  }
+  /* Reduced motion keeps the colour and the ring, which carry the signal on their own,
+     and drops only the movement. */
+  @media (prefers-reduced-motion: reduce) {
+    .intercept.holding {
+      animation: none;
+    }
   }
   .exposed {
     height: 24px;

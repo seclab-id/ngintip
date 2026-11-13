@@ -237,7 +237,18 @@ const linesOf = (text) => (text ?? '').split('\n').filter((l) => l.length > 0);
 export function generate(raw, type, payloadSets) {
   const { parts, positions } = parseTemplate(raw);
   const k = positions.length;
-  if (k === 0) return { requests: [], count: 0, total: 0, truncated: false, error: 'No payload positions. Wrap text in section signs to mark them.' };
+  if (k === 0) {
+    // Null payloads are the one attack with nothing to substitute: the request goes out
+    // exactly as it stands, N times (rate limits, retry handling, race conditions).
+    // Demanding a payload position for it would mean marking a spot only to fill it with
+    // nothing, so a null set with no positions is valid and sends the raw request.
+    const nul = payloadSets.find((c) => c && typeof c === 'object' && c.type === 'null');
+    if (!nul) {
+      return { requests: [], count: 0, total: 0, truncated: false, error: 'No payload positions. Wrap text in section signs to mark them.' };
+    }
+    const { list, truncated } = resolvePayloads(nul);
+    return { requests: list.map(() => ({ payloads: [], request: raw })), count: list.length, total: list.length, truncated };
+  }
 
   const resolved = payloadSets.map(resolvePayloads);
   const badSet = resolved.findIndex((r) => r.error);

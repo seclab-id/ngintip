@@ -72,6 +72,10 @@ pub struct Flow {
     /// Earlier versions of the request/response, before intercept edits or an
     /// extension transformed them. Only set when they differ from the final.
     pub variants: FlowVariants,
+    /// Which project this flow belongs to: the store generation current when its id was
+    /// minted, NOT when it was handed to the writer. Those differ by a whole upstream
+    /// round trip, and the gap is exactly where a project switch lands.
+    pub gen: u64,
 }
 
 /// Captured request/response text at earlier pipeline stages, so History can show
@@ -100,6 +104,12 @@ impl FlowVariants {
 }
 
 impl Flow {
+    /// Tag this flow with the store generation its id was minted under.
+    pub fn at(mut self, gen: u64) -> Self {
+        self.gen = gen;
+        self
+    }
+
     pub fn request(
         id: u64,
         method: &Method,
@@ -141,6 +151,7 @@ impl Flow {
             req_truncated: false,
             res_truncated: false,
             variants: FlowVariants::default(),
+            gen: 0,
         }
     }
 
@@ -192,6 +203,37 @@ pub struct WsMessage {
     pub data: Bytes,
 }
 
+/// Totals for one flow's WebSocket conversation, so a caller can decide whether it is
+/// worth paging at all. `bytes` sums the TRUE payload sizes, which can exceed what was
+/// stored: capture keeps only the start of a huge message.
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsStats {
+    pub count: u64,
+    pub client: u64,
+    pub server: u64,
+    pub bytes: u64,
+}
+
+/// One message on a page, with the sizes that keep a shortened payload honest. Three
+/// numbers can differ: `msg.length` is what the peer sent, `stored` is what capture
+/// kept, and `msg.data.len()` is what this page asked for.
+pub struct WsPageRow {
+    pub msg: WsMessage,
+    pub stored: u64,
+}
+
+/// Project-wide counters for a status answer, from two indexed aggregates rather than
+/// loading every row the way `summaries` does.
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreStats {
+    pub flows: u64,
+    pub ws_messages: u64,
+    /// Timestamp of the newest captured flow, 0 when there are none.
+    pub newest_ts: u64,
+}
+
 /// Entries kept per Repeater tab; older ones are dropped.
 pub const REPEATER_HISTORY_LIMIT: i64 = 100;
 
@@ -213,9 +255,53 @@ pub struct RepeaterEntry {
     pub error: Option<String>,
 }
 
+/// The two search tables, kept separate because `clear` drops and recreates them and
+/// must do it from the same definition SCHEMA uses. A test asserts SCHEMA contains this.
+const FTS_SCHEMA: &str = "
+CREATE VIRTUAL TABLE IF NOT EXISTS flows_fts USING fts5 (text, tokenize = 'trigram');
+CREATE VIRTUAL TABLE IF NOT EXISTS ws_fts USING fts5 (text, tokenize = 'trigram');
+";
+
+/// One Intruder result row. The four text fields are empty in a list read and filled by
+/// `intruder_result`, the same split `repeater_history` uses: a run can be thousands of
+/// rows, and the table only shows number, status, length, time and payload.
+#[derive(Clone, Default, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntruderRow {
+    pub n: u64,
+    pub payloads: Vec<String>,
+    pub status: u16,
+    pub length: usize,
+    pub time_ms: u64,
+    pub error: Option<String>,
+    #[serde(default, deserialize_with = "null_to_empty")]
+    pub request_raw: String,
+    #[serde(default, deserialize_with = "null_to_empty")]
+    pub response_raw: String,
+    #[serde(default, deserialize_with = "null_to_empty")]
+    pub request_final: String,
+    #[serde(default, deserialize_with = "null_to_empty")]
+    pub response_original: String,
+}
+
+/// `null` means "no text for this row", not a type error.
+///
+/// Only the first `KEEP_RESPONSES` rows of a run carry bodies, and `requestFinal` /
+/// `responseOriginal` exist only when an extension changed the message, so the window
+/// sends JSON null for all of them routinely. `#[serde(default)]` alone does not cover
+/// this: it fills a MISSING field, while a present null is still a type mismatch.
+fn null_to_empty<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+    use serde::Deserialize;
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
+
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
+-- Wait for a lock instead of failing instantly. Without it a writer that meets any
+-- contention gets SQLITE_BUSY straight away and a whole batch of captured flows is
+-- lost (see Ctx::record_flow). Five seconds is far longer than any commit here.
+PRAGMA busy_timeout = 5000;
 CREATE TABLE IF NOT EXISTS flows (
     id          INTEGER PRIMARY KEY,
     ts          INTEGER NOT NULL,
@@ -269,6 +355,24 @@ CREATE TABLE IF NOT EXISTS repeater_history (
     error        TEXT
 );
 CREATE INDEX IF NOT EXISTS repeater_history_tab ON repeater_history (tab_id, id);
+-- Results of each Intruder attack, kept with the project the way Repeater sends are.
+-- Its own table rather than a settings blob: a run is up to KEEP_RESPONSES bodies, which
+-- has no business being loaded and rewritten whole on every unrelated settings write.
+CREATE TABLE IF NOT EXISTS intruder_results (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    tab_id            INTEGER NOT NULL,
+    n                 INTEGER NOT NULL,
+    payloads          TEXT    NOT NULL,
+    status            INTEGER NOT NULL,
+    length            INTEGER NOT NULL,
+    time_ms           INTEGER NOT NULL,
+    error             TEXT,
+    request_raw       TEXT    NOT NULL,
+    response_raw      TEXT    NOT NULL,
+    request_final     TEXT    NOT NULL,
+    response_original TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS intruder_results_tab ON intruder_results (tab_id, n);
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -298,6 +402,13 @@ struct Db {
 pub struct Store {
     db: Mutex<Db>,
     next: AtomicU64,
+    /// Bumped every time this store is pointed at a different project.
+    ///
+    /// Capture is asynchronous: `Ctx::record_flow` queues a flow and a writer thread
+    /// commits it later. Without a generation, a flow captured under project A that is
+    /// still in the queue when the user opens project B is written into B's file, which
+    /// for separate client engagements is a confidentiality problem, not a tidiness one.
+    generation: AtomicU64,
 }
 
 impl Store {
@@ -309,6 +420,11 @@ impl Store {
                 path: path.to_path_buf(),
             }),
             next: AtomicU64::new(max_id),
+            // Starts at 1, not 0, because `Flow::gen` defaults to 0: a future call site
+            // that forgets `.at(gen)` then fails immediately, in development, instead of
+            // working perfectly until the first project switch and silently dropping
+            // every flow after it.
+            generation: AtomicU64::new(1),
         })
     }
 
@@ -345,7 +461,16 @@ impl Store {
             path: path.to_path_buf(),
         };
         self.next.store(max_id, Ordering::Relaxed);
+        // Bumped while the lock is held, so nothing can read the old generation and then
+        // write into the new connection.
+        self.generation.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Which project this store is currently open on. Compare a value taken earlier to
+    /// find out whether the project changed in between.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 
     pub fn path(&self) -> PathBuf {
@@ -354,6 +479,17 @@ impl Store {
 
     pub fn next_id(&self) -> u64 {
         self.next.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// An id, with the generation it belongs to.
+    ///
+    /// The generation is read FIRST on purpose. If a switch slips in between the two
+    /// reads, the flow carries the older generation and is dropped (loudly) rather than
+    /// written into the project that just opened with an id minted from the previous
+    /// project's counter, which `INSERT OR REPLACE` would use to overwrite a real row.
+    pub fn next_id_at(&self) -> (u64, u64) {
+        let gen = self.generation();
+        (self.next_id(), gen)
     }
 
     /// Reseed the flow-id counter to the current maximum id in the table, so the next
@@ -373,12 +509,30 @@ impl Store {
     /// Persist many flows in a single transaction, so a burst of traffic commits
     /// once instead of once per request. Returns the summaries in input order.
     pub fn push_batch(&self, flows: Vec<Flow>) -> Result<Vec<FlowSummary>> {
+        Ok(self.push_batch_at(flows, None)?.unwrap_or_default())
+    }
+
+    /// Persist a batch, but only while the store is still open on the project the flows
+    /// were captured in.
+    ///
+    /// `Some(gen)` makes the write conditional and returns `None` when it was skipped.
+    /// The comparison happens AFTER the connection lock is taken, which is the whole
+    /// point: checking the generation first and inserting second is a race with a window
+    /// wide enough to matter, and losing it writes one client's traffic into another
+    /// client's project. Worse, the id was minted from the previous project's counter,
+    /// and `INSERT OR REPLACE` would then overwrite whatever row holds that id here.
+    pub fn push_batch_at(&self, flows: Vec<Flow>, gen: Option<u64>) -> Result<Option<Vec<FlowSummary>>> {
         if flows.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         }
         // Decode bodies for the index outside the lock.
         let texts: Vec<String> = flows.iter().map(search_text).collect();
         let mut db = self.db.lock().unwrap();
+        if let Some(gen) = gen {
+            if self.generation.load(Ordering::SeqCst) != gen {
+                return Ok(None);
+            }
+        }
         let tx = db.conn.transaction()?;
         {
             let mut flow_stmt = tx.prepare_cached(
@@ -418,13 +572,15 @@ impl Store {
         tx.commit()?;
         // The emitted summary reflects modification (variants present), same as what
         // summaries() derives on reload, so the History "Modified" column is consistent.
-        Ok(flows
-            .into_iter()
-            .map(|mut f| {
-                f.summary.modified = !f.variants.is_empty();
-                f.summary
-            })
-            .collect())
+        Ok(Some(
+            flows
+                .into_iter()
+                .map(|mut f| {
+                    f.summary.modified = !f.variants.is_empty();
+                    f.summary
+                })
+                .collect(),
+        ))
     }
 
     /// IDs of flows whose headers, (decoded) bodies or WebSocket messages
@@ -433,18 +589,20 @@ impl Store {
         if needle.is_empty() {
             return Ok(Vec::new());
         }
+        // WebSocket messages first, before taking the lock, since `ws_search` takes it
+        // itself. Splitting the old single UNION into two queries is behaviour
+        // preserving: the ids are sorted and deduped at the end either way, and now
+        // "a message matched" has exactly one definition, which `ws_search` owns.
+        let mut ids = self.ws_search(needle)?;
         let (cond, param) = fts_condition(needle);
         let db = self.db.lock().unwrap();
-        let mut ids: Vec<u64> = {
-            let mut stmt = db.conn.prepare(&format!(
-                "SELECT rowid FROM flows_fts WHERE flows_fts.text {cond}
-                 UNION
-                 SELECT m.flow_id FROM ws_fts JOIN ws_messages m ON m.id = ws_fts.rowid
-                 WHERE ws_fts.text {cond}"
-            ))?;
+        {
+            let mut stmt = db.conn.prepare(&format!("SELECT rowid FROM flows_fts WHERE flows_fts.text {cond}"))?;
             let rows = stmt.query_map([&param], |r| r.get::<_, i64>(0))?;
-            rows.map(|r| r.map(|id| id as u64)).collect::<rusqlite::Result<_>>()?
-        };
+            for id in rows {
+                ids.push(id? as u64);
+            }
+        }
 
         // Flows the background indexer hasn't reached yet: check them directly.
         let lower = needle.to_lowercase();
@@ -549,6 +707,26 @@ impl Store {
         Ok(value.map(|v| serde_json::from_str(&v)).transpose()?)
     }
 
+    /// Like `put_setting`, but writes nothing when the store moved to another project
+    /// since `gen` was taken. Returns whether it wrote.
+    ///
+    /// For read-modify-write callers, which load a value, work on it, and write the whole
+    /// thing back. If the project changes in between, that write replaces the NEW
+    /// project's value with the previous project's wholesale. For the Organizer that is
+    /// one client's saved requests and agent findings replacing another's, in the surface
+    /// whose entire purpose is to feed a client-facing report.
+    pub fn put_setting_at(&self, key: &str, value: &serde_json::Value, gen: u64) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        if self.generation.load(Ordering::SeqCst) != gen {
+            return Ok(false);
+        }
+        db.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            params![key, serde_json::to_string(value)?],
+        )?;
+        Ok(true)
+    }
+
     pub fn put_setting(&self, key: &str, value: &serde_json::Value) -> Result<()> {
         self.db.lock().unwrap().conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
@@ -568,32 +746,85 @@ impl Store {
         self.put_setting(key, &serde_json::to_value(list)?)
     }
 
-    pub fn delete(&self, ids: &[u64]) -> Result<()> {
-        let mut db = self.db.lock().unwrap();
-        let tx = db.conn.transaction()?;
-        {
-            let mut flows = tx.prepare("DELETE FROM flows WHERE id = ?1")?;
-            let mut fts = tx.prepare("DELETE FROM flows_fts WHERE rowid = ?1")?;
-            let mut ws_fts =
-                tx.prepare("DELETE FROM ws_fts WHERE rowid IN (SELECT id FROM ws_messages WHERE flow_id = ?1)")?;
-            let mut ws = tx.prepare("DELETE FROM ws_messages WHERE flow_id = ?1")?;
-            for id in ids {
-                flows.execute([*id as i64])?;
-                fts.execute([*id as i64])?;
-                ws_fts.execute([*id as i64])?;
-                ws.execute([*id as i64])?;
+    /// Rows per delete transaction.
+    ///
+    /// Deleting is the expensive direction for `flows_fts`: it is a plain FTS5 table, so
+    /// removing a row means reading the stored document back and writing a delete marker
+    /// for every token, and the trigram tokenizer emits roughly one token per character
+    /// of up to `INDEX_LIMIT` bytes per flow. One transaction over 16,000 flows therefore
+    /// holds every dirty index page until the commit, which grows the WAL past the size
+    /// of the database and starves everything else of the connection for minutes.
+    ///
+    /// Chunking bounds the WAL and, because the lock is taken per chunk, lets the flow
+    /// writer thread interleave so capture keeps working while a big delete runs.
+    const DELETE_CHUNK: usize = 500;
+
+    /// Delete flows by id, with their search-index rows and WebSocket messages.
+    ///
+    /// Commits per chunk, so an error partway leaves the earlier chunks deleted. That is
+    /// the right trade for this operation: the alternative is a single transaction that
+    /// cannot finish at all on a large History, and a partial delete of rows the user
+    /// asked to delete is recoverable by repeating it, while a hung window is not.
+    /// Returns how many ids were actually processed. That is every id unless the store
+    /// moved to another project partway, which the chunking makes reachable: the lock is
+    /// released between chunks, so an `open_project` on another thread can swap the
+    /// connection and the remaining chunks would otherwise delete those rowids out of the
+    /// project the operator just opened.
+    pub fn delete(&self, ids: &[u64], gen: u64) -> Result<usize> {
+        let mut done = 0;
+        for chunk in ids.chunks(Self::DELETE_CHUNK) {
+            let mut db = self.db.lock().unwrap();
+            if self.generation.load(Ordering::SeqCst) != gen {
+                break; // another project is open now; these ids mean nothing in it
             }
+            let tx = db.conn.transaction()?;
+            {
+                let mut flows = tx.prepare("DELETE FROM flows WHERE id = ?1")?;
+                let mut fts = tx.prepare("DELETE FROM flows_fts WHERE rowid = ?1")?;
+                let mut ws_fts =
+                    tx.prepare("DELETE FROM ws_fts WHERE rowid IN (SELECT id FROM ws_messages WHERE flow_id = ?1)")?;
+                let mut ws = tx.prepare("DELETE FROM ws_messages WHERE flow_id = ?1")?;
+                for id in chunk {
+                    flows.execute([*id as i64])?;
+                    fts.execute([*id as i64])?;
+                    ws_fts.execute([*id as i64])?;
+                    ws.execute([*id as i64])?;
+                }
+            }
+            tx.commit()?;
+            done += chunk.len();
         }
-        tx.commit()?;
-        Ok(())
+        Ok(done)
     }
 
-    pub fn clear(&self) -> Result<()> {
-        self.db
-            .lock()
-            .unwrap()
-            .conn
-            .execute_batch("DELETE FROM flows; DELETE FROM flows_fts; DELETE FROM ws_messages; DELETE FROM ws_fts;")?;
+    /// Empty History: every flow, its search-index rows and every WebSocket message.
+    ///
+    /// The FTS tables are DROPped and recreated rather than deleted from. `flows_fts` is
+    /// a virtual table, so `DELETE FROM flows_fts` removes rows one at a time through
+    /// FTS5's update hook, paying the same per-trigram cost as deleting each flow by hand
+    /// but over every row at once. That is the same stall the History "Clear" button sits
+    /// one click away from, with no chunking to soften it. Dropping the index is constant
+    /// time, and the cheap `'delete-all'` command is not available here because these are
+    /// plain content tables, not contentless ones.
+    pub fn clear(&self, gen: u64) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        if self.generation.load(Ordering::SeqCst) != gen {
+            return Ok(()); // another project is open now; its History is not ours to empty
+        }
+        // One transaction, so a failure cannot leave the project with no search tables:
+        // every later capture would fail its whole batch and the project would only heal
+        // on reopen. The recreate uses FTS_SCHEMA rather than re-running SCHEMA, because
+        // SCHEMA carries `PRAGMA journal_mode`, which errors inside a transaction on any
+        // connection not already in WAL.
+        db.conn.execute_batch(&format!(
+            "BEGIN;
+             DROP TABLE IF EXISTS flows_fts;
+             DROP TABLE IF EXISTS ws_fts;
+             DELETE FROM flows;
+             DELETE FROM ws_messages;
+             {FTS_SCHEMA}
+             COMMIT;"
+        ))?;
         Ok(())
     }
 
@@ -693,6 +924,121 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Totals for one flow's WebSocket messages. One row, served from the
+    /// `ws_messages_flow` index.
+    pub fn ws_stats(&self, flow_id: u64) -> Result<WsStats> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.conn.prepare(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(direction = 'client'), 0),
+                    COALESCE(SUM(direction = 'server'), 0),
+                    COALESCE(SUM(length), 0)
+             FROM ws_messages WHERE flow_id = ?1",
+        )?;
+        Ok(stmt.query_row([flow_id as i64], |r| {
+            Ok(WsStats {
+                count: r.get::<_, i64>(0)? as u64,
+                client: r.get::<_, i64>(1)? as u64,
+                server: r.get::<_, i64>(2)? as u64,
+                bytes: r.get::<_, i64>(3)? as u64,
+            })
+        })?)
+    }
+
+    /// A page of one flow's WebSocket messages, oldest first, with ids above `after`.
+    ///
+    /// Only `cap` bytes of each payload leave SQLite (`SUBSTR` in the query), so a
+    /// socket of 1 MB messages costs the cap per message rather than a megabyte. That
+    /// is the difference between this and [`Store::ws_messages`], which loads whole
+    /// payloads because the window opens one flow at a time; this one can be called in
+    /// a loop by an agent.
+    ///
+    /// `contains` reuses the same FTS condition as [`Store::search`], so a match here
+    /// means exactly what a match there meant. Note `ws_fts` only indexes text and
+    /// binary messages, and only their first `INDEX_LIMIT` bytes.
+    pub fn ws_page(
+        &self,
+        flow_id: u64,
+        after: u64,
+        direction: Option<&str>,
+        contains: Option<&str>,
+        limit: usize,
+        cap: usize,
+    ) -> Result<Vec<WsPageRow>> {
+        let fts = contains.filter(|c| !c.is_empty()).map(fts_condition);
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        // `fts_condition` hardcodes ?1, so its parameter has to be the first one bound.
+        if let Some((_, p)) = &fts {
+            params.push(Box::new(p.clone()));
+        }
+        params.push(Box::new(cap as i64));
+        let cap_n = params.len();
+        params.push(Box::new(flow_id as i64));
+        let flow_n = params.len();
+        params.push(Box::new(after as i64));
+        let after_n = params.len();
+
+        let mut sql = format!(
+            "SELECT m.id, m.flow_id, m.ts, m.direction, m.opcode, m.length,
+                    SUBSTR(m.data, 1, ?{cap_n}), LENGTH(m.data)
+             FROM ws_messages m"
+        );
+        if fts.is_some() {
+            sql.push_str(" JOIN ws_fts ON ws_fts.rowid = m.id");
+        }
+        sql.push_str(&format!(" WHERE m.flow_id = ?{flow_n} AND m.id > ?{after_n}"));
+        if let Some(d) = direction {
+            params.push(Box::new(d.to_string()));
+            sql.push_str(&format!(" AND m.direction = ?{}", params.len()));
+        }
+        if let Some((cond, _)) = &fts {
+            sql.push_str(&format!(" AND ws_fts.text {cond}"));
+        }
+        params.push(Box::new(limit as i64));
+        sql.push_str(&format!(" ORDER BY m.id LIMIT ?{}", params.len()));
+
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter().map(|p| &**p)), |r| {
+            Ok(WsPageRow { msg: ws_from_row(r)?, stored: r.get::<_, i64>(7)? as u64 })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Flow ids whose WebSocket messages match `needle`. This is the second arm of
+    /// [`Store::search`]'s union, split out so "a message matched" has one definition
+    /// and a caller can tell a message hit from a request/response hit.
+    pub fn ws_search(&self, needle: &str) -> Result<Vec<u64>> {
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (cond, param) = fts_condition(needle);
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.conn.prepare(&format!(
+            "SELECT DISTINCT m.flow_id FROM ws_fts JOIN ws_messages m ON m.id = ws_fts.rowid
+             WHERE ws_fts.text {cond}"
+        ))?;
+        let rows = stmt.query_map([&param], |r| r.get::<_, i64>(0))?;
+        Ok(rows.map(|r| r.map(|id| id as u64)).collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Project-wide counters, without materialising any row.
+    pub fn stats(&self) -> Result<StoreStats> {
+        let db = self.db.lock().unwrap();
+        let (flows, newest_ts) = db.conn.query_row("SELECT COUNT(*), COALESCE(MAX(ts), 0) FROM flows", [], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
+        })?;
+        let ws_messages = db.conn.query_row("SELECT COUNT(*) FROM ws_messages", [], |r| Ok(r.get::<_, i64>(0)? as u64))?;
+        Ok(StoreStats { flows, ws_messages, newest_ts })
+    }
+
+    /// The highest flow id handed out so far, WITHOUT taking one. Lets a caller tell a
+    /// flow that is still being written (id already allocated, row not committed yet,
+    /// because `record_flow` writes on a background thread) from one that never existed.
+    pub fn peek_id(&self) -> u64 {
+        self.next.load(Ordering::Relaxed)
+    }
+
     /// Record a Repeater send, keeping the newest entries of that tab. Returns the entry id.
     pub fn push_repeater(&self, e: &RepeaterEntry) -> Result<u64> {
         let db = self.db.lock().unwrap();
@@ -743,6 +1089,96 @@ impl Store {
                 repeater_from_row,
             )
             .optional()?)
+    }
+
+    /// Replace every stored result for one Intruder tab, in one transaction. A run is
+    /// atomic: half of an old run beside half of a new one would be unreadable.
+    pub fn intruder_save(&self, tab_id: u64, rows: &[IntruderRow]) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.conn.transaction()?;
+        tx.execute("DELETE FROM intruder_results WHERE tab_id = ?1", [tab_id as i64])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO intruder_results
+                   (tab_id, n, payloads, status, length, time_ms, error, request_raw, response_raw, request_final, response_original)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            )?;
+            for r in rows {
+                stmt.execute(params![
+                    tab_id as i64,
+                    r.n as i64,
+                    serde_json::to_string(&r.payloads)?,
+                    r.status,
+                    r.length as i64,
+                    r.time_ms as i64,
+                    r.error,
+                    r.request_raw,
+                    r.response_raw,
+                    r.request_final,
+                    r.response_original,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every row for a tab, WITHOUT the request/response text: that is what makes
+    /// reopening a project with a 5,000-row attack cheap.
+    pub fn intruder_results(&self, tab_id: u64) -> Result<Vec<IntruderRow>> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.conn.prepare(
+            "SELECT n, payloads, status, length, time_ms, error
+             FROM intruder_results WHERE tab_id = ?1 ORDER BY n",
+        )?;
+        let rows = stmt.query_map([tab_id as i64], |r| {
+            Ok(IntruderRow {
+                n: r.get::<_, i64>(0)? as u64,
+                payloads: serde_json::from_str(&r.get::<_, String>(1)?).unwrap_or_default(),
+                status: r.get(2)?,
+                length: r.get::<_, i64>(3)? as usize,
+                time_ms: r.get::<_, i64>(4)? as u64,
+                error: r.get(5)?,
+                ..Default::default()
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// One row in full, fetched when the operator actually opens it.
+    pub fn intruder_result(&self, tab_id: u64, n: u64) -> Result<Option<IntruderRow>> {
+        let db = self.db.lock().unwrap();
+        Ok(db
+            .conn
+            .query_row(
+                "SELECT n, payloads, status, length, time_ms, error, request_raw, response_raw, request_final, response_original
+                 FROM intruder_results WHERE tab_id = ?1 AND n = ?2",
+                params![tab_id as i64, n as i64],
+                |r| {
+                    Ok(IntruderRow {
+                        n: r.get::<_, i64>(0)? as u64,
+                        payloads: serde_json::from_str(&r.get::<_, String>(1)?).unwrap_or_default(),
+                        status: r.get(2)?,
+                        length: r.get::<_, i64>(3)? as usize,
+                        time_ms: r.get::<_, i64>(4)? as u64,
+                        error: r.get(5)?,
+                        request_raw: r.get(6)?,
+                        response_raw: r.get(7)?,
+                        request_final: r.get(8)?,
+                        response_original: r.get(9)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn clear_intruder_results(&self, tab_id: u64) -> Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .conn
+            .execute("DELETE FROM intruder_results WHERE tab_id = ?1", [tab_id as i64])?;
+        Ok(())
     }
 
     pub fn clear_repeater_history(&self, tab_id: u64) -> Result<()> {
@@ -828,6 +1264,8 @@ fn flow_from_row(r: &Row) -> rusqlite::Result<Flow> {
     let variants_json: Option<String> = r.get(21)?;
     let modified = variants_json.as_deref().is_some_and(|s| !s.is_empty());
     Ok(Flow {
+        // Rebuilt from a row that is already in this project's file.
+        gen: 0,
         req_truncated: truncated & 1 != 0,
         res_truncated: truncated & 2 != 0,
         summary: summary_from_row(r, 18, req_body.len(), modified)?,
@@ -994,6 +1432,185 @@ mod tests {
     use super::*;
     use http::StatusCode;
 
+    /// A delete larger than one chunk must still remove everything. The chunking exists
+    /// because a single transaction over a large History holds every dirty FTS page until
+    /// the commit; it must not turn into a delete that only half happens.
+    #[test]
+    fn delete_spans_more_than_one_chunk() {
+        let path = std::env::temp_dir().join(format!("ngintip-chunk-{}.ngintip", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        let uri: Uri = "http://a.test/x".parse().unwrap();
+
+        let n = Store::DELETE_CHUNK * 2 + 7; // deliberately not a multiple of the chunk
+        let mut ids = Vec::with_capacity(n);
+        for _ in 0..n {
+            let id = store.next_id();
+            ids.push(id);
+            store
+                .push(Flow::request(id, &Method::GET, &uri, Version::HTTP_11, &HeaderMap::new(), Bytes::new()))
+                .unwrap();
+        }
+        assert_eq!(store.stats().unwrap().flows, n as u64);
+
+        assert_eq!(store.delete(&ids, store.generation()).unwrap(), n, "stopped short of the ids it was given");
+        assert_eq!(store.stats().unwrap().flows, 0u64, "a delete crossing chunk boundaries left rows behind");
+
+        // The guarded path: a generation that is not the store's deletes nothing at all.
+        let keep = store.next_id();
+        store
+            .push(Flow::request(keep, &Method::GET, &uri, Version::HTTP_11, &HeaderMap::new(), Bytes::new()))
+            .unwrap();
+        assert_eq!(store.delete(&[keep], store.generation() + 1).unwrap(), 0, "deleted rows for a project that is not open");
+        assert_eq!(store.stats().unwrap().flows, 1u64, "a stale-generation delete removed rows anyway");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An attack's results are kept with the project, bodies included, but the list read
+    /// must not carry them: that split is what keeps reopening a project with a large run
+    /// cheap, and it is the same one `repeater_history` uses.
+    #[test]
+    fn intruder_results_round_trip_without_loading_every_body() {
+        let path = std::env::temp_dir().join(format!("ngintip-intr-{}.ngintip", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+
+        let rows: Vec<IntruderRow> = (1..=3)
+            .map(|n| IntruderRow {
+                n,
+                payloads: vec![format!("p{n}")],
+                status: 200,
+                length: 10,
+                time_ms: 5,
+                error: None,
+                request_raw: format!("GET /{n} HTTP/1.1\n\n"),
+                response_raw: "HTTP/1.1 200 OK\n\nbody".into(),
+                request_final: String::new(),
+                response_original: String::new(),
+            })
+            .collect();
+        store.intruder_save(7, &rows).unwrap();
+
+        // The window sends JSON null for a row with no bodies (past KEEP_RESPONSES, or
+        // with no extension). That crossed the serde boundary as a type error, and
+        // neither the Rust test nor the mocked frontend test could see it.
+        let from_window: IntruderRow = serde_json::from_str(
+            r#"{"n":9,"payloads":[],"status":200,"length":3,"timeMs":7,"error":null,
+                "requestRaw":null,"responseRaw":null,"requestFinal":null,"responseOriginal":null}"#,
+        )
+        .expect("a row with null bodies must deserialize");
+        assert_eq!(from_window.n, 9);
+        assert!(from_window.request_raw.is_empty());
+
+        let listed = store.intruder_results(7).unwrap();
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].payloads, vec!["p1".to_string()], "the table columns did not survive");
+        assert!(listed.iter().all(|r| r.response_raw.is_empty()), "the list read dragged every response body with it");
+
+        let one = store.intruder_result(7, 2).unwrap().expect("row 2");
+        assert_eq!(one.request_raw, "GET /2 HTTP/1.1\n\n");
+        assert_eq!(one.response_raw, "HTTP/1.1 200 OK\n\nbody");
+        assert!(store.intruder_result(7, 99).unwrap().is_none());
+
+        // A new run replaces the old one rather than interleaving with it.
+        store.intruder_save(7, &rows[..1]).unwrap();
+        assert_eq!(store.intruder_results(7).unwrap().len(), 1, "the previous run was left behind");
+
+        // Another tab is untouched, and clearing one tab clears only that tab.
+        store.intruder_save(8, &rows).unwrap();
+        store.clear_intruder_results(7).unwrap();
+        assert!(store.intruder_results(7).unwrap().is_empty());
+        assert_eq!(store.intruder_results(8).unwrap().len(), 3, "clearing one tab took another with it");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Clear drops and recreates the FTS tables, so the thing to prove is that search
+    /// still works afterwards: a dropped index that is never rebuilt would leave Clear
+    /// looking fine and every later search silently returning nothing.
+    #[test]
+    fn search_still_works_after_clearing_history() {
+        let path = std::env::temp_dir().join(format!("ngintip-clear-{}.ngintip", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        let uri: Uri = "http://a.test/x".parse().unwrap();
+
+        let mut before = Flow::request(store.next_id(), &Method::POST, &uri, Version::HTTP_11, &HeaderMap::new(), Bytes::from_static(b"needle-before"));
+        before.set_response(StatusCode::OK, Version::HTTP_11, &HeaderMap::new(), Bytes::new());
+        store.push(before).unwrap();
+        assert_eq!(store.search("needle-before").unwrap().len(), 1);
+
+        store.clear(store.generation()).unwrap();
+        assert_eq!(store.stats().unwrap().flows, 0u64);
+        assert!(store.search("needle-before").unwrap().is_empty(), "cleared rows still match");
+        assert!(SCHEMA.contains(FTS_SCHEMA.trim()), "clear() recreates tables SCHEMA no longer defines");
+
+        let id = store.next_id();
+        let mut after = Flow::request(id, &Method::POST, &uri, Version::HTTP_11, &HeaderMap::new(), Bytes::from_static(b"needle-after"));
+        after.set_response(StatusCode::OK, Version::HTTP_11, &HeaderMap::new(), Bytes::new());
+        store.push(after).unwrap();
+        assert_eq!(store.search("needle-after").unwrap(), vec![id], "the index was not usable after Clear");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A read-modify-write caller (the Organizer, the MCP setting writers) loads a value,
+    /// works on it, then writes the whole thing back. If the project changed in between,
+    /// that write must not land: it would replace the newly opened project's value with
+    /// the previous project's in full.
+    #[test]
+    fn a_setting_write_for_a_closed_project_is_refused() {
+        let a = std::env::temp_dir().join(format!("ngintip-seta-{}.ngintip", std::process::id()));
+        let b = std::env::temp_dir().join(format!("ngintip-setb-{}.ngintip", std::process::id()));
+        for p in [&a, &b] {
+            let _ = std::fs::remove_file(p);
+        }
+        let store = Store::open(&a).unwrap();
+        let gen = store.generation();
+        store.put_setting("organizer", &serde_json::json!({ "client": "A" })).unwrap();
+
+        // Still project A: the write lands.
+        assert!(store.put_setting_at("organizer", &serde_json::json!({ "client": "A2" }), gen).unwrap());
+
+        store.switch(&b).unwrap();
+        store.put_setting("organizer", &serde_json::json!({ "client": "B" })).unwrap();
+
+        // Project A's in-flight write must not reach project B.
+        assert!(!store.put_setting_at("organizer", &serde_json::json!({ "client": "A3" }), gen).unwrap());
+        assert_eq!(
+            store.get_setting("organizer").unwrap().unwrap(),
+            serde_json::json!({ "client": "B" }),
+            "one project's Organizer replaced another's"
+        );
+        for p in [&a, &b] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// Capture is asynchronous, so a flow queued under one project can still be waiting
+    /// when another is opened. The generation is what lets the writer tell them apart.
+    #[test]
+    fn switching_project_bumps_the_generation() {
+        let a = std::env::temp_dir().join(format!("ngintip-gen-a-{}.ngintip", std::process::id()));
+        let b = std::env::temp_dir().join(format!("ngintip-gen-b-{}.ngintip", std::process::id()));
+        for p in [&a, &b] {
+            let _ = std::fs::remove_file(p);
+        }
+        let store = Store::open(&a).unwrap();
+        let before = store.generation();
+        store.switch(&b).unwrap();
+        assert_ne!(before, store.generation(), "opening another project left the generation unchanged");
+        // Ordinary work must NOT move it: only opening another project does.
+        let after = store.generation();
+        let uri: Uri = "http://a.test/x".parse().unwrap();
+        store
+            .push(Flow::request(store.next_id(), &Method::GET, &uri, Version::HTTP_11, &HeaderMap::new(), Bytes::new()))
+            .unwrap();
+        store.put_setting("k", &serde_json::json!(1)).unwrap();
+        assert_eq!(after, store.generation(), "capturing a flow moved the generation");
+        for p in [&a, &b] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     #[test]
     fn migrates_old_project_and_saves_meta() {
         let path = std::env::temp_dir().join(format!("intip-test-{}.intip", std::process::id()));
@@ -1139,7 +1756,7 @@ mod tests {
         store.push_ws(a, 1, "server", 1, 5, b"ws-hit").unwrap();
         assert_eq!(store.search("WS-HIT").unwrap(), vec![a], "WebSocket messages are searched");
 
-        store.delete(&[a]).unwrap();
+        store.delete(&[a], store.generation()).unwrap();
         assert!(store.search("ws-hit").unwrap().is_empty());
 
         let (cond, _) = fts_condition("needle");

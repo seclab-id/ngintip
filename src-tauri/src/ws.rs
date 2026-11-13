@@ -275,6 +275,15 @@ impl WsIntercept {
         self.enabled.load(Ordering::Relaxed)
     }
 
+    /// Release every held message by dropping it, and switch WS intercept off.
+    /// See `Intercept::drain_dropped`: used on a project change, not on the toggle.
+    pub fn drain_dropped(&self) {
+        self.enabled.store(false, Ordering::Relaxed);
+        for p in self.queue.lock().unwrap().drain(..) {
+            let _ = p.tx.send(WsDecision::Drop);
+        }
+    }
+
     /// Turning it off releases everything still held, unchanged.
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);

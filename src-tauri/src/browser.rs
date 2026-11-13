@@ -113,6 +113,16 @@ pub fn resolve_binary(path: &str) -> PathBuf {
     p
 }
 
+/// Chrome features turned off for every launch.
+///
+/// Chrome fetches its Optimization Guide ML models over the proxy, and with the
+/// throwaway profile this tool uses by default, it refetches them on EVERY launch. That
+/// is about 39 MB a launch, recorded whole, because a streamed body is stored whole (see
+/// `body::STORE_LIMIT`). One measured project held 346 MB of it against 72 KB of actual
+/// testing traffic. Nobody points a pentest proxy at Chrome to watch Chrome update
+/// itself, so this is noise that only costs project size.
+const FEATURES_OFF: [&str; 2] = ["OptimizationHints", "OptimizationGuideModelDownloading"];
+
 /// The command-line flags for a proxy-wired pentest session. Pure, so it is
 /// testable and easy to audit. `proxy` is like `http://127.0.0.1:8080`.
 pub fn launch_args(proxy: &str, user_data_dir: &Path, extra_flags: &str, url: Option<&str>) -> Vec<String> {
@@ -133,10 +143,27 @@ pub fn launch_args(proxy: &str, user_data_dir: &Path, extra_flags: &str, url: Op
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--new-window".to_string(),
+        // Stop the component updater refetching Chrome's own components through the
+        // proxy. Harmless to repeat, so it needs no merging.
+        "--disable-component-update".to_string(),
     ];
+    // Chrome honours only the LAST `--disable-features` it is given, so appending ours
+    // after the user's would drop theirs, and putting ours first would let theirs drop
+    // ours without a word. Merge the two lists into one flag instead.
+    let mut features: Vec<String> = FEATURES_OFF.iter().map(|s| (*s).to_string()).collect();
     for f in extra_flags.split_whitespace() {
-        args.push(f.to_string());
+        match f.strip_prefix("--disable-features=") {
+            Some(list) => {
+                for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+                    if !features.iter().any(|known| known == name) {
+                        features.push(name.to_string());
+                    }
+                }
+            }
+            None => args.push(f.to_string()),
+        }
     }
+    args.push(format!("--disable-features={}", features.join(",")));
     args.push(url.unwrap_or("about:blank").to_string());
     args
 }
@@ -416,10 +443,42 @@ mod tests {
         assert!(args.iter().any(|a| a.contains("<-loopback>")));
         assert_eq!(args.last().unwrap(), "https://target.test");
         // Extra flags are appended, no url defaults to about:blank.
+        // Chrome's own background downloads are off by default, every launch.
+        assert!(args.contains(&"--disable-component-update".to_string()));
+        let off = args.iter().find(|a| a.starts_with("--disable-features=")).expect("features disabled by default");
+        assert!(off.contains("OptimizationHints") && off.contains("OptimizationGuideModelDownloading"), "{off}");
+
         let args2 = launch_args("http://127.0.0.1:8080", dir, "--incognito --lang=en", None);
         assert!(args2.contains(&"--incognito".to_string()));
         assert!(args2.contains(&"--lang=en".to_string()));
+        // The URL stays last, after every flag.
         assert_eq!(args2.last().unwrap(), "about:blank");
+    }
+
+    #[test]
+    fn a_users_own_disable_features_merges_with_ours_instead_of_replacing_it() {
+        let dir = Path::new("/tmp/p");
+        let args = launch_args("http://127.0.0.1:8080", dir, "--lang=en --disable-features=Foo,Bar --incognito", None);
+
+        // Exactly one --disable-features reaches Chrome, because Chrome reads only the
+        // last one it is given; two would mean one list silently wins.
+        let found: Vec<&String> = args.iter().filter(|a| a.starts_with("--disable-features=")).collect();
+        assert_eq!(found.len(), 1, "{args:?}");
+        let list = found[0].trim_start_matches("--disable-features=");
+        let names: Vec<&str> = list.split(',').collect();
+        for want in ["OptimizationHints", "OptimizationGuideModelDownloading", "Foo", "Bar"] {
+            assert!(names.contains(&want), "{want} missing from {list}");
+        }
+        // The rest of the user's flags are untouched and still passed through.
+        assert!(args.contains(&"--lang=en".to_string()) && args.contains(&"--incognito".to_string()));
+
+        // Naming one of ours again does not duplicate it.
+        let again = launch_args("http://127.0.0.1:8080", dir, "--disable-features=OptimizationHints", None);
+        let list = again
+            .iter()
+            .find_map(|a| a.strip_prefix("--disable-features="))
+            .expect("one merged features flag");
+        assert_eq!(list.split(',').filter(|n| *n == "OptimizationHints").count(), 1, "listed once, not twice: {list}");
     }
 
     #[test]

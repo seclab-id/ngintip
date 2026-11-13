@@ -1,10 +1,12 @@
 <script>
   import { tick, untrack } from 'svelte';
   import CodeEditor from './CodeEditor.svelte';
+  import MiniDecoder from './MiniDecoder.svelte';
   import ContextMenu from './ContextMenu.svelte';
   import Modal from './Modal.svelte';
   import FindBar from './FindBar.svelte';
   import { matchRanges, markHtmlRanges } from '../lib/find.js';
+  import { autoDecode } from '../lib/codec.js';
   import { store } from '../lib/store.svelte.js';
   import { methodClass, statusClass, fmtDateTime } from '../lib/format.js';
   import { prettyBody, splitMessage } from '../lib/message.js';
@@ -55,6 +57,26 @@
   function dropCurrent() {
     if (selKind === 'ws') store.dropWsHeld();
     else store.dropHeld();
+  }
+
+  // Highlight-to-decode side bar, the same one Repeater has. An encoded body stays
+  // exactly as it arrived on the wire; selecting a piece of it decodes that piece
+  // beside the message, instead of rewriting what you are about to forward.
+  let miniDecode = $state(null);
+  $effect(() => {
+    it.selectedKey;
+    wsIt.selectedKey;
+    miniDecode = null;
+  });
+
+  /** Selection inside `el`, when it is worth decoding (JWT, Base64, URL, hex, entities). */
+  function decodeSelection(el) {
+    const sel = window.getSelection?.();
+    if (!sel || sel.isCollapsed) return;
+    if (el && sel.anchorNode && !el.contains(sel.anchorNode)) return;
+    const text = sel.toString();
+    // Selecting ordinary text (to copy a header, say) must not pop the side bar.
+    if (text.trim() && text.length <= 100_000 && autoDecode(text).length) miniDecode = { text };
   }
 
   let selected = $derived(it.queue.find((q) => q.key === it.selectedKey));
@@ -388,13 +410,18 @@
         </header>
         {#if tab === 'original'}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
-          <pre class="code orig" bind:this={origPre} onpointerenter={() => (origHovered = true)} onpointerleave={() => (origHovered = false)}>{@html origBody}</pre>
+          <pre
+            class="code orig"
+            bind:this={origPre}
+            onpointerenter={() => (origHovered = true)}
+            onpointerleave={() => (origHovered = false)}
+            onpointerup={() => decodeSelection(origPre)}>{@html origBody}</pre>
           {#if origFindOpen}
             <FindBar bind:value={origQuery} bind:opts={origOpts} error={origMatches?.error} count={origMatches?.count ?? 0} index={origIdx} oninput={() => (origIdx = 0)} onstep={origStep} onclose={closeOrigFind} />
           {/if}
         {:else}
           {#key it.selectedKey}
-            <CodeEditor bind:this={editedRef} bind:value={it.draft} />
+            <CodeEditor bind:this={editedRef} bind:value={it.draft} onselect={(t) => (miniDecode = { text: t })} />
           {/key}
         {/if}
         <div class="foot">
@@ -402,6 +429,9 @@
           <span class="foot-hint">Cmd/Ctrl+F</span>
         </div>
       </div>
+      {/if}
+      {#if miniDecode}
+        <aside class="decoder-dock"><MiniDecoder text={miniDecode.text} onclose={() => (miniDecode = null)} /></aside>
       {/if}
     </div>
   {/if}
@@ -600,11 +630,22 @@
     color: var(--text-dim);
   }
   .grid {
+    position: relative;
     display: grid;
     grid-template-columns: minmax(220px, 300px) 1fr;
     gap: 10px;
     min-height: 0;
     padding: 10px;
+  }
+  .decoder-dock {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    bottom: 10px;
+    z-index: 6;
+    min-width: 0;
+    min-height: 0;
+    border-radius: var(--radius);
   }
   .list {
     overflow: auto;

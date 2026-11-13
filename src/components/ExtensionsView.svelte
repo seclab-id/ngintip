@@ -13,6 +13,29 @@
   let showSetupLog = $state(false);
   let test = $state(null); // { id, phase, input, output, logs, changed, error, running }
 
+  // Debug console filter. An extension that logs a decrypted body puts hundreds of
+  // lines in here, and the one line that matters ("no key yet", "DECRYPTED") is the
+  // reason you opened the console at all. Filtering by line, not by entry, because a
+  // single entry is often a whole pretty-printed body.
+  let logQuery = $state('');
+  let logLines = $derived(logs.length ? logs.join('\n').split('\n') : []);
+  let shownLines = $derived.by(() => {
+    const q = logQuery.trim().toLowerCase();
+    return q ? logLines.filter((l) => l.toLowerCase().includes(q)) : logLines;
+  });
+  let copied = $state(false);
+  async function copyLogs() {
+    // Copies what you are looking at, filter and all: the filtered view is usually the
+    // thing worth pasting into a finding.
+    try {
+      await navigator.clipboard.writeText(shownLines.join('\n'));
+      copied = true;
+      setTimeout(() => (copied = false), 1200);
+    } catch {
+      // Clipboard denied: the text is selectable, so there is still a way out.
+    }
+  }
+
   // Where an extension may run. An extension can cover any combination.
   const SURFACES = [
     { id: 'proxy', short: 'Proxy', title: 'Run on live proxy (History) traffic' },
@@ -222,8 +245,22 @@
 
   <!-- Debug console -->
   <section class="card">
-    <div class="card-head"><h2>Debug console</h2><button class="btn ghost sm" onclick={clearLogs}>Clear</button></div>
-    <pre class="out console mono">{logs.length ? logs.join('\n') : 'No output yet. Enable an extension and send some traffic, or run a Test.'}</pre>
+    <div class="card-head">
+      <h2>Debug console</h2>
+      <div class="head-actions">
+        <input class="input log-find" type="search" placeholder="Filter lines" aria-label="Filter debug console" bind:value={logQuery} spellcheck="false" />
+        {#if logQuery.trim()}
+          <span class="dim log-count">{shownLines.length} of {logLines.length}</span>
+        {/if}
+        <button class="btn ghost sm" disabled={!shownLines.length} onclick={copyLogs}>{copied ? 'Copied' : 'Copy'}</button>
+        <button class="btn ghost sm" onclick={clearLogs}>Clear</button>
+      </div>
+    </div>
+    <pre class="out console mono pick">{logLines.length
+        ? shownLines.length
+          ? shownLines.join('\n')
+          : `No line matches "${logQuery.trim()}".`
+        : 'No output yet. Enable an extension and send some traffic, or run a Test.'}</pre>
   </section>
 </div>
 
@@ -512,6 +549,23 @@
   }
   .out.err {
     color: var(--red);
+  }
+  /* The app disables text selection globally (app.css), which is right for chrome and
+     wrong for output you are meant to copy into a finding. */
+  .pick {
+    user-select: text;
+    -webkit-user-select: text;
+    cursor: text;
+  }
+  .log-find {
+    width: 180px;
+    height: 24px;
+    padding: 0 8px;
+    font-size: 11.5px;
+  }
+  .log-count {
+    font: 500 11px var(--sans);
+    white-space: nowrap;
   }
   .out.logs {
     margin-top: 8px;

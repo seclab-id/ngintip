@@ -262,6 +262,17 @@ kbd {
   -webkit-user-select: text;
 }
 
+/* A message pane locked while a drag-selection is running in another one (see
+   lib/dragselect.js). Request and response share a document, so a drag that leaves its
+   pane would otherwise keep selecting into the next one and copy both messages.
+   `!important` and the descendant selector are both needed: the text being protected is
+   `.code` above, which sets `user-select: text` on itself and would win otherwise. */
+[data-selectlock],
+[data-selectlock] * {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+
 /* Syntax colours (see src/lib/highlight.js) */
 .hl-dim {
   color: var(--text-faint);

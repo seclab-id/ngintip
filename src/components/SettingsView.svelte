@@ -3,7 +3,6 @@
   import { store, DETAIL_CACHE_MAX } from '../lib/store.svelte.js';
   import * as api from '../lib/api.js';
   import { pollVisible } from '../lib/poll.js';
-  import { isLoopback } from '../lib/net.js';
   import { BRAND } from '../lib/brand.js';
   import SitemapTree from './SitemapTree.svelte';
   import VaultPanel from './VaultPanel.svelte';
@@ -394,6 +393,13 @@
           <span class="dim">(latest)</span>
         {/if}
       </span>
+      <button
+        class="btn ghost sm"
+        title="Ask GitHub which release is the latest, now"
+        disabled={store.update.checking}
+        onclick={() => store.checkUpdate(true)}>
+        {store.update.checking ? 'Checking…' : 'Check'}
+      </button>
       <button class="btn ghost sm" class:primary={store.update.newer} onclick={() => store.openReleases()}>
         {store.update.newer ? 'Get update' : 'Releases'}
       </button>
@@ -617,9 +623,15 @@
     {#if store.proxyError}<p class="error">{store.proxyError}</p>{/if}
     {#if exposed}
       <div class="warn" class:danger={!store.config.auth.enabled}>
-        <strong>The proxy is reachable from the network.</strong>
-        Anyone who can connect to this address can use the proxy, and their traffic is recorded in History too.
-        {#if store.config.auth.enabled}Authentication is on.{:else}Turn on authentication below, or use 127.0.0.1.{/if}
+        {#if store.exposure === 'all'}
+          <strong>This listener is on every interface.</strong>
+          That includes networks that connect later, such as a VPN or a hotspot, so its reach is not fixed.
+        {:else}
+          <strong>This listener is on a VPN interface.</strong>
+          The far side of the tunnel can reach the proxy, which may be a client or corporate network.
+        {/if}
+        Anyone who can connect can use the proxy, and their traffic is recorded in History too.
+        {#if store.config.auth.enabled}Authentication is on.{:else}Turn on authentication below, or bind to one address instead.{/if}
       </div>
     {/if}
     {#if reachable.length}
@@ -800,6 +812,12 @@
         <span>Extra flags</span>
         <input class="input mono" bind:value={browserFlags} placeholder="--incognito --lang=en (optional)" spellcheck="false" />
       </label>
+      <p class="dim hint">
+        Added to every launch already: <span class="mono">--disable-component-update</span> and
+        <span class="mono">--disable-features=OptimizationHints,OptimizationGuideModelDownloading</span>. With a throwaway
+        profile Chrome refetches its own ML models on every launch, which lands in History as about 39 MB each time.
+        A <span class="mono">--disable-features</span> you add here is merged with those, not replaced by them.
+      </p>
       <div class="btn-row">
         <button class="btn sm" onclick={() => store.setBrowserPath(browserPath, browserFlags)}>Save</button>
         <button class="btn ghost sm" onclick={() => store.detectBrowser()}>Detect installed</button>
@@ -1239,6 +1257,11 @@
   }
   .kv.wide {
     grid-template-columns: 110px 1fr auto;
+  }
+  /* The version row carries two controls (Check, Releases), so it needs a fourth column;
+     with the base three the second button wraps onto a row of its own. */
+  .kv.version {
+    grid-template-columns: 56px 1fr auto auto;
   }
   .kv .vval {
     display: inline-flex;

@@ -125,12 +125,10 @@ impl CertAuthority {
         Ok(())
     }
 
-    /// TLS server config presenting a leaf cert for `host`, signed by this CA.
-    pub fn server_config(&self, host: &str) -> Result<Arc<ServerConfig>> {
-        if let Some(cfg) = self.cache.lock().unwrap().get(host) {
-            return Ok(cfg);
-        }
-
+    /// Forge a leaf certificate for `host`, signed by the current root, with the key it
+    /// was issued for. Split out of [`Self::server_config`] so a test can look at the
+    /// certificate bytes without reaching through rustls.
+    fn forge_leaf(&self, host: &str) -> Result<(Certificate, KeyPair)> {
         let mut params = CertificateParams::new(vec![host.to_string()])?;
         params.distinguished_name.push(DnType::CommonName, host);
         params.key_usages = vec![
@@ -148,6 +146,16 @@ impl CertAuthority {
             let root = self.root.read().unwrap();
             params.signed_by(&key, &root.cert, &root.key)?
         };
+        Ok((leaf, key))
+    }
+
+    /// TLS server config presenting a leaf cert for `host`, signed by this CA.
+    pub fn server_config(&self, host: &str) -> Result<Arc<ServerConfig>> {
+        if let Some(cfg) = self.cache.lock().unwrap().get(host) {
+            return Ok(cfg);
+        }
+
+        let (leaf, key) = self.forge_leaf(host)?;
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
 
         let mut cfg = ServerConfig::builder()
@@ -196,10 +204,11 @@ fn generate_root() -> Result<(Certificate, KeyPair)> {
     params
         .distinguished_name
         .push(DnType::OrganizationName, crate::brand::NAME);
-    // Developer/author identifier, so a trusted root is traceable to its origin.
+    // Who issued this root, so a trusted CA in someone's store is traceable to its
+    // origin. Organisation only: see `brand::ORG_DOMAIN` for why nothing personal goes in.
     params
         .distinguished_name
-        .push(DnType::OrganizationalUnitName, crate::brand::DEVELOPER);
+        .push(DnType::OrganizationalUnitName, crate::brand::ORG_DOMAIN);
     params.key_usages = vec![
         KeyUsagePurpose::KeyCertSign,
         KeyUsagePurpose::CrlSign,
@@ -232,14 +241,46 @@ mod tests {
     }
 
     #[test]
-    fn generated_ca_embeds_the_developer_identifier() {
+    fn generated_ca_embeds_the_origin_identifier() {
         let dir = std::env::temp_dir().join(format!("intip-ca-dev-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        // The subject OU carries the developer id, which appears verbatim in the DER.
+        // The subject OU carries the organisation, which appears verbatim in the DER.
         let der = CertAuthority::load_or_create(&dir).unwrap().der().to_vec();
-        let needle = crate::brand::DEVELOPER.as_bytes();
-        assert!(der.windows(needle.len()).any(|w| w == needle), "CA should carry the developer identifier {}", crate::brand::DEVELOPER);
+        let needle = crate::brand::ORG_DOMAIN.as_bytes();
+        assert!(
+            der.windows(needle.len()).any(|w| w == needle),
+            "CA subject should carry {}",
+            crate::brand::ORG_DOMAIN
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A forged leaf is signed with params rebuilt from `ca.pem` by `from_ca_cert_pem`,
+    /// so its issuer DN comes out of that round trip. Anything lost there would stop the
+    /// issuer matching the root's subject, and every chain would fail to verify.
+    #[test]
+    fn a_reloaded_ca_issues_leaves_under_the_same_subject() {
+        let dir = std::env::temp_dir().join(format!("intip-ca-dn-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Generate, then load again: the second instance goes through
+        // `from_ca_cert_pem`, which is where an unrecognised attribute would be lost.
+        let _ = CertAuthority::load_or_create(&dir).unwrap();
+        let reloaded = CertAuthority::load_or_create(&dir).unwrap();
+        let (leaf, _) = reloaded.forge_leaf("example.com").unwrap();
+        let leaf_der = leaf.der().to_vec();
+
+        // The leaf's issuer is a copy of the root's subject, so each attribute of it has
+        // to be in here verbatim.
+        for id in [crate::brand::NAME, crate::brand::ORG_DOMAIN] {
+            let needle = id.as_bytes();
+            assert!(
+                leaf_der.windows(needle.len()).any(|w| w == needle),
+                "leaf issuer should still carry {id} after a reload"
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

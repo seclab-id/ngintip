@@ -3,6 +3,7 @@
 // runtime errors that `vite build` can't see. Not a substitute for trying the app.
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, tick, unmount } from 'svelte';
+import { repeaterPref, variantPref } from './lib/viewprefs.svelte.js';
 
 const listeners = {};
 const calls = [];
@@ -17,7 +18,17 @@ const sent = [];
 const savedAs = [];
 const existing = new Set();
 // Fake proxy listeners (the backend returns the full status list from every mutation).
-let mockListeners = [{ id: 'default', host: '0.0.0.0', port: 8080, enabled: true, running: true }];
+// The backend classifies each bind address (see `Exposure` in commands.rs); mirror the
+// rule here so the fake status list has the same shape as the real one.
+const exposureOf = (host) => {
+  const h = String(host ?? '').trim();
+  if (h === '' || h === '*' || h === '0.0.0.0' || h === '::') return 'all';
+  if (h === 'localhost' || h === '::1' || h.startsWith('127.')) return 'local';
+  if (h === '10.8.0.6') return 'tunnel'; // the fake VPN address used by one test
+  return 'lan';
+};
+const withExposure = (l) => ({ ...l, exposure: exposureOf(l.host) });
+let mockListeners = [{ id: 'default', host: '0.0.0.0', port: 8080, enabled: true, running: true, exposure: 'all' }];
 // Fake Organizer: the backend owns it (src-tauri/src/organizer.rs); same ops and rules.
 const org = { rev: 0, collections: [], activeId: null };
 let orgSeq = 0;
@@ -130,9 +141,14 @@ const backend = {
   cancel_send: () => true,
   repeater_history: ({ tab }) => sent.filter((e) => e.tabId === tab).map((e) => ({ ...e, responseRaw: '' })),
   repeater_entry: ({ id }) => sent.find((e) => e.id === id),
+  intruder_results: () => [],
+  intruder_result: () => null,
+  intruder_save_results: () => null,
+  clear_intruder_results: () => null,
   clear_repeater_history: () => null,
   project_info: () => ({ name: 'demo', path: '/tmp/demo.intip' }),
   blank_project: () => ({ name: 'scratch', path: '' }),
+  open_project: ({ path }) => ({ name: String(path).split('/').pop().replace(/\.ngintip$/, ''), path }),
   save_project_as: ({ path }) => (savedAs.push(path), { name: 'demo', path: '/tmp/demo.ngintip', rawSize: 1048576, compressedSize: 131072, percent: 88, summary: '1.0 MB -> 128.0 KB (88% smaller)' }),
   default_project_dir: () => '/Users/me/Documents/Ngintip',
   path_exists: ({ path }) => existing.has(path),
@@ -160,11 +176,14 @@ const backend = {
   intercept_status: () => ({ enabled: true, responses: false, pending: [] }),
   list_listeners: () => mockListeners,
   start_listeners: () => (mockListeners = mockListeners.map((l) => (l.enabled ? { ...l, running: true } : l))),
+  // Per-project listeners; this fake has one project, so it behaves like start_listeners.
+  sync_listeners: () => (mockListeners = mockListeners.map((l) => (l.enabled ? { ...l, running: true } : l))),
   stop_listeners: () => (mockListeners = mockListeners.map((l) => ({ ...l, running: false }))),
-  add_listener: ({ host, port }) => (mockListeners = [...mockListeners, { id: `l${mockListeners.length + 1}`, host, port, enabled: true, running: true }]),
+  add_listener: ({ host, port }) =>
+    (mockListeners = [...mockListeners, withExposure({ id: `l${mockListeners.length + 1}`, host, port, enabled: true, running: true })]),
   remove_listener: ({ id }) => (mockListeners = mockListeners.filter((l) => l.id !== id)),
   set_listener_enabled: ({ id, enabled }) => (mockListeners = mockListeners.map((l) => (l.id === id ? { ...l, enabled, running: enabled } : l))),
-  update_listener: ({ id, host, port }) => (mockListeners = mockListeners.map((l) => (l.id === id ? { ...l, host, port } : l))),
+  update_listener: ({ id, host, port }) => (mockListeners = mockListeners.map((l) => (l.id === id ? withExposure({ ...l, host, port }) : l))),
   set_host_overrides: () => null,
   organizer_state: () => structuredClone(org),
   organizer_op: ({ action }) => orgApply(action),
@@ -240,9 +259,16 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(), save: vi.fn() }));
 const { open: openDialog, save: saveDialog } = await import('@tauri-apps/plugin-dialog');
 
 const { BRAND } = await import('./lib/brand.js');
+const { PANE_ATTR, LOCK_ATTR } = await import('./lib/dragselect.js');
 const APP_VERSION = BRAND.version; // from package.json, like the UI
 const { default: App } = await import('./App.svelte');
 const { store } = await import('./lib/store.svelte.js');
+
+/** Calls to one command, with their arguments (the `calls` array holds names only). */
+async function invokeCallsForImpl(name) {
+  const { invoke } = await import('@tauri-apps/api/core');
+  return invoke.mock.calls.filter((c) => c[0] === name);
+}
 
 async function settle() {
   for (let i = 0; i < 10; i++) {
@@ -295,12 +321,147 @@ beforeAll(async () => {
 });
 afterAll(() => unmount(app));
 
+/** Put both message panes on a stated version. Each pane remembers the version last
+ *  chosen (that is the point of it), so a test that depends on seeing the wire must ask
+ *  for the wire rather than inherit whatever the previous test clicked. */
+function onVariant(id = 'final') {
+  variantPref.req.pick(id);
+  variantPref.res.pick(id);
+  repeaterPref.req.pick('typed');
+  repeaterPref.res.pick('final');
+}
+
+/** Open the Organizer on a given tab. The tab is remembered between visits (that is
+ *  the point of it), so a test that depends on one must say so rather than inherit
+ *  whatever the previous test left behind. */
+async function openOrganizer(which = 'collections') {
+  store.view = 'organizer';
+  await settle();
+  const label = which === 'notes' ? 'Notes' : 'Collections';
+  const btn = $$('.organizer .tab').find((b) => b.textContent.trim().startsWith(label));
+  if (btn && !btn.classList.contains('active')) await click(btn);
+  await settle();
+}
+
 describe('UI smoke test', () => {
   it('loads History with flows, project and LAN warning', () => {
     expect($$('.table .row:not(.head)').length).toBe(3);
     expect(text()).toContain('api.example.com');
     expect(text()).toContain('demo');
-    expect(text()).toContain('LAN · no auth');
+    expect(text()).toContain('All interfaces · no auth');
+  });
+
+  it('renders the startup update dialog and closes on Remind me later', async () => {
+    // The check itself is covered in lib/store.update.test.js; this proves the dialog
+    // actually mounts and is wired to the store.
+    Object.assign(store.update, { latest: '99.0.0', newer: true, name: 'Ngintip 99.0.0' });
+    store.updatePrompt = true;
+    await settle();
+    const dlg = $('[role="dialog"]');
+    expect(dlg.textContent).toContain('Update available');
+    expect(dlg.textContent).toContain(`v${APP_VERSION}`);
+    expect(dlg.textContent).toContain('v99.0.0');
+    expect(dlg.textContent).toContain('Ngintip 99.0.0');
+
+    await click(buttonWith('Remind me later'));
+    expect(store.updatePrompt).toBe(false);
+    expect($('[role="dialog"]')).toBeFalsy();
+    Object.assign(store.update, { latest: APP_VERSION, newer: false, name: '' });
+  });
+
+  it('warns for a wildcard or VPN bind, but not for a plain LAN one', async () => {
+    const set = async (host, exposure) => {
+      store.listeners = [{ id: 'default', host, port: 8080, enabled: true, running: true, exposure }];
+      await settle();
+    };
+
+    // Every interface: the reach includes networks that are not up yet.
+    await set('0.0.0.0', 'all');
+    expect(store.exposure).toBe('all');
+    expect(text()).toContain('All interfaces');
+
+    // A VPN address: the far side of the tunnel can reach the proxy.
+    await set('10.8.0.6', 'tunnel');
+    expect(store.exposure).toBe('tunnel');
+    expect(text()).toContain('VPN');
+    expect(text()).not.toContain('All interfaces');
+
+    // A deliberate LAN bind is how you drive the proxy from a phone. No warning.
+    await set('192.168.1.5', 'lan');
+    expect(store.exposure).toBe(null);
+    expect($('.exposed')).toBeFalsy();
+
+    await set('127.0.0.1', 'local');
+    expect(store.exposure).toBe(null);
+    expect($('.exposed')).toBeFalsy();
+
+    // A listener that is configured but not running cannot expose anything.
+    store.listeners = [{ id: 'default', host: '0.0.0.0', port: 8080, enabled: true, running: false, exposure: 'all' }];
+    await settle();
+    expect(store.exposure).toBe(null);
+
+    // The most severe wins when several are up.
+    store.listeners = [
+      { id: 'a', host: '192.168.1.5', port: 8080, enabled: true, running: true, exposure: 'lan' },
+      { id: 'b', host: '10.8.0.6', port: 8081, enabled: true, running: true, exposure: 'tunnel' },
+      { id: 'c', host: '0.0.0.0', port: 8082, enabled: true, running: true, exposure: 'all' },
+    ];
+    await settle();
+    expect(store.exposure).toBe('all');
+    expect(store.exposedListener.id).toBe('c');
+
+    store.listeners = mockListeners;
+    await settle();
+  });
+
+  it('opens Settings on the proxy listener section from the status pill', async () => {
+    // The pill is where someone reads "Listening on ...", so it is where they click
+    // when they want to change it. It works stopped too: that is when you most want it.
+    await click($('.status'));
+    expect(store.view).toBe('settings');
+    expect($('.sub-nav-item.active').textContent).toContain('Proxy listener');
+    expect(store.settingsSection).toBe(null);
+    store.view = 'history';
+    await settle();
+  });
+
+  it('opens Settings on the proxy listener section from the exposure warning', async () => {
+    await click($('.exposed'));
+    expect(store.view).toBe('settings');
+    expect($('.sub-nav-item.active').textContent).toContain('Proxy listener');
+    // The deep-link is consumed, so the section stays put afterwards.
+    expect(store.settingsSection).toBe(null);
+    store.view = 'history';
+    await settle();
+  });
+
+  it('a drag in one message pane does not select through the other', async () => {
+    // Request and response are two panes of one document, so a drag that leaves the
+    // pane used to keep selecting into its neighbour and copy both messages.
+    await click($$('.table .row:not(.head)')[0]);
+    await settle();
+
+    const panes = $$('[data-msgpane]');
+    expect(panes.length).toBe(2); // request and response, and the attribute is spelled
+    expect(PANE_ATTR).toBe('data-msgpane'); // ...the same as the module's selector
+
+    const [req, res] = panes;
+    const lockedPanes = () => panes.map((p) => p.hasAttribute(LOCK_ATTR));
+    expect(lockedPanes()).toEqual([false, false]);
+
+    // Press inside the response pane: the request pane goes unselectable for the drag.
+    res.querySelector('pre.code').dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+    expect(lockedPanes()).toEqual([true, false]);
+
+    // Releasing anywhere gives it back, so later clicks and copies still work.
+    window.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));
+    expect(lockedPanes()).toEqual([false, false]);
+
+    // A drag interrupted by the system (pointercancel) must release it too.
+    res.querySelector('pre.code').dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+    expect(req.hasAttribute(LOCK_ATTR)).toBe(true);
+    window.dispatchEvent(new MouseEvent('pointercancel', { bubbles: true }));
+    expect(req.hasAttribute(LOCK_ATTR)).toBe(false);
   });
 
   it('toggles History columns from the Advanced panel (persisted per project)', async () => {
@@ -385,7 +546,57 @@ describe('UI smoke test', () => {
     expect($$('.msgs .panel')[0].querySelector('.modes.variants')).toBeNull();
   });
 
+  it('remembers the version per pane, and falls back to the wire', async () => {
+    onVariant('final');
+    store.view = 'history';
+    await settle();
+    const open = async (path) => {
+      await click($$('.table .row:not(.head)').find((r) => r.textContent.includes(path)));
+      return $$('.msgs .panel');
+    };
+    const activeOf = (panel) => panel.querySelector('.modes.variants .mode.active')?.textContent.trim();
+    const tab = (panel, label) =>
+      [...panel.querySelectorAll('.modes.variants .mode')].find((b) => b.textContent.trim() === label);
+
+    // Flow 2 has an Original request and a decoded (Extension) response. Opened cold,
+    // both panes show the wire, because that is the first-run default.
+    let panels = await open('/v1/login');
+    expect([activeOf(panels[0]), activeOf(panels[1])]).toEqual(['Wire', 'Wire']);
+
+    // Pick Original on the REQUEST. The response pane must not follow: they are
+    // different messages, and this is the whole point of keeping them apart.
+    await click(tab(panels[0], 'Original'));
+    expect([activeOf($$('.msgs .panel')[0]), activeOf($$('.msgs .panel')[1])]).toEqual(['Original', 'Wire']);
+
+    // Both choices survive leaving the flow and coming back.
+    await click(tab($$('.msgs .panel')[1], 'Extension'));
+    await open('/v1/users');
+    panels = await open('/v1/login');
+    expect([activeOf(panels[0]), activeOf(panels[1])]).toEqual(['Original', 'Extension']);
+    expect(panels[0].querySelector('pre.code').textContent).toContain('/v1/login-ORIGINAL');
+    expect(panels[1].querySelector('pre.code').textContent.replace(/\s+/g, '')).toContain('"decoded":true');
+
+    // Each pane has its own key, so neither can overwrite the other.
+    expect(localStorage.getItem('ngintip.message.variant.req')).toBe('original');
+    expect(localStorage.getItem('ngintip.message.variant.res')).toBe('decoded');
+
+    // The request pane remembers Original, but this flow's response has none, so that
+    // pane falls back to the wire rather than showing a version that does not exist.
+    variantPref.res.pick('original');
+    await open('/v1/users');
+    panels = await open('/v1/login');
+    expect(activeOf(panels[1])).toBe('Wire');
+
+    // Choosing the wire again is a choice too, and is remembered.
+    await click(tab($$('.msgs .panel')[0], 'Wire'));
+    await open('/v1/users');
+    panels = await open('/v1/login');
+    expect(activeOf(panels[0])).toBe('Wire');
+    onVariant('final');
+  });
+
   it('offers a decoded extension view alongside the real wire message', async () => {
+    onVariant('final');
     store.view = 'history';
     await settle();
     const row2 = $$('.table .row:not(.head)').find((r) => r.textContent.includes('/v1/login'));
@@ -432,6 +643,8 @@ describe('UI smoke test', () => {
   });
 
   it('opening a passive finding highlights its match in the right pane', async () => {
+    // A finding is about the bytes on the wire, so the wire is what has to be shown.
+    onVariant('final');
     // Flow #2's response contains "sid=abc123" (Set-Cookie). Jump to it as a finding.
     store.showFinding(2, { where: 'response', match: 'sid=abc123' });
     await settle();
@@ -583,6 +796,75 @@ describe('UI smoke test', () => {
     await settle();
     store.view = 'history';
     await settle();
+  });
+
+  it('Repeater remembers Typed/Sent and Final/Original, per pane and per send', async () => {
+    // A send a repeater-scope extension transformed: the request that left differs from
+    // the one typed, and the reply was made readable after it arrived.
+    const orig = backend.send_raw;
+    backend.send_raw = () => ({
+      status: 200,
+      durationMs: 1,
+      length: 2,
+      responseRaw: 'HTTP/1.1 200 OK\n\nDECODED-BODY',
+      responseImage: null,
+      requestFinal: 'GET /?q=ENCRYPTED HTTP/1.1\nHost: x\n\n',
+      responseOriginal: 'HTTP/1.1 200 OK\n\nENCRYPTED-BODY',
+    });
+    const rep = store.repeater;
+    const before = { ids: rep.tabs.map((t) => t.id), activeId: rep.activeId };
+    try {
+      store.view = 'repeater';
+      await settle();
+      const first = rep.tabs.find((t) => t.id === rep.activeId);
+      const restore = { raw: first.raw, target: first.target, response: first.response };
+      first.target = 'https://x';
+      first.raw = 'GET /a HTTP/1.1\nHost: x\n\n';
+      await store.sendRepeater(first);
+      await settle();
+
+      const segs = (sel) => [...$$(`.repeater ${sel} .seg`)];
+      const activeIn = (sel) => segs(sel).find((b) => b.classList.contains('on'))?.textContent.trim();
+      const reqSeg = '.ext-seg:not(.res)';
+      const resSeg = '.ext-seg.res';
+
+      // Both segments appear, each on its own default: the editable request and the
+      // readable reply, which is what you work in.
+      expect([activeIn(reqSeg), activeIn(resSeg)]).toEqual(['Typed', 'Final']);
+
+      // Switch the REQUEST only. The response pane must not follow.
+      await click(segs(reqSeg).find((b) => b.textContent.trim() === 'Sent'));
+      expect([activeIn(reqSeg), activeIn(resSeg)]).toEqual(['Sent', 'Final']);
+      expect($('.repeater .sent-req').textContent).toContain('ENCRYPTED');
+      await click(segs(resSeg).find((b) => b.textContent.trim() === 'Original'));
+      expect(activeIn(resSeg)).toBe('Original');
+
+      // A second tab with no send of its own has nothing to switch to, so it falls back
+      // rather than claiming a version it does not have.
+      store.addRepeaterTab({ name: 'b', target: 'https://x', raw: 'GET /b HTTP/1.1\nHost: x\n\n' });
+      await settle();
+      expect($(`.repeater ${reqSeg}`)).toBeFalsy();
+      expect($(`.repeater ${resSeg}`)).toBeFalsy();
+
+      // Back to the tab that was sent: both choices are still there.
+      rep.activeId = first.id;
+      await settle();
+      expect([activeIn(reqSeg), activeIn(resSeg)]).toEqual(['Sent', 'Original']);
+
+      // Written to storage under their own keys, so neither pane can overwrite the other.
+      expect(localStorage.getItem('ngintip.repeater.requestView')).toBe('sent');
+      expect(localStorage.getItem('ngintip.repeater.responseView')).toBe('original');
+      // Put the Repeater back exactly as it was: the extra tab and the sent response
+      // are this test's mess, and the next test counts tabs.
+      rep.tabs = rep.tabs.filter((t) => before.ids.includes(t.id));
+      rep.activeId = before.activeId;
+      Object.assign(first, restore);
+    } finally {
+      backend.send_raw = orig;
+      onVariant('final');
+      store.view = 'history';
+      await settle();
+    }
   });
 
   it('Repeater request pane has a right-click menu (send / copy)', async () => {
@@ -857,6 +1139,349 @@ describe('UI smoke test', () => {
     await click(buttonWith('Forward + response'));
     expect(calls).toContain('intercept_forward');
     expect(store.intercept.queue.length).toBe(1);
+  });
+
+  it('nudges the Intercept pill while traffic is actually held', async () => {
+    store.view = 'intercept';
+    // State the precondition instead of inheriting it: an earlier test leaves a held
+    // message behind, and "nothing is held" is the whole first half of this check.
+    store.intercept.queue = [];
+    store.wsIntercept.queue = [];
+    const pill = () => [...document.querySelectorAll('.intercept')].find((el) => el.tagName === 'BUTTON');
+    await settle();
+    expect(store.intercept.enabled).toBe(true);
+    expect(pill()?.classList.contains('holding')).toBe(false); // on, but nobody is waiting
+
+    listeners.intercept({ payload: { key: 31, id: 41, phase: 'request', method: 'GET', scheme: 'https', host: 'c.com', path: '/held', status: null, raw: 'GET /held HTTP/1.1\nHost: c.com\n\n' } });
+    await settle();
+    expect(pill()?.classList.contains('holding')).toBe(true);
+    expect(pill()?.title).toContain('1 message held');
+
+    // Forwarding the last held message stops the nudge: the point is "someone is
+    // waiting on you", not "intercept is on".
+    store.selectHeld(31);
+    await settle();
+    await click(buttonWith('Forward'));
+    await settle();
+    expect(store.intercept.queue.length).toBe(0);
+    expect(pill()?.classList.contains('holding')).toBe(false);
+  });
+
+  // Both ways out of a project must clear the same things, and the field reported from
+  // the wild (Intruder) is only one of them. Driven with a view MOUNTED, because
+  // App.svelte unmounts every view under `{#if store.chooser}`: a switch taken through
+  // the chooser hides a stale object reference, and File > New / File > Open does not.
+  const plantClientA = () => {
+    store.intruder.tabs[0].name = 'client-A-login';
+    store.intruder.tabs[0].target = 'https://a.example';
+    store.intruder.tabs[0].raw = 'POST /login HTTP/1.1\nCookie: sid=A\n\nuser=§admin§';
+    store.intruder.tabs[0].results = [{ status: 200, text: 'A response', payloads: ['admin'] }];
+    store.comparer.items = [{ id: 1, label: 'A', text: 'A response body' }];
+    store.decoder.input = 'clientA-token';
+    store.decoder.output = 'decoded-A';
+    store.filter = 'a.example';
+    store.pendingFinding = { flowId: 9, where: 'response', match: 'secret-A' };
+    store.intercept.draft = 'POST /pay HTTP/1.1 (client A)';
+    store.extensions.log = 'venv built for client A';
+  };
+  const expectClientAGone = () => {
+    expect(store.intruder.tabs).toHaveLength(1);
+    expect(store.intruder.tabs[0].name).not.toBe('client-A-login');
+    expect(store.intruder.tabs[0].raw).not.toContain('sid=A');
+    expect(store.intruder.tabs[0].results).toEqual([]);
+    expect(store.comparer.items).toEqual([]);
+    expect(store.decoder.input).toBe('');
+    expect(store.decoder.output).toBe('');
+    expect(store.filter).toBe('');
+    expect(store.pendingFinding).toBeNull();
+    expect(store.intercept.draft).toBe('');
+    expect(store.extensions.log).toBe('');
+    // The mounted Intruder view must be showing the cleared object, not still holding a
+    // reference to the one the previous project was using. The node has to be asserted
+    // present first: `?? ''` would pass silently if the view failed to render at all.
+    const view = document.querySelector('.intruder');
+    expect(view).not.toBeNull();
+    expect(view.textContent).not.toContain('client-A-login');
+  };
+  // Things that MUST survive a project switch: losing them means the operator sets their
+  // workstation up again, which is a different kind of wrong from leaking client data.
+  // Plant values a careless reset block would plausibly eat. Asserting defaults proves
+  // nothing: `update.prompted` reset means the update dialog reappears on every switch,
+  // and `browser.path` reset means downloading Chromium again.
+  const plantWorkstation = () => {
+    const before = { update: { ...store.update }, browser: { ...store.browser }, hostOverrides: store.hostOverrides.slice() };
+    store.update = { ...store.update, latest: '9.9.9', newer: true, prompted: true };
+    store.browser = { ...store.browser, path: '/opt/chrome', flags: '--no-sandbox' };
+    store.hostOverrides = [{ host: 'a.example', ip: '1.2.3.4' }];
+    // These are app-wide by design, so they survive the switch under test AND would
+    // survive into the next test if this did not put them back.
+    return () => {
+      store.update = before.update;
+      store.browser = before.browser;
+      store.hostOverrides = before.hostOverrides;
+    };
+  };
+  const expectWorkstationKept = (before) => {
+    expect(store.theme).toBe(before.theme);
+    expect(store.update.prompted).toBe(true);
+    expect(store.update.latest).toBe('9.9.9');
+    expect(store.browser.path).toBe('/opt/chrome');
+    expect(store.browser.flags).toBe('--no-sandbox');
+    expect(store.hostOverrides).toEqual([{ host: 'a.example', ip: '1.2.3.4' }]);
+    expect(store.theme).toBe(before.theme);
+  };
+
+  it('an attack that outlives its project does not write results into the next one', async () => {
+    // The attack loop holds the old tab object, so without a teardown it keeps firing at
+    // the previous client's target and then saves its rows into whichever project is open
+    // when it finishes. A gate holds every send until the switch has happened, so the
+    // race is the test rather than a matter of timing.
+    const original = backend.intruder_send;
+    let release;
+    const gate = new Promise((r) => (release = r));
+    backend.intruder_send = async () => {
+      await gate;
+      return { status: 200, length: 3, durationMs: 1, responseRaw: 'HTTP/1.1 200 OK\n\nfromA' };
+    };
+    const repeater = { ...store.repeater, tabs: store.repeater.tabs.slice() };
+    try {
+      const tab = store.intruder.tabs[0];
+      tab.raw = 'GET /a HTTP/1.1\nHost: a.example\n\n';
+      tab.sets = [{ type: 'null', nul: { count: 3 } }];
+      const attack = store.startAttack(tab);
+      await settle();
+      expect(tab.running).toBe(true);
+
+      await store.blankProject(); // the project changes mid-attack
+      release();
+      await attack;
+      await settle();
+
+      expect(tab.running, 'the attack kept running after the project changed').toBe(false);
+      const saves = await invokeCallsForImpl('intruder_save_results');
+      expect(saves.length, "the previous project's attack results were written into the new project").toBe(0);
+    } finally {
+      backend.intruder_send = original;
+      store.repeater = repeater;
+    }
+  });
+
+  it('re-checks the release version on demand, and says what it found', async () => {
+    // The automatic check runs once per session, so without a way to force it the row
+    // just sits there. A button that can silently do nothing is worse than none.
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ tag_name: 'v9.9.9', name: 'Big one', html_url: 'https://example/r' }) });
+    try {
+      store.view = 'settings';
+      store.settingsSection = 'project';
+      await settle();
+      const btn = buttonWith('Check');
+      expect(btn, 'no Check button in Settings > Project').toBeTruthy();
+
+      await click(btn);
+      await settle();
+      expect(store.update.latest).toBe('9.9.9');
+      expect(store.update.newer).toBe(true);
+      expect(text()).toContain('9.9.9');
+    } finally {
+      globalThis.fetch = realFetch;
+      store.update = { ...store.update, latest: null, newer: false, checked: false, name: '' };
+    }
+  });
+
+  it('fetches a stored attack row\'s request and response when it is opened', async () => {
+    // The list read omits the bodies on purpose, so a stored row arrives with EMPTY
+    // STRINGS in their place. Treating "has bodies" as "not null" meant the fetch never
+    // ran and every stored row showed "Request not kept for this row".
+    const original = backend.intruder_result;
+    backend.intruder_result = ({ tab, n }) => ({
+      n,
+      payloads: [],
+      status: 200,
+      length: 5,
+      timeMs: 7,
+      error: null,
+      requestRaw: `GET /${tab}/${n} HTTP/1.1\n\n`,
+      responseRaw: 'HTTP/1.1 200 OK\n\nbody',
+      requestFinal: '',
+      responseOriginal: '',
+    });
+    try {
+      const tab = store.intruder.tabs[0];
+      // Exactly what the backend's list read returns.
+      tab.results = [{ n: 1, payloads: [], status: 200, length: 5, timeMs: 7, error: null, requestRaw: '', responseRaw: '', requestFinal: '', responseOriginal: '' }];
+      await store.loadIntruderResult(tab, 1);
+      expect(tab.results[0].requestRaw).toContain('GET /');
+      expect(tab.results[0].responseRaw).toContain('200 OK');
+
+      // Fetched once: a second open must not go back to the backend.
+      const before = calls.filter((c) => c === 'intruder_result').length;
+      await store.loadIntruderResult(tab, 1);
+      expect(calls.filter((c) => c === 'intruder_result').length).toBe(before);
+      tab.results = [];
+    } finally {
+      backend.intruder_result = original;
+    }
+  });
+
+  it('saves the Intruder attack setup with the project, but never its results', async () => {
+    // Intruder used to live only in memory, which is why it appeared to survive a project
+    // switch: what you saw was the previous project's, not yours. Now it is per-project
+    // like Repeater. Results are deliberately excluded: up to KEEP_RESPONSES full bodies
+    // per tab is how a project file reaches hundreds of megabytes.
+    const { invoke } = await import('@tauri-apps/api/core');
+    store.view = 'intruder';
+    await settle();
+    const tab = store.intruder.tabs[0];
+    tab.name = 'login-bruteforce';
+    tab.target = 'https://target.example';
+    tab.raw = 'POST /login HTTP/1.1\n\nuser=§admin§';
+    tab.type = 'cluster';
+    tab.concurrency = 4;
+    tab.results = [{ status: 200, text: 'a very large response body', payloads: ['admin'] }];
+    store.saveIntruder();
+    await new Promise((r) => setTimeout(r, 450)); // past the 400ms debounce
+    await settle();
+
+    const write = invoke.mock.calls.filter((c) => c[0] === 'set_setting' && c[1]?.key === 'intruder').at(-1);
+    expect(write, 'nothing was saved under the `intruder` key').toBeTruthy();
+    const saved = write[1].value.tabs[0];
+    expect(saved.name).toBe('login-bruteforce');
+    expect(saved.target).toBe('https://target.example');
+    expect(saved.raw).toContain('§admin§');
+    expect(saved.type).toBe('cluster');
+    expect(saved.concurrency).toBe(4);
+    expect(saved.results, 'response bodies were persisted into the project').toBeUndefined();
+    expect(saved.running).toBeUndefined();
+    expect(saved.rawMode).toBeUndefined();
+  });
+
+  it('a new project does not inherit the previous one\'s session state', async () => {
+    store.view = 'intruder';
+    await settle();
+    plantClientA();
+    const restoreWorkstation = plantWorkstation();
+    await settle();
+    const before = { theme: store.theme };
+    // blankProject legitimately resets per-project state too (Repeater tabs and the
+    // rest), so this restores it: the leak under test is session state, not that.
+    const repeater = { ...store.repeater, tabs: store.repeater.tabs.slice() };
+
+    await store.blankProject();
+    await settle();
+
+    expectClientAGone();
+    expectWorkstationKept(before);
+    restoreWorkstation();
+    store.repeater = repeater;
+  });
+
+  it('opening another project does not inherit the previous one\'s session state', async () => {
+    // The second entry point. #switchProject is a hand-copied duplicate of blankProject's
+    // reset block, which is exactly how a fix lands in one path and misses the other.
+    store.view = 'intruder';
+    await settle();
+    plantClientA();
+    const restoreWorkstation = plantWorkstation();
+    await settle();
+    const before = { theme: store.theme };
+    const repeater = { ...store.repeater, tabs: store.repeater.tabs.slice() };
+
+    openDialog.mockResolvedValueOnce('/tmp/client-b.ngintip');
+    await store.openProject();
+    await settle();
+
+    await settle();
+    expectClientAGone();
+    expectWorkstationKept(before);
+    restoreWorkstation();
+    store.repeater = repeater;
+  });
+
+  it('a passive scan that outlives its project does not write into the next one', async () => {
+    // The scan accumulates findings for the project it started in and saves the whole
+    // accumulator at the end, so switching project mid-scan persisted client A's
+    // findings into client B's file. A gate holds every getFlow until the switch has
+    // happened, so the race is the test rather than a matter of timing.
+    const original = backend.get_flow;
+    let release;
+    const gate = new Promise((r) => (release = r));
+    backend.get_flow = async (args) => {
+      await gate;
+      return { ...original(args), responseRaw: 'HTTP/1.1 200 OK\nAccess-Control-Allow-Origin: *\n\n{"client":"A"}' };
+    };
+    const repeater = { ...store.repeater, tabs: store.repeater.tabs.slice() };
+    try {
+      const scan = store.scanPassive({ rescan: true });
+      await store.blankProject(); // the project changes while the scan is still running
+      release();
+      await scan;
+      await settle();
+      // Project B is empty, and that is what #loadPassiveConfig loaded for it.
+      expect(store.passiveFindings).toEqual([]);
+    } finally {
+      backend.get_flow = original;
+      store.repeater = repeater;
+    }
+  });
+
+  it('shows an MCP passive scan instead of overwriting it', async () => {
+    // passive_scan over MCP replaces the stored findings from the backend. The window
+    // kept its own copy, so the findings were invisible and the next passive action
+    // wrote the stale copy back over them.
+    const fromMcp = [{ key: '7|token|response|mcp-found', severity: 'high', flowId: 7, type: 'token', where: 'response', match: 'mcp-found' }];
+    const original = backend.get_setting;
+    backend.get_setting = (args) => (args?.key === 'passiveFindings' ? fromMcp : args?.key === 'passiveScanned' ? [7] : original(args));
+    try {
+      store.passiveFindings = [];
+      listeners.passive({ payload: { findings: 1, scanned: 1 } });
+      await settle();
+      expect(store.passiveFindings).toEqual(fromMcp);
+    } finally {
+      backend.get_setting = original;
+    }
+  });
+
+  it('picks up a scope change made over MCP', async () => {
+    // Worse than a stale display: deleteOutOfScope computes which flows to DELETE from
+    // the window's cached scope, so a stale copy decides what gets destroyed.
+    const original = backend.get_scope;
+    backend.get_scope = () => ['b.example'];
+    try {
+      store.scope = ['a.example'];
+      listeners.setting({ payload: { key: 'scope' } });
+      await settle();
+      expect(store.scope).toEqual(['b.example']);
+    } finally {
+      backend.get_scope = original;
+      store.scope = [];
+    }
+  });
+
+  it('extensions: the debug console can be filtered and selected', async () => {
+    const lines = ['[dgp] request DECRYPTED for display (key abc)', '{"msisdn":"62812"}', '[dgp] response has an encrypted body but no key yet'];
+    const original = backend.extension_logs;
+    backend.extension_logs = () => lines;
+    try {
+      store.view = 'extensions';
+      await settle();
+      const out = () => document.querySelector('.out.console');
+      expect(out()?.textContent).toContain('no key yet');
+
+      const find = document.querySelector('.log-find');
+      find.value = 'DECRYPTED';
+      find.dispatchEvent(new Event('input', { bubbles: true }));
+      await settle();
+      expect(out().textContent).toContain('DECRYPTED');
+      expect(out().textContent).not.toContain('no key yet');
+      expect(text()).toContain('1 of 3');
+
+      // Output meant to be pasted into a finding has to be selectable, even though the
+      // app disables selection globally (app.css sets user-select: none on body).
+      expect(out().classList.contains('pick')).toBe(true);
+    } finally {
+      backend.extension_logs = original;
+    }
   });
 
   it('intercept: colored phase tag and right-click send actions', async () => {
@@ -1397,7 +2022,7 @@ describe('UI smoke test', () => {
 
     // Proxy listener section.
     await click(navItem('Proxy listener'));
-    expect(text()).toContain('The proxy is reachable from the network');
+    expect(text()).toContain('This listener is on every interface');
     expect(text()).toContain('Invisible proxy');
 
     // Match & Replace section.
@@ -1628,6 +2253,7 @@ describe('UI smoke test', () => {
   });
 
   it('passively scans captured traffic for findings', async () => {
+    onVariant('final');
     store.view = 'passive';
     await settle();
     // Start clean (a background auto-scan may have run already).
@@ -2491,8 +3117,7 @@ describe('UI smoke test', () => {
   });
 
   it('organizer: sortable/searchable table, note modal, right-click label/colour/capture/move/send', async () => {
-    store.view = 'organizer';
-    await settle();
+    await openOrganizer();
     expect(text()).toContain('Organizer');
     store.addCollection('Targets');
     await settle();
@@ -2601,8 +3226,7 @@ describe('UI smoke test', () => {
   });
 
   it('organizer: Request/Response panes have a custom right-click menu, and Ctrl+R sends to Repeater', async () => {
-    store.view = 'organizer';
-    await settle();
+    await openOrganizer();
     await click($$('.organizer .col-item').find((b) => b.textContent.includes('Targets')));
     await settle();
     await click($$('.organizer .rbody .rrow')[0]);
@@ -2653,8 +3277,7 @@ describe('UI smoke test', () => {
   });
 
   it('context menu: nested "Move to" opens on hover / ArrowRight and closes when leaving it', async () => {
-    store.view = 'organizer';
-    await settle();
+    await openOrganizer();
     await click($$('.organizer .col-item').find((b) => b.textContent.includes('Targets')));
     $$('.organizer .rbody .rrow')[0].dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 12, clientY: 12 }));
     await settle();
@@ -2692,9 +3315,7 @@ describe('UI smoke test', () => {
   });
 
   it('organizer notes: two-pane editor saves as you type; delete asks first', async () => {
-    store.view = 'organizer';
-    await settle();
-    await click($$('.organizer .tab').find((b) => b.textContent.trim().startsWith('Notes')));
+    await openOrganizer('notes');
     expect(text()).toContain('No notes yet');
     await click(buttonWith('+ New note'));
     expect(store.organizer.notes.length).toBe(1);
@@ -2722,6 +3343,68 @@ describe('UI smoke test', () => {
     await click(buttonLabeled('Delete note'));
     await answer(true);
     expect(store.organizer.notes.length).toBe(0);
+  });
+
+  it('organizer notes: Preview renders markdown and never injects a saved payload', async () => {
+    await openOrganizer('notes');
+    await click(buttonWith('+ New note'));
+    const body = $('.neditor .ne-body');
+    body.value = [
+      '## IDOR on /orders',
+      '',
+      '- [x] reproduced',
+      '- [ ] write up',
+      '',
+      'payload: <img src=x onerror=alert(1)>',
+      '',
+      'see https://target.test/policy',
+    ].join('\n');
+    body.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+
+    // Write mode is a plain textarea: no rendering, so the caret behaves normally.
+    expect($('.neditor .md')).toBeFalsy();
+
+    await click(buttonWith('Preview'));
+    const rendered = $('.neditor .md');
+    expect(rendered).toBeTruthy();
+    expect(rendered.querySelector('h2').textContent).toBe('IDOR on /orders');
+    expect(rendered.querySelectorAll('li.md-task input[type="checkbox"]').length).toBe(2);
+    expect(rendered.querySelector('li.md-task input').disabled).toBe(true);
+    // The saved XSS payload is text in the DOM, not an element.
+    expect(rendered.querySelector('img')).toBeNull();
+    expect(rendered.textContent).toContain('<img src=x onerror=alert(1)>');
+    // Links are rendered, with the href intact for the click handler to open.
+    expect(rendered.querySelector('a[href]').getAttribute('href')).toBe('https://target.test/policy');
+
+    // Back to Write, and the textarea still holds the source untouched.
+    await click(buttonWith('Write'));
+    expect($('.neditor .ne-body').value).toContain('onerror=alert(1)');
+
+    await click(buttonLabeled('Delete note'));
+    await answer(true);
+  });
+
+  it('organizer: comes back to the tab you left it on', async () => {
+    const activeTab = () => $('.organizer .tab.active')?.textContent.trim().split(/\s/)[0];
+
+    // Leave it on Notes, go elsewhere, come back: still Notes.
+    await openOrganizer('notes');
+    expect(activeTab()).toBe('Notes');
+    store.view = 'history';
+    await settle();
+    store.view = 'organizer';
+    await settle();
+    expect(activeTab()).toBe('Notes');
+
+    // And the other way round, so it is remembering rather than just defaulting.
+    await openOrganizer('collections');
+    expect(activeTab()).toBe('Collections');
+    store.view = 'history';
+    await settle();
+    store.view = 'organizer';
+    await settle();
+    expect(activeTab()).toBe('Collections');
   });
 
   it('intruder: right-click a tab to save it to the Organizer', async () => {
@@ -2912,7 +3595,7 @@ describe('UI smoke test', () => {
 
     // Opening it in the Organizer shows the run as a table; picking a row drives the panes.
     const col = store.organizer.collections.find((c) => c.items.some((i) => i.id === rec.id));
-    store.view = 'organizer';
+    await openOrganizer();
     store.viewCollection(col.id);
     await settle();
     const savedRow = $$('.organizer .rbody .rrow').find((el) => el.textContent.includes('2 results'));
@@ -3117,8 +3800,7 @@ describe('UI smoke test', () => {
   });
 
   it('organizer: edits made over MCP show up live, and an older state is ignored', async () => {
-    store.view = 'organizer';
-    await settle();
+    await openOrganizer();
     store.viewCollection(store.organizer.activeId);
     await settle();
     // The MCP server saves into the active collection behind the UI's back...
@@ -3143,8 +3825,7 @@ describe('UI smoke test', () => {
     const itemId = await store.saveRequestToCollection({ name: '/keep-me', method: 'GET', host: 'h', path: '/keep-me', request: 'GET /keep-me HTTP/1.1\r\nHost: h\r\n\r\n', response: '', source: 'history' });
     const col = store.organizer.collections.find((c) => c.items.some((it) => it.id === itemId));
     store.viewCollection(col.id);
-    store.view = 'organizer';
-    await settle();
+    await openOrganizer();
     const row = () => $$('.organizer .rbody .rrow').find((r) => r.textContent.includes('/keep-me'));
     const rowDelete = async () => {
       row().dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 10, clientY: 10 }));

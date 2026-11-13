@@ -119,11 +119,8 @@ pub fn response_text_for_processing(f: &Flow) -> String {
 
 fn proc_message(start_line: &str, headers: &[(String, String)], body: &[u8]) -> String {
     let decoded = decode_body(headers, body);
-    let mut out = String::with_capacity(256 + decoded.len());
-    out.push_str(start_line);
-    out.push('\n');
-    write_headers(&mut out, headers);
-    out.push('\n');
+    let mut out = message_head(start_line, headers);
+    out.reserve(decoded.len());
     out.push_str(&String::from_utf8_lossy(&decoded));
     out
 }
@@ -194,13 +191,118 @@ fn write_headers(out: &mut String, headers: &[(String, String)]) {
 }
 
 fn render(start_line: &str, headers: &[(String, String)], body: &[u8], full: bool) -> String {
-    let mut out = String::with_capacity(256 + body.len().min(if full { body.len() } else { VIEW_LIMIT }));
+    let mut out = message_head(start_line, headers);
+    out.reserve(body.len().min(if full { body.len() } else { VIEW_LIMIT }));
+    out.push_str(&body_text_impl(headers, body, full));
+    out
+}
+
+/// Start line, header lines, and the blank line that ends them: a message with no body.
+///
+/// This is the one definition of a message head, so a headers-only read cannot disagree
+/// with the same message read whole. That matters because `write_headers` folds several
+/// `Cookie` fields into a single line, which is exactly the header an authorization test
+/// is reading.
+pub fn message_head(start_line: &str, headers: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(256);
     out.push_str(start_line);
     out.push('\n');
     write_headers(&mut out, headers);
     out.push('\n');
-    out.push_str(&body_text_impl(headers, body, full));
     out
+}
+
+pub fn request_head(f: &Flow) -> String {
+    message_head(&format!("{} {} {}", f.summary.method, f.summary.path, f.version), &f.req_headers)
+}
+
+/// Response head, or `None` when the request never got a response.
+pub fn response_head(f: &Flow) -> Option<String> {
+    if f.res_version.is_empty() {
+        return None;
+    }
+    let start = format!("{} {} {}", f.res_version, f.summary.status, f.res_reason);
+    Some(message_head(start.trim_end(), &f.res_headers))
+}
+
+/// Part of a decoded body, as text, for a caller that wants a page of a large body
+/// rather than all of it.
+pub struct BodySlice {
+    /// The slice, as lossy UTF-8 of the decoded bytes.
+    pub text: String,
+    /// Byte offset this slice starts at.
+    pub start: usize,
+    /// Byte offset the next slice should start at (the end of this one).
+    pub next: usize,
+    /// Whether any decoded bytes follow this slice.
+    pub more: bool,
+}
+
+/// A byte range of the body with Content-Encoding undone.
+///
+/// `offset` and `max` count BYTES of the decoded body, because every other size in this
+/// API (`Content-Length`, a summary's `length`) is in bytes; counting characters would
+/// make the caller's arithmetic disagree with those numbers. The end is snapped down to
+/// a UTF-8 boundary so no character is split across two pages, and `next` reports where
+/// that landed, so a caller that pages by `next` never sees a split character at all.
+///
+/// Only as much as the range needs is decompressed, so a body that expands to hundreds
+/// of megabytes is never fully expanded to serve its first page.
+pub fn body_slice(headers: &[(String, String)], body: &[u8], offset: usize, max: usize) -> BodySlice {
+    let want = offset.saturating_add(max);
+    let (decoded, beyond) = decode_body_capped(headers, body, want);
+    if offset >= decoded.len() {
+        // Past the end: honest emptiness, not an error. `beyond` can still be true when
+        // the caller asked for an offset inside a body we only decoded part of.
+        return BodySlice { text: String::new(), start: decoded.len(), next: decoded.len(), more: beyond };
+    }
+    let mut end = decoded.len().min(want);
+    // Snap the end off the middle of a character. We are already at a boundary when we
+    // stopped at the end of what was decoded, or when the next byte begins a new
+    // character (a UTF-8 continuation byte is 0b10xxxxxx, a lead byte never is).
+    if end < decoded.len() && decoded[end] & 0xC0 == 0x80 {
+        let mut e = end;
+        while e > offset && decoded[e] & 0xC0 == 0x80 {
+            e -= 1;
+        }
+        // Keep the unsnapped end when snapping would return nothing: a replacement
+        // character beats a caller that can never make progress. That only happens when
+        // `max` is smaller than the single character sitting at `offset`.
+        if e > offset {
+            end = e;
+        }
+    }
+    BodySlice {
+        text: String::from_utf8_lossy(&decoded[offset..end]).into_owned(),
+        start: offset,
+        next: end,
+        more: beyond || end < decoded.len(),
+    }
+}
+
+/// A byte range of the decoded body, as bytes.
+///
+/// Same bounds as [`body_slice`], but nothing is turned into text, so a body that is not
+/// UTF-8 survives it. Returns the range and whether more follows.
+pub fn body_range(headers: &[(String, String)], body: &[u8], offset: usize, max: usize) -> (Vec<u8>, bool) {
+    let want = offset.saturating_add(max);
+    let (decoded, beyond) = decode_body_capped(headers, body, want);
+    if offset >= decoded.len() {
+        return (Vec::new(), beyond);
+    }
+    let end = decoded.len().min(want);
+    (decoded[offset..end].to_vec(), beyond || end < decoded.len())
+}
+
+/// Decoded body length when it can be known without decompressing: an unencoded body is
+/// its own stored length. Under gzip/br/zstd the true length is unknowable short of a
+/// full decode, so this returns `None` rather than guessing.
+pub fn decoded_len(headers: &[(String, String)], body: &[u8]) -> Option<usize> {
+    match header(headers, "content-encoding").map(|v| v.trim().to_ascii_lowercase()) {
+        None => Some(body.len()),
+        Some(e) if e.is_empty() || e == "identity" => Some(body.len()),
+        Some(_) => None,
+    }
 }
 
 /// Body with Content-Encoding (gzip/deflate/br) undone when possible.
@@ -554,6 +656,75 @@ mod tests {
         // The capped decode only reads a bit past the cap, not the whole 4 MB.
         let (decoded, more) = decode_body_capped(&headers, &gz, VIEW_LIMIT);
         assert!(more && decoded.len() <= VIEW_LIMIT + 8192);
+    }
+
+    #[test]
+    fn body_slice_pages_without_splitting_a_character() {
+        let none: Vec<(String, String)> = vec![];
+        // Pages reassemble into exactly the original bytes, and no page ever ends in the
+        // middle of a character.
+        let src = "ab\u{20ac}cd h\u{e9}llo \u{1f600} tail".as_bytes().to_vec();
+        for max in [1usize, 2, 3, 4, 5, 7, 16, 1024] {
+            let mut out = String::new();
+            let mut at = 0usize;
+            let mut guard = 0;
+            loop {
+                let s = body_slice(&none, &src, at, max);
+                guard += 1;
+                assert!(guard < 200, "body_slice must make progress (max={max})");
+                out.push_str(&s.text);
+                assert!(s.next > at || !s.more, "no progress at {at} (max={max})");
+                at = s.next;
+                if !s.more {
+                    break;
+                }
+            }
+            if max >= 4 {
+                // Every character fits in a page, so nothing is ever cut.
+                assert_eq!(out.as_bytes(), &src[..], "reassembled at max={max}");
+                assert!(!out.contains('\u{fffd}'), "no replacement char at max={max}");
+            } else {
+                // A page too small for a character has to cut one; it must still finish.
+                assert!(out.len() >= src.len() / 2, "still produced the body at max={max}");
+            }
+        }
+
+        // Past the end is empty, not an error, and reports nothing more.
+        let past = body_slice(&none, &src, 10_000, 16);
+        assert!(past.text.is_empty() && !past.more);
+
+        // The offset is honoured and `next` points just past what came back.
+        let mid = body_slice(&none, b"0123456789", 3, 4);
+        assert_eq!((mid.text.as_str(), mid.start, mid.next, mid.more), ("3456", 3, 7, true));
+        let tail = body_slice(&none, b"0123456789", 7, 4);
+        assert_eq!((tail.text.as_str(), tail.next, tail.more), ("789", 10, false));
+    }
+
+    #[test]
+    fn decoded_len_is_known_only_without_an_encoding() {
+        let none: Vec<(String, String)> = vec![];
+        assert_eq!(decoded_len(&none, b"hello"), Some(5));
+        let id = vec![("content-encoding".to_string(), "identity".to_string())];
+        assert_eq!(decoded_len(&id, b"hello"), Some(5));
+        let gz = vec![("content-encoding".to_string(), "gzip".to_string())];
+        assert_eq!(decoded_len(&gz, b"\x1f\x8b..."), None, "a compressed length is not knowable here");
+    }
+
+    #[test]
+    fn a_head_matches_the_same_message_read_whole() {
+        // The folded Cookie line is the case that would drift if the head were rebuilt
+        // somewhere else, so it is the one worth pinning.
+        let headers = vec![
+            ("Host".to_string(), "api.test".to_string()),
+            ("Cookie".to_string(), "a=1".to_string()),
+            ("Cookie".to_string(), "b=2".to_string()),
+        ];
+        let head = message_head("GET /x HTTP/1.1", &headers);
+        let whole = render("GET /x HTTP/1.1", &headers, b"body-here", true);
+        assert!(whole.starts_with(&head), "the head is a prefix of the whole message");
+        assert!(head.contains("Cookie: a=1; b=2"), "cookies folded once: {head}");
+        assert_eq!(head.matches("Cookie").count(), 1);
+        assert!(head.ends_with("\n\n"), "a head ends with the blank line");
     }
 
     #[test]

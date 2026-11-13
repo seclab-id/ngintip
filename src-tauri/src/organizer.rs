@@ -201,11 +201,20 @@ pub fn load(store: &Store) -> Result<Organizer, String> {
 /// Apply one edit: load, change, bump the revision, save.
 pub fn apply(store: &Store, op: Op) -> Result<Applied, String> {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // `LOCK` serializes edits against each other; it knows nothing about which project is
+    // open. This is load-modify-write, so a project change between the load and the write
+    // would replace the newly opened project's Organizer wholesale with the previous
+    // one's: every collection, every saved request and response, every agent finding, of
+    // one client, written into another client's file. Read before the load, so a switch
+    // in between refuses the write rather than saving the wrong project's state.
+    let gen = store.generation();
     let mut org = load(store)?;
     let (collection_id, item_id) = org.edit(op)?;
     org.rev += 1;
     let value = serde_json::to_value(&org).map_err(|e| e.to_string())?;
-    store.put_setting(SETTING, &value).map_err(|e| e.to_string())?;
+    if !store.put_setting_at(SETTING, &value, gen).map_err(|e| e.to_string())? {
+        return Err("the project changed while this edit was being applied; nothing was saved".into());
+    }
     Ok(Applied { state: org, collection_id, item_id })
 }
 

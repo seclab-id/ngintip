@@ -4,6 +4,8 @@
   import { prettyBody, htmlBody, softWrapLong } from '../lib/message.js';
   import { matchRanges, markHtmlRanges } from '../lib/find.js';
   import { autoDecode } from '../lib/codec.js';
+  import { isolateSelection } from '../lib/dragselect.js';
+  import { variantPref } from '../lib/viewprefs.svelte.js';
   import { fmtSize } from '../lib/format.js';
   import FindBar from './FindBar.svelte';
 
@@ -14,7 +16,7 @@
   // `truncated` + `loadFull` enable a "Show all" button that fetches the full,
   // uncapped body from the backend (bodies are stored in full, only the view is capped).
   let { title, raw = '', image = null, actions, placeholder = '', truncated = false, loadFull = null,
-    ondecode = null, onsend = null, variants = null, isImage = false, loadImage = null,
+    ondecode = null, onsend = null, variants = null, side = null, isImage = false, loadImage = null,
     isBinary = false, loadHex = null, preferPretty = false } = $props();
 
   // Image preview: use an eagerly-supplied `image`, else lazy-load via `loadImage`
@@ -47,6 +49,13 @@
   // one (Extension / Original). Only History passes `variants`.
   let variantId = $state('final');
   let showVariants = $derived(Array.isArray(variants) && variants.length > 1);
+  // Which pane this is, so request and response each remember their own version. A
+  // viewer that does not say (no switcher of its own) simply does not remember.
+  const choice = $derived(side === 'req' ? variantPref.req : side === 'res' ? variantPref.res : null);
+  function pickVariant(id) {
+    variantId = id;
+    choice?.pick(id);
+  }
   let variantRaw = $derived.by(() => {
     if (!showVariants) return null;
     const v = variants.find((x) => x.id === variantId);
@@ -58,10 +67,11 @@
     raw;
     showingFull = false;
     full = null;
-    // Default to the real (wire) message; a decoded view, when present, sits one click
-    // away in the switcher. Keeping the wire default means a security tool never hides
-    // what actually crossed the wire (passive findings, anomalies) behind a decode.
-    variantId = 'final';
+    // Reopen on the version last chosen, when this message actually has it. The wire
+    // remains the fallback and the first-run default: a security tool must not hide what
+    // actually crossed the wire (passive findings, anomalies) behind a decode, and a
+    // remembered choice must never silently apply to a version this flow does not have.
+    variantId = choice ? choice.openOn(variants?.map((v) => v.id)) : 'final';
     lazyImage = null;
     loadingImage = false;
     lazyHex = null;
@@ -261,6 +271,19 @@
     return s.toString();
   }
 
+  // A drag that leaves this pane would otherwise keep selecting through the next one
+  // (request and response sit in the same document). Lock the others for the drag.
+  function onSelectDown() {
+    const restore = isolateSelection(root);
+    const end = () => {
+      restore();
+      window.removeEventListener('pointerup', end);
+      window.removeEventListener('pointercancel', end);
+    };
+    window.addEventListener('pointerup', end);
+    window.addEventListener('pointercancel', end);
+  }
+
   function onSelectUp() {
     if (!ondecode) return;
     const text = selectionText();
@@ -272,7 +295,9 @@
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="panel" bind:this={root} onpointerenter={() => (hovered = true)} onpointerleave={() => (hovered = false)}>
+<!-- data-msgpane marks this as a selection pane; see PANE_ATTR in lib/dragselect.js,
+     which a test keeps in step with the literal written here. -->
+<div class="panel" bind:this={root} data-msgpane onpointerenter={() => (hovered = true)} onpointerleave={() => (hovered = false)}>
   <header class="panel-head">
     <span class="panel-title">{title}</span>
     {#if raw}
@@ -287,7 +312,7 @@
     {#if showVariants}
       <div class="modes variants" role="tablist" title="Which captured version to show">
         {#each variants as v}
-          <button class="mode" class:active={variantId === v.id} role="tab" aria-selected={variantId === v.id} onclick={() => (variantId = v.id)}>{v.label}</button>
+          <button class="mode" class:active={variantId === v.id} role="tab" aria-selected={variantId === v.id} onclick={() => pickVariant(v.id)}>{v.label}</button>
         {/each}
       </div>
     {/if}
@@ -317,7 +342,7 @@
     <iframe class="frame" title="{title} preview" sandbox="" srcdoc={html}></iframe>
   {:else}
     <!-- svelte-ignore a11y_no_static_element_interactions, a11y_no_noninteractive_element_interactions -->
-    <pre class="code" class:head-only={deferBinary} bind:this={pre} onmouseup={onSelectUp}>{@html body}</pre>
+    <pre class="code" class:head-only={deferBinary} bind:this={pre} onpointerdown={onSelectDown} onmouseup={onSelectUp}>{@html body}</pre>
     {#if deferBinary}
       <div class="load-body">
         <span class="dim">Binary body ({fmtSize(bodyBytes)}, not printable) — hidden to keep the viewer fast.</span>

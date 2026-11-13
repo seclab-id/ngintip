@@ -139,3 +139,30 @@ describe('payload generators', () => {
     expect(clearPositions(w.raw)).toBe(raw);
   });
 });
+
+describe('null payloads without positions', () => {
+  const RAW = 'POST /login HTTP/1.1\nHost: x\n\nuser=admin';
+
+  it('sends the request as it stands, N times', () => {
+    // A null-payload attack substitutes nothing (rate limits, retries, races), so
+    // demanding a payload position would mean marking a spot to fill it with nothing.
+    const g = generate(RAW, 'sniper', [{ type: 'null', nul: { count: 3 } }]);
+    expect(g.error).toBeUndefined();
+    expect(g.count).toBe(3);
+    expect(g.requests.map((r) => r.request)).toEqual([RAW, RAW, RAW]);
+    expect(g.requests[0].payloads).toEqual([]);
+  });
+
+  it('still refuses any other payload type with no positions', () => {
+    const g = generate(RAW, 'sniper', [{ type: 'list', list: 'a\nb' }]);
+    expect(g.error).toMatch(/No payload positions/);
+    expect(g.requests).toEqual([]);
+  });
+
+  it('leaves the normal path alone when positions exist', () => {
+    const g = generate('GET /?q=\u00a7x\u00a7 HTTP/1.1\n\n', 'sniper', [{ type: 'null', nul: { count: 2 } }]);
+    expect(g.count).toBe(2);
+    // Substituted with the empty payload, not sent raw with the markers still in it.
+    expect(g.requests[0].request).not.toContain('\u00a7');
+  });
+});

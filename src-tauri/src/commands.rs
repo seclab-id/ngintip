@@ -34,6 +34,99 @@ pub struct Running {
     task: tauri::async_runtime::JoinHandle<()>,
 }
 
+/// How far a bind address reaches, which decides whether the UI warns about it.
+///
+/// Only the surprising cases are worth a warning. `All` binds to every interface there
+/// is, including ones that appear after the listener started (a VPN coming up, a hotspot
+/// turning on), so the reach is not something the user chose and cannot see. `Tunnel`
+/// means the address belongs to a VPN interface, where the other side is somebody
+/// else's network - a client's, or an employer's.
+///
+/// `Lan` is deliberately NOT warned about: binding to one LAN address is exactly what
+/// you do to drive the proxy from a phone, the address itself says where it is, and a
+/// warning that fires on normal use is a warning people learn to click past.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Exposure {
+    /// Reachable only from this machine.
+    Local,
+    /// One address on a local network.
+    Lan,
+    /// An address on a VPN / tunnel interface.
+    Tunnel,
+    /// Every interface, present and future.
+    All,
+}
+
+/// Interface names that mean "tunnel" across the platforms this runs on: macOS `utun*`
+/// (which is also what Tailscale and most VPN clients use), Linux `tun*`/`tap*`/`wg*`,
+/// `ipsec*`, `ppp*`, ZeroTier `zt*`, and anything with "vpn" in the name (Windows
+/// adapters are named freely, e.g. "OpenVPN TAP-Windows6").
+fn is_tunnel_interface(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    const PREFIXES: [&str; 9] = ["utun", "tun", "tap", "wg", "ipsec", "ppp", "zt", "nebula", "wireguard"];
+    n.contains("vpn") || n.contains("tailscale") || PREFIXES.iter().any(|p| n.starts_with(p))
+}
+
+/// Does this host string mean "every interface"? Covers the IPv4 and IPv6 wildcards and
+/// an empty host, which `start_listeners` also treats as a wildcard bind.
+fn is_wildcard_host(host: &str) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if h.is_empty() || h == "*" {
+        return true;
+    }
+    match h.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_unspecified(),
+        Err(_) => false,
+    }
+}
+
+/// Classify a bind address. `nics` is (interface name, address) for the machine, so the
+/// caller can pass a fresh snapshot (a VPN may have come up since the listener started).
+fn exposure_of(host: &str, nics: &[(String, String)]) -> Exposure {
+    if is_wildcard_host(host) {
+        return Exposure::All;
+    }
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    if h == "localhost" {
+        return Exposure::Local;
+    }
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        if ip.is_loopback() {
+            return Exposure::Local;
+        }
+    }
+    // An address on a tunnel interface is reachable from the far side of that tunnel.
+    // An address we cannot place is treated as plain LAN: the bind would have failed if
+    // it were not one of this machine's own addresses.
+    if nics.iter().any(|(name, ip)| ip.eq_ignore_ascii_case(&h) && is_tunnel_interface(name)) {
+        return Exposure::Tunnel;
+    }
+    Exposure::Lan
+}
+
+/// [`Exposure`] of an address a listener is actually bound to.
+///
+/// `exposure_of` works from the configured host string; this works from the live
+/// `SocketAddr`, which is what the proxy itself remembers. An unspecified bind
+/// (`0.0.0.0`, `::`) classifies as `All` and a loopback bind as `Local`, matching what
+/// `status_list` reports from the config.
+pub(crate) fn exposure_of_addr(addr: &SocketAddr) -> Exposure {
+    if addr.ip().is_unspecified() {
+        return Exposure::All;
+    }
+    exposure_of(&addr.ip().to_string(), &interface_addrs())
+}
+
+/// (interface name, address) for every interface on the machine.
+fn interface_addrs() -> Vec<(String, String)> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|i| (i.name.clone(), i.ip().to_string()))
+        .collect()
+}
+
 /// One listener's state for the UI: its saved config plus whether it is live.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,6 +138,8 @@ pub struct ListenerStatus {
     port: u16,
     enabled: bool,
     running: bool,
+    /// How far this address reaches, so the UI can warn only where it is warranted.
+    exposure: Exposure,
 }
 
 #[derive(Serialize)]
@@ -91,12 +186,26 @@ pub struct RepeaterResponse {
     /// offer an Original view next to the transformed ("final") one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_original: Option<String>,
+    /// The History flow this send was recorded as, when it was recorded.
+    ///
+    /// Set by `send_recorded`. The id is allocated before the request goes out, but the
+    /// row is written by a background thread, so a reader can briefly be ahead of the
+    /// write; `Store::peek_id` is how a caller tells "still being written" from "never
+    /// existed". `flow_ts` pins the citation in time, because ids are reseeded when
+    /// History is emptied and can be handed out again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow_ts: Option<u64>,
 }
 
 /// Every configured listener merged with its live state, for the UI. Locks config
 /// then server (keep that order everywhere to avoid deadlock); holds neither across
 /// an await.
 fn status_list(state: &AppState) -> Vec<ListenerStatus> {
+    // Read the interfaces once per call, outside the locks: a VPN may have come up or
+    // gone away since these listeners were started, and the warning has to follow that.
+    let nics = interface_addrs();
     let config = state.config.lock().unwrap();
     let running = state.server.lock().unwrap();
     config
@@ -110,6 +219,7 @@ fn status_list(state: &AppState) -> Vec<ListenerStatus> {
                 port: live.map(|r| r.port).unwrap_or(l.port),
                 enabled: l.enabled,
                 running: live.is_some(),
+                exposure: exposure_of(&l.host, &nics),
             }
         })
         .collect()
@@ -180,15 +290,47 @@ async fn bind_proxy(host: &str, port: u16) -> Result<(TcpListener, u16), String>
     Err(format!("No free port in {port}..{} ({last})", port.saturating_add(MAX_TRIES - 1)))
 }
 
+/// Project setting holding this project's listeners. Listeners belong to a project (one
+/// target may need a LAN bind, another only loopback), so they are saved with it and do
+/// not follow the user into the next project. `config.listeners` stays the live working
+/// set that [`status_list`] reports; this is the copy that survives a project switch.
+pub const LISTENERS_KEY: &str = "listeners";
+
+/// Write the live listener set into the open project. Clones out of the config lock
+/// first: the store takes its own lock, and holding both invites a deadlock.
+fn persist_listeners(state: &AppState) {
+    let listeners = state.config.lock().unwrap().listeners.clone();
+    if let Ok(v) = serde_json::to_value(&listeners) {
+        let _ = state.ctx.store.put_setting(LISTENERS_KEY, &v);
+    }
+}
+
+/// The listener set a fresh project starts with: the app default, one loopback listener.
+/// Written by [`blank_project`] so a new project does not inherit the previous one's.
+pub fn default_listeners() -> Vec<config::Listener> {
+    config::Config::default().listeners
+}
+
+/// Of the listeners currently running, the ids the open project does not want up: it
+/// either has no such listener at all (it belonged to the project before this one) or
+/// has it saved as disabled. Everything else keeps running untouched, so switching
+/// between projects that share a listener does not drop the socket.
+fn stale_listener_ids(running: &[String], wanted: &[config::Listener]) -> Vec<String> {
+    running
+        .iter()
+        .filter(|id| !wanted.iter().any(|l| &l.id == *id && l.enabled))
+        .cloned()
+        .collect()
+}
+
 #[tauri::command]
 pub fn list_listeners(state: State<AppState>) -> Vec<ListenerStatus> {
     status_list(&state)
 }
 
-/// Start every enabled listener not already running. Called once on load so the
-/// configured listeners come up; idempotent, so it is safe to call again.
-#[tauri::command]
-pub async fn start_listeners(state: State<'_, AppState>) -> CmdResult<Vec<ListenerStatus>> {
+/// Bind every enabled listener that is not already up, logging the ones that fail
+/// instead of aborting: one unavailable port must not keep the others down.
+async fn start_enabled(state: &AppState) {
     let pending: Vec<(String, String, u16)> = {
         let config = state.config.lock().unwrap();
         let running = state.server.lock().unwrap();
@@ -200,10 +342,62 @@ pub async fn start_listeners(state: State<'_, AppState>) -> CmdResult<Vec<Listen
             .collect()
     };
     for (id, host, port) in pending {
-        if let Err(e) = start_one(&state, &id, &host, port).await {
+        if let Err(e) = start_one(state, &id, &host, port).await {
             state.ctx.log_error("proxy", format!("listener {host}:{port} failed to start: {e}"));
         }
     }
+}
+
+/// Start every enabled listener not already running. Called once on load so the
+/// configured listeners come up; idempotent, so it is safe to call again.
+#[tauri::command]
+pub async fn start_listeners(state: State<'_, AppState>) -> CmdResult<Vec<ListenerStatus>> {
+    start_enabled(&state).await;
+    Ok(status_list(&state))
+}
+
+/// Make the running listeners match the open project's saved set. Called after a project
+/// is created, opened, or reopened at startup.
+///
+/// A project saved before listeners became per-project has no saved set; it inherits the
+/// current one, once, and keeps it from then on. A project that does have one wins over
+/// whatever the previous project left running.
+#[tauri::command]
+pub async fn sync_listeners(state: State<'_, AppState>) -> CmdResult<Vec<ListenerStatus>> {
+    let saved: Option<Vec<config::Listener>> = state
+        .ctx
+        .store
+        .get_setting(LISTENERS_KEY)
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_value(v).ok());
+
+    let wanted = match saved {
+        Some(list) => list,
+        None => {
+            // First time for this project: adopt what is live and remember it.
+            persist_listeners(&state);
+            return start_listeners(state).await;
+        }
+    };
+
+    // Drop anything running that this project does not ask to have up, so the previous
+    // project's listeners never linger on ports this one did not choose.
+    let stale = {
+        let running = state.server.lock().unwrap();
+        let ids: Vec<String> = running.iter().map(|r| r.id.clone()).collect();
+        stale_listener_ids(&ids, &wanted)
+    };
+    for id in stale {
+        stop_one(&state, &id).await;
+    }
+
+    {
+        let mut config = state.config.lock().unwrap();
+        config.listeners = wanted;
+        config::save(&state.config_path, &config).map_err(|e| e.to_string())?;
+    }
+    start_enabled(&state).await;
     Ok(status_list(&state))
 }
 
@@ -231,6 +425,7 @@ pub async fn add_listener(state: State<'_, AppState>, host: String, port: u16) -
         let _ = config::save(&state.config_path, &config);
         return Err(e);
     }
+    persist_listeners(&state);
     Ok(status_list(&state))
 }
 
@@ -243,6 +438,7 @@ pub async fn remove_listener(state: State<'_, AppState>, id: String) -> CmdResul
         config.listeners.retain(|l| l.id != id);
         config::save(&state.config_path, &config).map_err(|e| e.to_string())?;
     }
+    persist_listeners(&state);
     Ok(status_list(&state))
 }
 
@@ -271,6 +467,7 @@ pub async fn set_listener_enabled(state: State<'_, AppState>, id: String, enable
     } else {
         stop_one(&state, &id).await;
     }
+    persist_listeners(&state);
     Ok(status_list(&state))
 }
 
@@ -290,6 +487,7 @@ pub async fn update_listener(state: State<'_, AppState>, id: String, host: Strin
     if was_running {
         start_one(&state, &id, &host, port).await?;
     }
+    persist_listeners(&state);
     Ok(status_list(&state))
 }
 
@@ -321,39 +519,46 @@ pub fn list_flows(state: State<AppState>) -> CmdResult<Vec<FlowSummary>> {
     state.ctx.store.summaries().map_err(|e| e.to_string())
 }
 
+/// A recorded flow's message versions, including the lazy "decoded" one: when a
+/// `decode_*` extension is active and this host is in scope, the readable form is
+/// computed on demand and offered as the Extension version alongside the real (wire)
+/// message. The wire bytes stay canonical and nothing is persisted; this only makes an
+/// encrypted or encoded body readable.
+///
+/// Shared by the UI (`get_flow`) and the MCP server (`history_get`), so an agent reading
+/// a flow sees exactly the versions the window shows. Without that, an encrypted API is
+/// legible on screen and opaque over MCP.
+pub(crate) fn flow_variants(ctx: &std::sync::Arc<proxy::Ctx>, f: &store::Flow) -> store::FlowVariants {
+    let mut variants = f.variants.clone();
+    if !ctx.extensions.active() || !ctx.scope.contains(&f.summary.host) {
+        return variants;
+    }
+    let hc = || crate::extensions::HookCtx {
+        host: f.summary.host.clone(),
+        path: f.summary.path.clone(),
+        flow_id: Some(f.summary.id),
+        edited: false,
+    };
+    if variants.req_extension.is_none() {
+        let txt = raw::request_text_for_processing(f);
+        if let Some(out) = ctx.extensions.decode(crate::extensions::Phase::Request, txt.as_bytes(), crate::extensions::Surface::Proxy, &hc()) {
+            variants.req_extension = Some(String::from_utf8_lossy(&out).replace("\r\n", "\n"));
+        }
+    }
+    if variants.res_extension.is_none() && !f.res_headers.is_empty() {
+        let txt = raw::response_text_for_processing(f);
+        if let Some(out) = ctx.extensions.decode(crate::extensions::Phase::Response, txt.as_bytes(), crate::extensions::Surface::Proxy, &hc()) {
+            variants.res_extension = Some(String::from_utf8_lossy(&out).replace("\r\n", "\n"));
+        }
+    }
+    variants
+}
+
 #[tauri::command]
 pub fn get_flow(state: State<AppState>, id: u64) -> CmdResult<Option<FlowDetail>> {
     let flow = state.ctx.store.get(id).map_err(|e| e.to_string())?;
     Ok(flow.map(|f| {
-        let mut variants = f.variants.clone();
-        // Lazy "decoded" view: when a decode_* extension is active and this host is in
-        // scope, compute the readable form on open and expose it as the "Decoded"
-        // version alongside the real (wire) message. The wire bytes stay canonical and
-        // nothing is persisted; this just makes an encrypted/encoded body readable.
-        if state.ctx.extensions.active() && state.ctx.scope.contains(&f.summary.host) {
-            let hc = || crate::extensions::HookCtx {
-                host: f.summary.host.clone(),
-                path: f.summary.path.clone(),
-                flow_id: Some(f.summary.id),
-                edited: false,
-            };
-            if variants.req_extension.is_none() {
-                let txt = raw::request_text_for_processing(&f);
-                if let Some(out) =
-                    state.ctx.extensions.decode(crate::extensions::Phase::Request, txt.as_bytes(), crate::extensions::Surface::Proxy, &hc())
-                {
-                    variants.req_extension = Some(String::from_utf8_lossy(&out).replace("\r\n", "\n"));
-                }
-            }
-            if variants.res_extension.is_none() && !f.res_headers.is_empty() {
-                let txt = raw::response_text_for_processing(&f);
-                if let Some(out) =
-                    state.ctx.extensions.decode(crate::extensions::Phase::Response, txt.as_bytes(), crate::extensions::Surface::Proxy, &hc())
-                {
-                    variants.res_extension = Some(String::from_utf8_lossy(&out).replace("\r\n", "\n"));
-                }
-            }
-        }
+        let variants = flow_variants(&state.ctx, &f);
         FlowDetail {
             request_raw: raw::request_text(&f),
             response_raw: raw::response_text(&f),
@@ -413,9 +618,33 @@ pub fn set_flow_meta(state: State<AppState>, id: u64, note: String, color: Strin
         .map_err(|e| e.to_string())
 }
 
+/// Delete flows by id.
+///
+/// `async` on purpose: a non-async command compiles to `ExecutionContext::Blocking` and
+/// runs on the IPC dispatch thread, so deleting a large selection froze the whole window.
+/// On Windows that reads as a crash, because an app that stops pumping messages for a few
+/// seconds gets the "(Not Responding)" title from the OS. Same reason `save_project` does
+/// its snapshot off-thread.
 #[tauri::command]
-pub fn delete_flows(state: State<AppState>, ids: Vec<u64>) -> CmdResult<()> {
-    state.ctx.store.delete(&ids).map_err(|e| e.to_string())
+pub async fn delete_flows(state: State<'_, AppState>, ids: Vec<u64>) -> CmdResult<usize> {
+    let ctx = state.ctx.clone();
+    // Captured before the work starts: if the operator opens another project while this
+    // runs, the remaining ids must not be deleted out of THAT project. The deleting is
+    // chunked, so without this there are dozens of windows in which that can happen, and
+    // a slow-but-responsive delete is exactly when someone clicks elsewhere.
+    let gen = ctx.store.generation();
+    let total = ids.len();
+    let done = tauri::async_runtime::spawn_blocking(move || ctx.store.delete(&ids, gen))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    if done < total {
+        state.ctx.log_warn(
+            "history",
+            format!("deleted {done} of {total} selected request(s); the project changed before the rest were removed"),
+        );
+    }
+    Ok(done)
 }
 
 /// Reseed the flow-id counter to the current max id (compacts numbering after a delete).
@@ -533,8 +762,17 @@ pub fn list_interfaces() -> Vec<NetInterface> {
 }
 
 #[tauri::command]
-pub fn clear_flows(state: State<AppState>) -> CmdResult<()> {
-    state.ctx.store.clear().map_err(|e| e.to_string())
+pub async fn clear_flows(state: State<'_, AppState>) -> CmdResult<()> {
+    let ctx = state.ctx.clone();
+    // Off the IPC thread for the same reason as `delete_flows`: on a large History this
+    // is seconds of SQLite work, and doing it inline freezes the window. And guarded for
+    // the same reason too: making it async is what lets `open_project` interleave, so
+    // without the generation this could empty the History of the project just opened.
+    let gen = ctx.store.generation();
+    tauri::async_runtime::spawn_blocking(move || ctx.store.clear(gen))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Serialize)]
@@ -598,6 +836,16 @@ fn project_magic(bytes: &[u8]) -> Option<&'static [u8]> {
         .chain(brand::LEGACY_MAGICS.iter().copied())
         .find(|m| bytes.len() > m.len() && &bytes[..m.len()] == *m)
 }
+
+/// The document a working copy came from, recorded INSIDE the working copy.
+///
+/// `DOCUMENT_PTR` is one shared file in the app data dir that every instance rewrites on
+/// every save, while `WORKING_PTR` is only rewritten when a project is opened. After a
+/// two-instance session that pair routinely describes two different projects, and the
+/// next startup then opens one project while believing it is another, which a later save
+/// writes out over the wrong file. A working copy that carries its own document cannot
+/// be mismatched with one: it travels with the data it describes.
+const DOC_KEY: &str = "document_path";
 
 /// Pointer files in the app data dir: the current working file and the document.
 const WORKING_PTR: &str = "working_ptr";
@@ -727,8 +975,56 @@ fn remove_working_file(path: &Path) {
     }
 }
 
+/// Whether a working file belongs to a process that is still running.
+///
+/// Working files are named `<pid>-<nanos>.<ext>` (see [`fresh_working_path`]), so the
+/// owner is already in the name: the nanosecond stamp alone cannot collide inside one
+/// process, which is the whole reason the pid is there. It names an owner, not a serial
+/// number. [`crate::browser::cleanup_orphan_browsers`] does exactly this check for
+/// throwaway Chrome profiles, and says why in its doc comment: several Ngintip
+/// instances coexist, and one must never sweep another's live state.
+///
+/// Our own pid is NOT live for this purpose: our previous working file is ours to
+/// delete. Anything unparseable is treated as live, because "existence is not
+/// ownership" cuts both ways and a file we cannot prove is garbage is kept.
+fn owner_is_live(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return true };
+    let Some((pid, _)) = name.split_once('-') else { return true };
+    let Ok(pid) = pid.parse::<i32>() else { return true };
+    if pid as u32 == std::process::id() {
+        return false;
+    }
+    pid_alive(pid)
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false; // 0 and negatives address process GROUPS, never a single process
+    }
+    // `kill(pid, 0) == 0` means the process exists and we may signal it. EPERM means it
+    // exists and we may NOT (it belongs to another user, e.g. a root-owned daemon),
+    // which is still very much alive. Only ESRCH means there is no such process. Reading
+    // success alone would report every process we do not own as dead and delete its file.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Windows refuses to unlink a SQLite file another process holds open, so the
+/// destructive case cannot arise there and the sweep stays as it was. Reporting every
+/// owner as dead keeps crashed runs from leaving their working files behind forever.
+#[cfg(not(unix))]
+fn pid_alive(_pid: i32) -> bool {
+    false
+}
+
 /// Delete working files left over from previous runs, keeping `keep` (and its
 /// WAL sidecars, which share its path prefix).
+///
+/// "Previous runs" is the precondition this used to assert and never check: it deleted
+/// every entry it was not keeping, including the live database of another running
+/// instance, WAL and all. That instance then went on capturing into an unlinked inode
+/// and lost everything the moment it exited.
 fn clean_stray_working(dir: &Path, keep: Option<&Path>) {
     let Ok(entries) = std::fs::read_dir(working_dir(dir)) else { return };
     for entry in entries.flatten() {
@@ -737,6 +1033,9 @@ fn clean_stray_working(dir: &Path, keep: Option<&Path>) {
             if p.to_string_lossy().starts_with(k.to_string_lossy().as_ref()) {
                 continue;
             }
+        }
+        if owner_is_live(&p) {
+            continue; // another live instance is using it
         }
         let _ = std::fs::remove_file(&p);
     }
@@ -749,11 +1048,35 @@ fn switch_working(dir: &Path, state: &AppState, wp: &Path) -> CmdResult<()> {
     state.ctx.store.switch(wp).map_err(|e| format!("Failed to open project: {e:#}"))?;
     write_ptr(dir, WORKING_PTR, wp);
     if let Some(old) = old {
-        if old != wp {
+        // The pointer is shared, so `old` can name a file this process never created:
+        // the same liveness rule as the startup sweep decides whether it is ours to
+        // delete. Patching only the sweep would leave this site destroying live data.
+        if old != wp && !owner_is_live(&old) {
             remove_working_file(&old);
         }
     }
     Ok(())
+}
+
+/// Let go of everything belonging to the project being closed, BEFORE the store is
+/// swapped to the next one.
+///
+/// The order is the entire point, and getting it backwards is worse than not doing it.
+/// Draining the intercept queue forwards the held messages, and the flows that produces
+/// are recorded into whichever store is current: drain after the swap and the previous
+/// client's traffic is filed in the new client's project file. The launched browser is
+/// the same hazard with a longer fuse, since it stays authenticated to the previous
+/// target and keeps fetching through the proxy until it is closed.
+///
+/// Held messages are DROPPED, not forwarded, and intercept is left off. A held request
+/// has not reached the target yet, so dropping it costs the client's system nothing,
+/// while forwarding would send a request to their production system after the operator
+/// left that engagement and could not be filed anywhere afterwards. The browser that
+/// would have seen the failure is closed on the next line anyway.
+fn release_project(state: &AppState) {
+    state.ctx.intercept.drain_dropped();
+    state.ctx.ws_intercept.drain_dropped();
+    state.kill_browsers();
 }
 
 /// Reload scope, Match & Replace rules, extensions and the search index from the
@@ -767,12 +1090,60 @@ fn adopt(state: &AppState) -> CmdResult<()> {
     Ok(())
 }
 
+/// Identity of the file at `path` as this process last saw it: path, length, mtime.
+/// Cheap (one `stat`) and good enough to catch another writer; a content hash would
+/// mean reading a 400 MB project on every save to protect against a change that kept
+/// both the length and the mtime.
+/// The document this working copy was loaded from or last saved to, if it still exists.
+fn document_of(store: &store::Store) -> Option<PathBuf> {
+    let v = store.get_setting(DOC_KEY).ok()??;
+    let p = PathBuf::from(v.as_str()?);
+    p.is_file().then_some(p)
+}
+
+pub fn doc_stamp(path: &Path) -> Option<(PathBuf, u64, std::time::SystemTime)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((path.to_path_buf(), m.len(), m.modified().ok()?))
+}
+
+/// Error prefix the UI matches on to offer Overwrite instead of just reporting a
+/// failure. A sentinel rather than a typed error because a command returns a String.
+pub const STALE_DOC: &str = "DOCUMENT_CHANGED";
+
+/// Whether `path` is this session's document AND the file there is no longer the one
+/// we wrote or opened.
+///
+/// The save path ends in an unconditional `std::fs::rename`, which is what makes a
+/// stale pointer or a second instance able to replace a project wholesale with no
+/// warning. A missing file is NOT stale: writing it back is what the user asked for.
+fn document_is_stale(state: &AppState, path: &Path) -> bool {
+    stale_against(state.doc_stamp.lock().unwrap().as_ref(), path)
+}
+
+fn stale_against(known: Option<&(PathBuf, u64, std::time::SystemTime)>, path: &Path) -> bool {
+    let Some((known_path, len, mtime)) = known else { return false };
+    if known_path != path {
+        return false; // Save As somewhere else: the file dialog already asked
+    }
+    match std::fs::metadata(path) {
+        Ok(m) => m.len() != *len || m.modified().ok().is_some_and(|t| t != *mtime),
+        Err(_) => false,
+    }
+}
+
 /// Record the current document path (or clear it) in memory and on disk.
 fn set_document(dir: &Path, state: &AppState, doc: Option<&Path>) {
     *state.document.lock().unwrap() = doc.map(|p| p.to_path_buf());
     // Interpreter + venv are per-project now (in the project's settings): point the
     // manager at this project's folder and apply its saved interpreter/venv.
     apply_project_python_venv(&state.ctx, dir, doc);
+    // The stamp is taken AFTER the file exists, so it describes what we just wrote or
+    // opened; that is the thing a later save compares against.
+    *state.doc_stamp.lock().unwrap() = doc.and_then(doc_stamp);
+    let _ = match doc {
+        Some(p) => state.ctx.store.put_setting(DOC_KEY, &serde_json::json!(p.to_string_lossy())),
+        None => state.ctx.store.put_setting(DOC_KEY, &serde_json::Value::Null),
+    };
     match doc {
         Some(p) => write_ptr(dir, DOCUMENT_PTR, p),
         None => {
@@ -789,9 +1160,21 @@ pub fn open_startup(dir: &Path) -> anyhow::Result<(store::Store, Option<PathBuf>
         .or_else(|| read_ptr(dir, LAST_PROJECT))
         .filter(|p| p.is_file());
 
-    if let Some(wp) = read_ptr(dir, WORKING_PTR).filter(|p| p.is_file()) {
+    // Reuse the previous run's working file, but only when no live process owns it.
+    // `is_file()` alone asked whether the file exists, not whose it is, so a second
+    // instance attached to the first's live SQLite database: both then mint flow ids
+    // from one `MAX(id)` seed and replace each other's rows through INSERT OR REPLACE,
+    // with no delete and no rename needed. A live owner means we start our own copy
+    // from the document instead, below.
+    if let Some(wp) = read_ptr(dir, WORKING_PTR).filter(|p| p.is_file() && !owner_is_live(p)) {
         clean_stray_working(dir, Some(&wp));
-        return Ok((store::Store::open(&wp)?, document));
+        let store = store::Store::open(&wp)?;
+        // The working copy names its own document, so a DOCUMENT_PTR another instance
+        // rewrote cannot make us open this project under a different file's name and
+        // then save over it. The pointer is only the fallback for working copies made
+        // before this was recorded.
+        let document = document_of(&store).or(document);
+        return Ok((store, document));
     }
 
     let wp = fresh_working_path(dir);
@@ -814,14 +1197,20 @@ pub fn open_startup(dir: &Path) -> anyhow::Result<(store::Store, Option<PathBuf>
 #[tauri::command]
 pub fn blank_project(app: tauri::AppHandle, state: State<AppState>) -> CmdResult<ProjectInfo> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    release_project(&state);
     let wp = fresh_working_path(&dir);
     switch_working(&dir, &state, &wp)?;
-    state.ctx.scope.set(Vec::new());
-    load_rules(&state.ctx);
+    // Listeners belong to the project. Write the default set into this brand-new store
+    // so `sync_listeners` has something to find: without it the project would be treated
+    // as a pre-per-project one and inherit whatever the last project left running.
+    if let Ok(v) = serde_json::to_value(default_listeners()) {
+        let _ = state.ctx.store.put_setting(LISTENERS_KEY, &v);
+    }
     set_document(&dir, &state, None);
-    // A blank project has no extensions (its store has none), so this clears the
-    // previous project's ones from the running manager.
-    load_extensions_into(&state.ctx);
+    // Goes through `adopt` like `open_project` does, rather than reimplementing it. The
+    // inline copy is how the listeners default above had to be written by hand in the
+    // first place: a per-project field added to one path and missed in the other.
+    adopt(&state)?;
     Ok(project_info_of(&state))
 }
 
@@ -833,6 +1222,9 @@ pub fn open_project(app: tauri::AppHandle, state: State<AppState>, path: String)
     let bytes = std::fs::read(&path).map_err(|e| format!("Failed to read {path}: {e}"))?;
     let raw = if is_compressed(&bytes) { decompress_bytes(&bytes)? } else { bytes };
 
+    // After the file has been read and decompressed, so an unreadable project fails
+    // without having torn down the one that is still open.
+    release_project(&state);
     let wp = fresh_working_path(&dir);
     std::fs::write(&wp, &raw).map_err(|e| format!("Failed to open project: {e}"))?;
     switch_working(&dir, &state, &wp)?;
@@ -904,7 +1296,15 @@ fn snapshot_compress_to(ctx: &proxy::Ctx, dest: &Path) -> Result<(u64, u64), Str
 }
 
 /// Snapshot the live project, compress it, and write it to `path` as the document.
-async fn write_document(dir: PathBuf, state: State<'_, AppState>, path: PathBuf) -> CmdResult<SaveResult> {
+async fn write_document(dir: PathBuf, state: State<'_, AppState>, path: PathBuf, force: bool) -> CmdResult<SaveResult> {
+    if !force && document_is_stale(&state, &path) {
+        return Err(format!(
+            "{STALE_DOC}: {} changed on disk since this window opened or last saved it. \
+             Saving now would replace whatever is there. Another Ngintip instance, a sync \
+             client or an editor may have written it.",
+            path.display()
+        ));
+    }
     // Capture the latest script text (in case a file was edited without a UI change)
     // so the saved project carries a current, portable copy, and the debug console so
     // it travels with the project too.
@@ -930,7 +1330,9 @@ pub async fn save_project_as(app: tauri::AppHandle, state: State<'_, AppState>, 
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
     }
-    write_document(dir, state, path).await
+    // Save As is an explicit choice of destination, and the file dialog already asks
+    // before replacing an existing file, so it does not re-ask here.
+    write_document(dir, state, path, true).await
 }
 
 /// Folder offered for a new project when none was used before: `~/Documents/Ngintip`
@@ -949,7 +1351,8 @@ pub fn path_exists(path: String) -> bool {
 
 /// Save (compress) the current project to its existing document path.
 #[tauri::command]
-pub async fn save_project(app: tauri::AppHandle, state: State<'_, AppState>) -> CmdResult<SaveResult> {
+pub async fn save_project(app: tauri::AppHandle, state: State<'_, AppState>, force: Option<bool>) -> CmdResult<SaveResult> {
+    let force = force.unwrap_or(false);
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let doc = state
         .document
@@ -957,7 +1360,7 @@ pub async fn save_project(app: tauri::AppHandle, state: State<'_, AppState>) -> 
         .unwrap()
         .clone()
         .ok_or_else(|| "No project file yet. Use Save Project As first.".to_string())?;
-    write_document(dir, state, doc).await
+    write_document(dir, state, doc, force).await
 }
 
 /// Recent log lines shown in the Logs view.
@@ -975,6 +1378,37 @@ pub fn clear_logs(state: State<AppState>) {
 #[tauri::command]
 pub fn delete_logs(state: State<AppState>, ids: Vec<u64>) -> CmdResult<()> {
     state.ctx.store.delete_logs(&ids).map_err(|e| e.to_string())
+}
+
+/// Record a log line raised by the UI, so something the frontend discovers (the startup
+/// update check, for one) lands in the Logs view and is saved with the project like
+/// every other log line. The level has to be one of the four the UI filters on, or the
+/// entry would be invisible there; source and message are capped so a loop in the
+/// frontend cannot grow the log table without bound.
+#[tauri::command]
+pub fn app_log(state: State<AppState>, level: String, source: String, message: String) -> CmdResult<()> {
+    let level = log_level(&level).ok_or_else(|| format!("unknown log level {level:?}"))?;
+    let source = truncate_chars(source.trim(), 32);
+    let message = truncate_chars(message.trim(), 4096);
+    if source.is_empty() || message.is_empty() {
+        return Err("source and message are required".into());
+    }
+    state.ctx.log(level, &source, message);
+    Ok(())
+}
+
+/// The log levels the Logs view can filter on, as the `&'static str` [`proxy::Ctx::log`]
+/// wants. Anything else is rejected rather than quietly stored.
+fn log_level(level: &str) -> Option<&'static str> {
+    ["error", "warn", "info", "debug"].into_iter().find(|l| *l == level)
+}
+
+/// Cut a string to at most `max` chars (not bytes, so a multi-byte char is never split).
+fn truncate_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((cut, _)) => s[..cut].to_string(),
+        None => s.to_string(),
+    }
 }
 
 #[derive(Serialize)]
@@ -1849,6 +2283,34 @@ pub fn repeater_entry(state: State<AppState>, id: u64) -> CmdResult<Option<store
     state.ctx.store.repeater_entry(id).map_err(|e| e.to_string())
 }
 
+/// Store an attack's results with the project. Replaces the tab's previous run.
+#[tauri::command]
+pub async fn intruder_save_results(state: State<'_, AppState>, tab: u64, rows: Vec<store::IntruderRow>) -> CmdResult<()> {
+    let ctx = state.ctx.clone();
+    // Off the IPC thread: a large run is thousands of rows with their bodies.
+    tauri::async_runtime::spawn_blocking(move || ctx.store.intruder_save(tab, &rows))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// An attack's rows without their request/response text, for the results table.
+#[tauri::command]
+pub fn intruder_results(state: State<AppState>, tab: u64) -> CmdResult<Vec<store::IntruderRow>> {
+    state.ctx.store.intruder_results(tab).map_err(|e| e.to_string())
+}
+
+/// One row in full, fetched when the operator opens it.
+#[tauri::command]
+pub fn intruder_result(state: State<AppState>, tab: u64, n: u64) -> CmdResult<Option<store::IntruderRow>> {
+    state.ctx.store.intruder_result(tab, n).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn clear_intruder_results(state: State<AppState>, tab: u64) -> CmdResult<()> {
+    state.ctx.store.clear_intruder_results(tab).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn clear_repeater_history(state: State<AppState>, tab: u64) -> CmdResult<()> {
     state.ctx.store.clear_repeater_history(tab).map_err(|e| e.to_string())
@@ -1987,7 +2449,8 @@ fn request_flow(ctx: &proxy::Ctx, target: &str, raw: &str) -> CmdResult<store::F
         }
     }
     let body = raw::restore_crlf(&parsed.body, None, &parsed.headers);
-    Ok(store::Flow::request(ctx.store.next_id(), &method, &uri, version, &headers, body))
+    let (id, gen) = ctx.store.next_id_at();
+    Ok(store::Flow::request(id, &method, &uri, version, &headers, body).at(gen))
 }
 
 /// Send a request AND record it in History (the flows table), so MCP/tool-driven
@@ -2004,6 +2467,10 @@ pub async fn send_recorded(ctx: &std::sync::Arc<proxy::Ctx>, tab: Option<u64>, t
     if sent.is_some() {
         flow.variants.req_original = Some(raw.to_string());
     }
+    // Captured before `flow` is moved into the recorder below. The id exists from here
+    // on, so the caller can be handed it and read the exchange back instead of guessing
+    // which History row was its own.
+    let (recorded_id, recorded_ts) = (flow.summary.id, flow.summary.ts);
     let (request, proto) = repeater_request(target, sent_raw, auto_length, None)?;
 
     let started = Instant::now();
@@ -2020,17 +2487,27 @@ pub async fn send_recorded(ctx: &std::sync::Arc<proxy::Ctx>, tab: Option<u64>, t
     let result = match outcome {
         Ok((parts, bytes, truncated)) => {
             // Repeater-scope response extensions (e.g. decrypt) before display/record.
-            let (parts, bytes) = match ext_response(ctx, &parts, &bytes, &host, crate::extensions::Surface::Repeater).await {
+            let (parts, bytes, res_original) = match ext_response(ctx, &parts, &bytes, &host, crate::extensions::Surface::Repeater).await {
                 Some((p, b, original)) => {
-                    flow.variants.res_original = Some(original);
-                    (p, b)
+                    flow.variants.res_original = Some(original.clone());
+                    (p, b, Some(original))
                 }
-                None => (parts, bytes),
+                None => (parts, bytes, None),
             };
             flow.set_response(parts.status, parts.version, &parts.headers, bytes.clone());
             flow.summary.duration_ms = dur;
             ctx.record_flow(flow);
-            Ok(build_response(&parts, &bytes, truncated, dur))
+            let mut res = build_response(&parts, &bytes, truncated, dur);
+            // Hand back both versions, as `send_with_fallback` does for the UI: the
+            // caller (the MCP server) otherwise only ever sees the transformed message
+            // and cannot tell what actually crossed the wire.
+            res.response_original = res_original;
+            if sent.is_some() {
+                res.request_final = Some(sent_raw.replace("\r\n", "\n"));
+            }
+            res.flow_id = Some(recorded_id);
+            res.flow_ts = Some(recorded_ts);
+            Ok(res)
         }
         Err(e) => {
             flow.set_error(e.clone());
@@ -2159,6 +2636,8 @@ fn build_response(
         response_raw,
         response_image: raw::image_data_url(&headers, bytes),
         request_final: None,
+        flow_id: None,
+        flow_ts: None,
         response_original: None,
     }
 }
@@ -2283,6 +2762,219 @@ async fn repeater_exchange(ctx: &std::sync::Arc<proxy::Ctx>, request: Request<bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A working file belonging to another RUNNING instance must survive both sweeps.
+    /// Before this, a second instance deleted the first's live SQLite database on
+    /// startup; the victim kept capturing into an unlinked inode and lost everything
+    /// when it exited. pid 1 always exists on unix, so it stands in for a live peer.
+    #[test]
+    #[cfg(unix)]
+    fn the_working_sweep_spares_a_live_instance() {
+        let dir = std::env::temp_dir().join(format!("ngintip-sweep-{}", std::process::id()));
+        let wd = working_dir(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&wd).unwrap();
+
+        let mine = wd.join(format!("{}-1.ngintip", std::process::id()));
+        let live = wd.join("1-2.ngintip"); // pid 1 is running on every unix
+        let live_wal = wd.join("1-2.ngintip-wal");
+        let dead = wd.join("999999999-3.ngintip"); // past any real pid
+        let odd = wd.join("not-a-pid.ngintip");
+        for p in [&mine, &live, &live_wal, &dead, &odd] {
+            std::fs::write(p, b"x").unwrap();
+        }
+
+        clean_stray_working(&dir, None);
+
+        assert!(live.exists(), "deleted the live database of another instance");
+        assert!(live_wal.exists(), "deleted another instance's WAL, which loses committed rows");
+        assert!(odd.exists(), "deleted a file whose owner could not be read; unproven is not garbage");
+        assert!(!dead.exists(), "kept a dead run's leftover, so the sweep stopped sweeping");
+        assert!(!mine.exists(), "kept our own stale working file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `owner_is_live` reads the pid out of `<pid>-<nanos>.<ext>`, treats our own as
+    /// not-live (ours to delete) and anything unparseable as live.
+    #[test]
+    #[cfg(unix)]
+    fn ownership_is_read_from_the_working_filename() {
+        assert!(owner_is_live(Path::new("/w/1-123.ngintip")));
+        assert!(owner_is_live(Path::new("/w/1-123.ngintip-shm")));
+        assert!(owner_is_live(Path::new("/w/nonsense.ngintip")));
+        assert!(owner_is_live(Path::new("/w/-5-123.ngintip")), "a name with no readable pid must be kept");
+        assert!(!owner_is_live(Path::new("/w/999999999-123.ngintip")));
+        assert!(!owner_is_live(&PathBuf::from(format!("/w/{}-123.ngintip", std::process::id()))));
+    }
+
+    /// A save refuses only when the file at THIS session's document path is no longer
+    /// the one we wrote or opened. A different path, or no stamp at all, is not stale.
+    #[test]
+    fn a_document_changed_underneath_is_detected() {
+        let path = std::env::temp_dir().join(format!("ngintip-stale-{}.ngintip", std::process::id()));
+        std::fs::write(&path, b"original").unwrap();
+        let stamp = doc_stamp(&path).expect("stamped");
+
+        assert!(!stale_against(Some(&stamp), &path), "unchanged file reported as stale");
+        assert!(!stale_against(None, &path), "no stamp means nothing to compare against");
+        assert!(!stale_against(Some(&stamp), Path::new("/elsewhere.ngintip")), "another path is not this document");
+
+        std::fs::write(&path, b"replaced by another instance").unwrap();
+        assert!(stale_against(Some(&stamp), &path), "a rewritten document was not detected");
+
+        // A file that is gone is not stale: writing it back is exactly what Save means.
+        std::fs::remove_file(&path).unwrap();
+        assert!(!stale_against(Some(&stamp), &path));
+    }
+
+    /// Startup must take the document from the working copy it is opening, not from the
+    /// shared DOCUMENT_PTR, which any other instance rewrites on any save (including an
+    /// auto-save). With the pointer believed, this project would open under another
+    /// file's name and the next save would write it over that file.
+    #[test]
+    fn a_working_copy_names_its_own_document_not_the_shared_pointer() {
+        let dir = std::env::temp_dir().join(format!("ngintip-ptr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(working_dir(&dir)).unwrap();
+
+        let mine = format!("{}-1.{}", std::process::id(), brand::PROJECT_EXT);
+        let wp = working_dir(&dir).join(mine);
+        let ours = dir.join("ours.ngintip");
+        let theirs = dir.join("theirs.ngintip");
+        std::fs::write(&ours, b"a").unwrap();
+        std::fs::write(&theirs, b"b").unwrap();
+
+        {
+            let store = store::Store::open(&wp).unwrap();
+            store.put_setting(DOC_KEY, &serde_json::json!(ours.to_string_lossy())).unwrap();
+        }
+        write_ptr(&dir, WORKING_PTR, &wp);
+        write_ptr(&dir, DOCUMENT_PTR, &theirs); // what another instance's save left behind
+
+        let (_store, document) = open_startup(&dir).unwrap();
+        assert_eq!(document.as_deref(), Some(ours.as_path()), "startup believed the shared pointer over the project it actually opened");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn nics() -> Vec<(String, String)> {
+        vec![
+            ("lo0".into(), "127.0.0.1".into()),
+            ("en0".into(), "192.168.1.20".into()),
+            ("bridge100".into(), "192.168.64.1".into()),
+            ("utun4".into(), "10.8.0.6".into()),
+            ("OpenVPN TAP-Windows6".into(), "10.9.0.2".into()),
+        ]
+    }
+
+    #[test]
+    fn only_a_wildcard_or_tunnel_bind_counts_as_surprising_exposure() {
+        let n = nics();
+        // Wildcards reach every interface, including ones not up yet.
+        for host in ["0.0.0.0", "::", "[::]", "", "  ", "*", "0:0:0:0:0:0:0:0"] {
+            assert_eq!(exposure_of(host, &n), Exposure::All, "{host:?}");
+        }
+        // A VPN address: the far side is someone else's network.
+        assert_eq!(exposure_of("10.8.0.6", &n), Exposure::Tunnel);
+        assert_eq!(exposure_of("10.9.0.2", &n), Exposure::Tunnel);
+        // A deliberate LAN bind is normal work (driving the proxy from a phone).
+        assert_eq!(exposure_of("192.168.1.20", &n), Exposure::Lan);
+        assert_eq!(exposure_of("192.168.64.1", &n), Exposure::Lan);
+        // Loopback reaches nobody.
+        for host in ["127.0.0.1", "127.0.0.53", "::1", "[::1]", "localhost", "LocalHost"] {
+            assert_eq!(exposure_of(host, &n), Exposure::Local, "{host:?}");
+        }
+        // An address that is on no interface here: the bind would fail, so do not
+        // escalate it to a tunnel warning.
+        assert_eq!(exposure_of("203.0.113.9", &n), Exposure::Lan);
+    }
+
+    #[test]
+    fn tunnel_interface_names_are_recognised_without_catching_ethernet() {
+        for name in ["utun0", "utun12", "tun0", "tap0", "wg0", "ipsec1", "ppp0", "zt5u4", "nebula1", "tailscale0", "OpenVPN TAP-Windows6", "Corp VPN"] {
+            assert!(is_tunnel_interface(name), "{name} should be a tunnel");
+        }
+        for name in ["en0", "eth0", "wlan0", "bridge100", "lo0", "awdl0", "Ethernet", "Wi-Fi", "docker0"] {
+            assert!(!is_tunnel_interface(name), "{name} should not be a tunnel");
+        }
+    }
+
+    fn listener(id: &str, port: u16, enabled: bool) -> config::Listener {
+        config::Listener { id: id.into(), host: "127.0.0.1".into(), port, enabled }
+    }
+
+    #[test]
+    fn a_new_project_starts_with_one_loopback_listener() {
+        // The whole point of the per-project move: a new project must not inherit the
+        // previous one's extra listeners.
+        let d = default_listeners();
+        assert_eq!(d.len(), 1, "a fresh project gets exactly one listener");
+        assert_eq!(d[0].host, "127.0.0.1", "and it is loopback, not exposed to the LAN");
+        assert!(d[0].enabled);
+    }
+
+    #[test]
+    fn switching_projects_stops_only_the_listeners_the_new_one_does_not_want() {
+        let running = ["a".to_string(), "b".to_string(), "c".to_string()];
+        let wanted = vec![
+            listener("a", 8080, true),  // shared and enabled: keep the socket
+            listener("b", 8081, false), // saved as disabled: take it down
+            // "c" is absent: it belonged to the previous project
+            listener("d", 8083, true),  // not running yet: started afterwards, not here
+        ];
+        assert_eq!(stale_listener_ids(&running, &wanted), vec!["b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn a_project_with_no_listeners_of_its_own_stops_everything() {
+        let running = ["a".to_string(), "b".to_string()];
+        assert_eq!(stale_listener_ids(&running, &[]), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn listeners_round_trip_through_a_project_setting() {
+        // What makes them per-project: the set has to come back out of the project store
+        // exactly as it went in, including a disabled one and a LAN bind.
+        let path = std::env::temp_dir().join(format!("intip-listeners-{}.intip", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = crate::store::Store::open(&path).unwrap();
+
+        let saved = vec![
+            listener("default", 8080, true),
+            config::Listener { id: "lan".into(), host: "0.0.0.0".into(), port: 8081, enabled: false },
+        ];
+        store.put_setting(LISTENERS_KEY, &serde_json::to_value(&saved).unwrap()).unwrap();
+
+        let back: Vec<config::Listener> =
+            serde_json::from_value(store.get_setting(LISTENERS_KEY).unwrap().unwrap()).unwrap();
+        assert_eq!(back, saved);
+
+        // A project that never saved a set is distinguishable from one that saved none,
+        // which is what decides between "inherit once" and "stop everything".
+        assert!(store.get_setting("listeners_other").unwrap().is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn app_log_accepts_only_the_levels_the_ui_filters_on() {
+        for ok in ["error", "warn", "info", "debug"] {
+            assert_eq!(log_level(ok), Some(ok));
+        }
+        // Anything else would be stored but invisible behind every level tab.
+        for bad in ["trace", "INFO", "fatal", "", "info "] {
+            assert_eq!(log_level(bad), None, "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn app_log_caps_its_inputs_without_splitting_a_char() {
+        assert_eq!(truncate_chars("short", 32), "short");
+        assert_eq!(truncate_chars("abcdef", 3), "abc");
+        // Multi-byte: cutting by bytes here would produce invalid UTF-8 and panic.
+        assert_eq!(truncate_chars("ngintip -> cegat", 7), "ngintip");
+        assert_eq!(truncate_chars("\u{e9}\u{e9}\u{e9}", 2), "\u{e9}\u{e9}");
+        assert_eq!(truncate_chars("", 8), "");
+    }
 
     #[test]
     fn compress_round_trips_and_is_zstd() {

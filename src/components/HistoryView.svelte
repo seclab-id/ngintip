@@ -448,7 +448,7 @@
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div style="display:contents" onpointerdowncapture={() => (activePane = 'req')} onfocusincapture={() => (activePane = 'req')}>
           <MessageView bind:this={reqRef} title="Request" raw={detail?.requestRaw} placeholder="Select a request to see details"
-            truncated={detail?.requestTruncatedView} loadFull={() => store.flowBody(current.id, 'request')} variants={reqVariants}
+            truncated={detail?.requestTruncatedView} loadFull={() => store.flowBody(current.id, 'request')} variants={reqVariants} side="req"
             isBinary={detail?.requestIsBinary} loadHex={() => store.flowHex(current.id, 'request')} preferPretty
             ondecode={(t) => (miniDecode = { text: t })} onsend={(t) => store.sendStringToDecoder(t)} />
         </div>
@@ -460,7 +460,7 @@
             <WsView flowId={current.id} handshake={detail?.responseRaw} />
           {:else}
             <MessageView bind:this={resRef} title="Response" raw={detail?.responseRaw} isImage={detail?.responseIsImage} loadImage={() => store.flowImage(current.id)}
-              truncated={detail?.responseTruncatedView} loadFull={() => store.flowBody(current.id, 'response')} variants={resVariants}
+              truncated={detail?.responseTruncatedView} loadFull={() => store.flowBody(current.id, 'response')} variants={resVariants} side="res"
               isBinary={detail?.responseIsBinary} loadHex={() => store.flowHex(current.id, 'response')} preferPretty
               ondecode={(t) => (miniDecode = { text: t })} onsend={(t) => store.sendStringToDecoder(t)} />
           {/if}

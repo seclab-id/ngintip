@@ -1,3 +1,8 @@
+// The MCP tool catalogue is one `json!` literal per tool inside one array, and that
+// macro expands recursively; the default limit of 128 is reached once the catalogue
+// passes about thirty tools. Compile-time only, no runtime effect.
+#![recursion_limit = "256"]
+
 mod body;
 mod brand;
 mod browser;
@@ -39,6 +44,11 @@ pub struct AppState {
     pub config_path: std::path::PathBuf,
     /// The `.ngintip` document the project is saved to/from (None until saved).
     pub document: Mutex<Option<std::path::PathBuf>>,
+    /// What this process believes is on disk at the document path: its path, length and
+    /// modified time as of the last time we wrote or loaded it. A save compares the file
+    /// against this before replacing it, so a document another instance (or a sync
+    /// client, or the user in Finder) changed underneath is never silently overwritten.
+    pub doc_stamp: Mutex<Option<(std::path::PathBuf, u64, std::time::SystemTime)>>,
     /// Running MCP server (lets an LLM drive Ngintip), if enabled.
     pub mcp: Mutex<Option<commands::McpRunning>>,
     /// Process/system resource stats for the Usage panel.
@@ -227,6 +237,7 @@ pub fn run() {
                 server: Mutex::new(Vec::new()),
                 config: Mutex::new(config),
                 config_path,
+                doc_stamp: Mutex::new(document.as_deref().and_then(commands::doc_stamp)),
                 document: Mutex::new(document),
                 mcp: Mutex::new(None),
                 usage: Mutex::new(usage::Usage::new()),
@@ -251,6 +262,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::list_listeners,
             commands::start_listeners,
+            commands::sync_listeners,
             commands::stop_listeners,
             commands::add_listener,
             commands::remove_listener,
@@ -285,6 +297,7 @@ pub fn run() {
             commands::logs,
             commands::clear_logs,
             commands::delete_logs,
+            commands::app_log,
             commands::get_config,
             commands::set_auth,
             commands::set_invisible,
@@ -306,6 +319,10 @@ pub fn run() {
             commands::repeater_history,
             commands::repeater_entry,
             commands::clear_repeater_history,
+            commands::intruder_save_results,
+            commands::intruder_results,
+            commands::intruder_result,
+            commands::clear_intruder_results,
             commands::project_info,
             commands::open_project,
             commands::blank_project,

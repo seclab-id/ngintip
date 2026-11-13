@@ -1,6 +1,7 @@
 <script>
   import CodeEditor from './CodeEditor.svelte';
   import MessageView from './MessageView.svelte';
+  import { repeaterPref } from '../lib/viewprefs.svelte.js';
   import MiniDecoder from './MiniDecoder.svelte';
   import SplitPane from './SplitPane.svelte';
   import CaptureEditor from './CaptureEditor.svelte';
@@ -73,11 +74,21 @@
   let resView = $state('final'); // 'final' (transformed) | 'original' (as it arrived)
   let reqFinal = $derived(tab?.response?.requestFinal ?? null);
   let resOriginal = $derived(tab?.response?.responseOriginal ?? null);
-  // Back to the editable/transformed default when the active tab changes.
+  function pickReqView(id) {
+    reqView = id;
+    repeaterPref.req.pick(id);
+  }
+  function pickResView(id) {
+    resView = id;
+    repeaterPref.res.pick(id);
+  }
+  // Reopen on the version last chosen when the active tab changes, but only when this
+  // send actually produced it: without a transformed request there is no Sent to show,
+  // and without an arrived original there is no Original.
   $effect(() => {
     tab?.id;
-    reqView = 'typed';
-    resView = 'final';
+    reqView = repeaterPref.req.openOn(reqFinal ? ['typed', 'sent'] : ['typed']);
+    resView = repeaterPref.res.openOn(resOriginal ? ['final', 'original'] : ['final']);
   });
 
   // In-pane find/search. The bottom-bar Find button opens the search on whichever
@@ -162,6 +173,18 @@
 
   const SWATCH_HEX = { red: '#ff5c6c', orange: '#ff9345', yellow: '#f2c94c', green: '#3ecf8e', cyan: '#38c7d6', blue: '#4f9dff', purple: '#9b7bff', pink: '#f06bb8', gray: '#8a92a6' };
   const groupColor = (name) => rep.groupColors?.[name] || 'var(--accent)';
+
+  // A brand-new group takes the first swatch no other group is using, so two groups
+  // made one after another never look alike. Past the ninth it wraps, which is the
+  // point where the colours stop carrying meaning anyway.
+  const PALETTE = HIGHLIGHTS.map((c) => SWATCH_HEX[c]);
+  function nextGroupColor() {
+    const used = new Set(Object.values(rep.groupColors ?? {}));
+    return PALETTE.find((hex) => !used.has(hex)) ?? PALETTE[Object.keys(rep.groupColors ?? {}).length % PALETTE.length];
+  }
+
+  /** Which tabs a group shows: a collapsed one still shows the tab you are editing. */
+  const shownTabs = (g) => (!g.name || !isCollapsed(g.name) ? g.tabs : g.tabs.filter((t) => t.id === tab?.id));
 
   function setGroupColor(name, hex) {
     rep.groupColors = { ...rep.groupColors, [name]: hex };
@@ -317,8 +340,19 @@
   function confirmGroupModal() {
     const name = groupModal?.name.trim();
     if (name) {
-      if (groupModal.mode === 'new') moveTab(groupModal.tabId, name);
-      else renameGroup(groupModal.oldName, name);
+      if (groupModal.mode === 'new') {
+        // Freshness has to be read before the move, because `groupNames` is derived
+        // from the tabs: after moveTab the name exists either way.
+        const fresh = !groupNames.includes(name);
+        const colour = fresh ? nextGroupColor() : null;
+        moveTab(groupModal.tabId, name);
+        if (fresh) {
+          setGroupColor(name, colour);
+          // New groups start closed. The tab you were on stays visible inside the
+          // collapsed group (see shownTabs), so grouping never hides your own work.
+          if (!isCollapsed(name)) rep.collapsedGroups = [...(rep.collapsedGroups ?? []), name];
+        }
+      } else renameGroup(groupModal.oldName, name);
     }
     groupModal = null;
   }
@@ -545,8 +579,8 @@
           <button class="group-send" title="Send all in this group (sequential / parallel)" onclick={(e) => openGroupSend(e, g.name)}>▶</button>
         </div>
       {/if}
-      {#if !g.name || !isCollapsed(g.name)}
-        {#each g.tabs as t (t.id)}
+      {#if shownTabs(g).length}
+        {#each shownTabs(g) as t (t.id)}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
             class="tab"
@@ -682,8 +716,8 @@
         {#if reqFinal}
           <div class="ext-seg" role="group" aria-label="Request view">
             <span class="ext-badge" title="A repeater-scope extension changed the request before sending">ext</span>
-            <button class="seg" class:on={reqView === 'typed'} onclick={() => (reqView = 'typed')}>Typed</button>
-            <button class="seg" class:on={reqView === 'sent'} title="What was actually sent after the extension" onclick={() => (reqView = 'sent')}>Sent</button>
+            <button class="seg" class:on={reqView === 'typed'} onclick={() => pickReqView('typed')}>Typed</button>
+            <button class="seg" class:on={reqView === 'sent'} title="What was actually sent after the extension" onclick={() => pickReqView('sent')}>Sent</button>
           </div>
         {/if}
         <div class="spacer"></div>
@@ -721,8 +755,8 @@
         {#if resOriginal}
           <div class="ext-seg res" role="group" aria-label="Response view">
             <span class="ext-badge" title="A repeater-scope extension transformed the response">ext</span>
-            <button class="seg" class:on={resView === 'final'} title="After the extension (e.g. decrypted)" onclick={() => (resView = 'final')}>Final</button>
-            <button class="seg" class:on={resView === 'original'} title="As it arrived on the wire" onclick={() => (resView = 'original')}>Original</button>
+            <button class="seg" class:on={resView === 'final'} title="After the extension (e.g. decrypted)" onclick={() => pickResView('final')}>Final</button>
+            <button class="seg" class:on={resView === 'original'} title="As it arrived on the wire" onclick={() => pickResView('original')}>Original</button>
           </div>
         {/if}
         <MessageView

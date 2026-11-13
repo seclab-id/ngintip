@@ -5,12 +5,13 @@
 //!
 //! Transport: MCP "Streamable HTTP". Clients POST JSON-RPC to the endpoint and
 //! get a JSON response; GET <docs_path> returns human/LLM docs. Bound to
-//! 127.0.0.1 only — the tools are powerful, so it's local-only by design.
+//! 127.0.0.1 only: the tools are powerful, so it's local-only by design.
 
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Instant;
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::Bytes;
 use http::{header, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
@@ -178,6 +179,62 @@ fn arg_u64(a: &Value, k: &str, d: u64) -> u64 {
     a.get(k).and_then(|v| v.as_u64()).unwrap_or(d)
 }
 
+/// An integer argument, strictly.
+///
+/// `arg_u64` falls back to its default on anything it cannot read, which is fine for a
+/// limit but wrong for a paging cursor: `{"beforeId": "4071"}`, which models emit
+/// constantly, would silently mean "start from the newest again" and the caller would
+/// re-read page one forever. That is an infinite loop, not a wrong answer. An all-digit
+/// string is accepted, because that is a near miss rather than a different intent.
+fn arg_int(a: &Value, k: &str, d: u64) -> Result<u64, String> {
+    match a.get(k) {
+        None | Some(Value::Null) => Ok(d),
+        Some(Value::Number(n)) => n.as_u64().ok_or_else(|| format!("{k} must be a whole number, zero or more")),
+        Some(Value::String(t)) if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) => {
+            t.parse().map_err(|_| format!("{k} is too large"))
+        }
+        Some(v) => Err(format!("{k} must be a whole number, not {v}")),
+    }
+}
+
+/// A string argument restricted to a fixed set. An unknown value is refused rather than
+/// quietly replaced by the default, so the caller is told instead of being misled.
+fn arg_enum(a: &Value, k: &str, allowed: &[&str], d: &str) -> Result<String, String> {
+    let v = arg_str(a, k);
+    if v.trim().is_empty() {
+        return Ok(d.to_string());
+    }
+    let v = v.trim().to_ascii_lowercase();
+    if allowed.contains(&v.as_str()) {
+        Ok(v)
+    } else {
+        Err(format!("invalid {k} '{v}'; use one of: {}", allowed.join(", ")))
+    }
+}
+
+/// Refuse an argument this tool deliberately does not have, naming the one to use
+/// instead. A silently ignored parameter is the bug class this whole surface is trying
+/// to avoid, and `offset` on a live list is the one a model reaches for by habit.
+fn reject_arg(a: &Value, k: &str, instead: &str) -> Result<(), String> {
+    if a.get(k).is_some_and(|v| !v.is_null()) {
+        return Err(format!("{k} is not how this tool pages; {instead}"));
+    }
+    Ok(())
+}
+
+/// First `max` bytes of `s`, cut on a character boundary, plus whether it was cut.
+/// Bytes, not characters, because every other size in this API is bytes.
+fn clip(s: &str, max: usize) -> (String, bool) {
+    if s.len() <= max {
+        return (s.to_string(), false);
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (s[..end].to_string(), true)
+}
+
 async fn call_tool(ctx: &Arc<Ctx>, name: &str, a: &Value) -> Result<String, String> {
     match name {
         "history_list" => history_list(ctx, a),
@@ -186,6 +243,7 @@ async fn call_tool(ctx: &Arc<Ctx>, name: &str, a: &Value) -> Result<String, Stri
         "history_set_note" => history_set_note(ctx, a),
         "history_set_color" => history_set_color(ctx, a),
         "history_get_color" => history_get_color(ctx, a),
+        "ws_messages" => ws_messages(ctx, a),
         "scope_get" => scope_get(ctx),
         "scope_set" => scope_set(ctx, a),
         "scope_check" => scope_check(ctx, a),
@@ -201,6 +259,7 @@ async fn call_tool(ctx: &Arc<Ctx>, name: &str, a: &Value) -> Result<String, Stri
         "organizer_list" => organizer_list(ctx, a),
         "organizer_get" => organizer_get(ctx, a),
         "organizer_save" => organizer_save(ctx, a),
+        "findings_add" => findings_add(ctx, a),
         "organizer_set" => organizer_set(ctx, a),
         "vault_list" => vault_list(ctx, a),
         "vault_get" => vault_get(ctx, a),
@@ -220,12 +279,15 @@ async fn call_tool(ctx: &Arc<Ctx>, name: &str, a: &Value) -> Result<String, Stri
             }
         }
         "extensions_logs" => ok_json(json!({ "logs": ctx.extensions.logs() })),
+        "proxy_status" => proxy_status(ctx),
         other => Err(format!("unknown tool: {other}")),
     }
 }
 
+/// Tool output. Compact, not pretty-printed: indentation is about 19% of a flow
+/// listing and no reader of this API needs it.
 fn ok_json(v: Value) -> Result<String, String> {
-    Ok(serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into()))
+    Ok(serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()))
 }
 
 // ---- history ----------------------------------------------------------------
@@ -238,7 +300,14 @@ fn history_list(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
     // Restrict to hosts in the target scope; default off, so nothing is hidden
     // unless asked. An empty scope means everything is in scope.
     let in_scope = a.get("inScope").and_then(|v| v.as_bool()).unwrap_or(false);
-    let limit = arg_u64(a, "limit", 100).clamp(1, 1000) as usize;
+    let limit = arg_int(a, "limit", 100)?.clamp(1, 1000) as usize;
+    // Paging by index over a live, newest-first capture is wrong by construction: flows
+    // arrive at the newest end, so every page boundary shifts and the caller silently
+    // re-reads rows it has seen and silently skips rows it has not. Ids are monotonic
+    // and are already the sort key, so a keyset cursor is exact. Refuse `offset` out
+    // loud rather than ignoring it.
+    reject_arg(a, "offset", "pass beforeId, set to the nextBeforeId from your last page; ids stay stable while capture runs, an index does not")?;
+    let before = arg_int(a, "beforeId", 0)?;
 
     let mut all = ctx.store.summaries().map_err(|e| e.to_string())?;
     all.retain(|f| {
@@ -250,38 +319,437 @@ fn history_list(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
                 || format!("{} {} {}", f.method, f.host, f.path).to_ascii_lowercase().contains(&contains))
     });
     let total = all.len();
-    let items: Vec<Value> = all.iter().rev().take(limit).map(|f| serde_json::to_value(f).unwrap_or(Value::Null)).collect();
-    ok_json(json!({ "total": total, "returned": items.len(), "flows": items }))
+    let newest = all.last().map(|f| f.id).unwrap_or(0);
+    let (items, has_more, next) = page_flows(&all, before, limit);
+    let mut out = json!({
+        // Rows matching the filters right now. Recomputed per call, so it drifts while
+        // capture runs; `newestId` is how the caller sees that it moved.
+        "total": total,
+        "newestId": newest,
+        "returned": items.len(),
+        "hasMore": has_more,
+        "flows": items,
+    });
+    if let Some(n) = next {
+        out["nextBeforeId"] = json!(n);
+    }
+    ok_json(out)
+}
+
+/// One page of summaries, newest first, with ids below `before` (0 means start at the
+/// newest). Returns the rows, whether more follow, and the cursor for the next page.
+///
+/// The cursor is only reported when more actually follow: a cursor that is still there
+/// once the list is exhausted is an invitation to page forever.
+fn page_flows(all: &[crate::store::FlowSummary], before: u64, limit: usize) -> (Vec<Value>, bool, Option<u64>) {
+    let mut items: Vec<Value> = Vec::with_capacity(limit.min(256));
+    let mut last = None;
+    let mut has_more = false;
+    for f in all.iter().rev().filter(|f| before == 0 || f.id < before) {
+        if items.len() == limit {
+            has_more = true;
+            break;
+        }
+        last = Some(f.id);
+        items.push(serde_json::to_value(f).unwrap_or(Value::Null));
+    }
+    (items, has_more, if has_more { last } else { None })
+}
+
+/// Which versions of a flow's message `history_get` can return. The wire bytes are
+/// canonical, so they are always what `request`/`response` mean under the default view;
+/// the other versions are additions, never replacements.
+const VIEWS: [&str; 3] = ["auto", "wire", "extension"];
+
+/// Which message a read is about. Naming one side is how a body is paged, and it halves
+/// the reply for free when only one side matters.
+const SIDES: [&str; 3] = ["both", "request", "response"];
+
+/// Which part of a message to return. `headers` is the cheapest useful read by a wide
+/// margin: it answers most header questions for a few hundred bytes.
+const PARTS: [&str; 3] = ["all", "headers", "body"];
+
+/// How a body comes back. `text` is the decoded body as lossy UTF-8; `base64` is the
+/// bytes themselves, for a body that is not text.
+const ENCODINGS: [&str; 2] = ["text", "base64"];
+
+/// Default body bytes per side for a deliberate read.
+///
+/// Deliberately larger than [`RESP_PREVIEW`], which is a glance inside a send reply that
+/// also hands back a `flowId` to fetch the rest with. This is the size of a read someone
+/// asked for, and 8 KB cuts most JSON and HTML mid-document.
+const BODY_PREVIEW: usize = 32 * 1024;
+
+/// Most body bytes one call will return as text.
+const BODY_MAX: usize = 1024 * 1024;
+
+/// Base64 carries a third more characters than the bytes inside it and tokenizes badly,
+/// so it gets a tighter ceiling of its own.
+const B64_MAX: usize = 8 * 1024;
+
+/// Explains the extra keys to whatever model is reading them, once, only when they are
+/// actually present. Without this an agent sees two texts for one message and has no way
+/// to know which one the server really sent.
+const VERSIONS_NOTE: &str = "`request`/`response` are the bytes on the wire. `requestExtension`/`responseExtension` are the same message after a decode_* extension made it readable (e.g. decrypted) - display only, never sent. `requestOriginal`/`responseOriginal` are what the message was before an intercept edit or an encode_*/process_* extension changed it.";
+
+/// Why a read can be complete and still not be the whole message.
+const CAPTURE_NOTE: &str = "Capture stored only the start of this body, so even a complete read of it is less than what crossed the wire.";
+
+/// One side of a flow, rendered: the text, plus the receipt that says what the text is
+/// and, more usefully, what it is not.
+struct Side {
+    text: String,
+    receipt: Option<Value>,
+}
+
+/// Split a rendered message into its head (through the blank line) and its body. A head
+/// ends at the first blank line by definition, which is what parsing one relies on too.
+fn split_head_body(text: &str) -> (&str, &str) {
+    match text.find("\n\n") {
+        Some(i) => text.split_at(i + 2),
+        None => (text, ""),
+    }
+}
+
+/// A byte range of an already-rendered body, snapped to character boundaries. Returns
+/// the text, the offset the next page starts at, and whether more follows.
+fn str_slice(body: &str, offset: usize, max: usize) -> (String, usize, bool) {
+    if offset >= body.len() {
+        return (String::new(), body.len(), false);
+    }
+    let mut start = offset;
+    while start < body.len() && !body.is_char_boundary(start) {
+        start += 1;
+    }
+    let (text, cut) = clip(&body[start..], max);
+    let next = start + text.len();
+    (text, next, cut)
+}
+
+/// A flow's request or response as `history_get` returns it, honouring `part`, the byte
+/// range and the encoding.
+fn wire_side(f: &crate::store::Flow, is_req: bool, part: &str, offset: usize, max: usize, b64: bool) -> Side {
+    let headers = if is_req { &f.req_headers } else { &f.res_headers };
+    let body: &[u8] = if is_req { &f.req_body } else { &f.res_body };
+    let captured_cut = if is_req { f.req_truncated } else { f.res_truncated };
+
+    // A request that never got a response keeps the text it has always had.
+    if !is_req && f.res_version.is_empty() {
+        return Side {
+            text: raw::response_text_full(f),
+            receipt: Some(json!({ "noResponse": true, "complete": true })),
+        };
+    }
+
+    let head = if is_req { raw::request_head(f) } else { raw::response_head(f).unwrap_or_default() };
+    let body_bytes = raw::decoded_len(headers, body);
+
+    if part == "headers" {
+        let mut r = json!({ "part": "headers", "complete": true, "bodyIncluded": false });
+        if !body.is_empty() {
+            if let Some(n) = body_bytes {
+                r["bodyBytes"] = json!(n);
+            }
+            r["note"] = json!("Headers only; the body was not read. Ask with part=body to page it.");
+        }
+        return Side { text: head, receipt: Some(r) };
+    }
+
+    // A binary body as lossy UTF-8 is unusable: each invalid byte becomes a three-byte
+    // replacement character, so the reply can be larger than the body and carries no
+    // information at all. Hand back the head and say how to ask for the bytes.
+    if raw::body_is_binary(headers, body) && !b64 {
+        let mut r = json!({
+            "part": part,
+            "binary": true,
+            "mime": f.summary.mime,
+            "returned": 0,
+            "complete": false,
+            "bodyIncluded": false,
+            "note": format!("Binary body not returned as text, which would be replacement characters. Ask with part=body and encoding=base64 for up to {B64_MAX} bytes of it, or stay with part=headers."),
+        });
+        if let Some(n) = body_bytes {
+            r["bodyBytes"] = json!(n);
+        }
+        if captured_cut {
+            r["capturedTruncated"] = json!(true);
+            r["captureNote"] = json!(CAPTURE_NOTE);
+        }
+        return Side { text: if part == "body" { String::new() } else { head }, receipt: Some(r) };
+    }
+
+    if b64 {
+        let (bytes, more) = raw::body_range(headers, body, offset, max);
+        let n = bytes.len();
+        let mut r = json!({
+            "part": "body",
+            "encoding": "base64",
+            "unit": "bytes of the decoded body (Content-Encoding undone)",
+            "offset": offset,
+            "returned": n,
+            "complete": offset == 0 && !more,
+            "hasMore": more,
+        });
+        if more {
+            r["nextOffset"] = json!(offset + n);
+        }
+        if let Some(bb) = body_bytes {
+            r["bodyBytes"] = json!(bb);
+        }
+        if captured_cut {
+            r["capturedTruncated"] = json!(true);
+            r["captureNote"] = json!(CAPTURE_NOTE);
+        }
+        return Side { text: STANDARD.encode(&bytes), receipt: Some(r) };
+    }
+
+    let sl = raw::body_slice(headers, body, offset, max);
+    if part == "all" && offset == 0 && !sl.more {
+        // Unchanged from before this tool could slice: the whole message, including the
+        // inline truncation and streaming notes the viewer has always appended.
+        let text = if is_req { raw::request_text_full(f) } else { raw::response_text_full(f) };
+        let receipt = captured_cut
+            .then(|| json!({ "part": "all", "complete": true, "capturedTruncated": true, "captureNote": CAPTURE_NOTE }));
+        return Side { text, receipt };
+    }
+
+    let complete = offset == 0 && !sl.more;
+    let mut r = json!({
+        "part": part,
+        "unit": "bytes of the decoded body (Content-Encoding undone), rendered as lossy UTF-8",
+        "offset": sl.start,
+        "returned": sl.text.len(),
+        "complete": complete,
+        "hasMore": sl.more,
+    });
+    if sl.more {
+        r["nextOffset"] = json!(sl.next);
+    }
+    if let Some(bb) = body_bytes {
+        r["bodyBytes"] = json!(bb);
+    }
+    if captured_cut {
+        r["capturedTruncated"] = json!(true);
+        r["captureNote"] = json!(CAPTURE_NOTE);
+    }
+    // Nothing is appended to the text itself: a caller may be diffing or hashing it, and
+    // an English note inside the bytes would corrupt that. The receipt carries it all.
+    let text = if part == "body" { sl.text } else { format!("{head}{}", sl.text) };
+    Side { text, receipt: Some(r) }
+}
+
+/// A variant (an extension-decoded or pre-edit message) cut the same way as the wire, so
+/// a body cap is not quietly defeated by asking for another version of the same body.
+fn variant_side(text: &str, part: &str, offset: usize, max: usize) -> Side {
+    let (head, body) = split_head_body(text);
+    if part == "headers" {
+        return Side { text: head.to_string(), receipt: None };
+    }
+    let (slice, next, more) = str_slice(body, offset, max);
+    let complete = offset == 0 && !more;
+    let out = if part == "body" { slice } else { format!("{head}{slice}") };
+    if complete {
+        return Side { text: out, receipt: None };
+    }
+    let mut r = json!({ "offset": offset, "returned": next.saturating_sub(offset), "complete": false, "hasMore": more });
+    if more {
+        r["nextOffset"] = json!(next);
+    }
+    Side { text: out, receipt: Some(r) }
 }
 
 fn history_get(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
-    let id = arg_u64(a, "id", 0);
-    let flow = ctx.store.get(id).map_err(|e| e.to_string())?.ok_or_else(|| format!("no flow {id}"))?;
-    ok_json(json!({
+    let id = arg_int(a, "id", 0)?;
+    let view = arg_enum(a, "view", &VIEWS, "auto")?;
+    let side = arg_enum(a, "side", &SIDES, "both")?;
+    let part = arg_enum(a, "part", &PARTS, "all")?;
+    let b64 = arg_enum(a, "encoding", &ENCODINGS, "text")? == "base64";
+    if b64 && part != "body" {
+        return Err("encoding=base64 returns body bytes; pass part=body with it".into());
+    }
+    let ceiling = if b64 { B64_MAX } else { BODY_MAX };
+    let max = arg_int(a, "maxBytes", if b64 { B64_MAX } else { BODY_PREVIEW } as u64)?.clamp(1, ceiling as u64) as usize;
+    let offset = arg_int(a, "offset", 0)? as usize;
+    if offset > 0 && side == "both" {
+        return Err("offset addresses one body; pass side=request or side=response with it".into());
+    }
+    if offset > 0 && part == "headers" {
+        return Err("offset addresses a body; part=headers has none".into());
+    }
+
+    let flow = match ctx.store.get(id).map_err(|e| e.to_string())? {
+        Some(f) => f,
+        // An id a send handed back can be read a moment before its row lands, because
+        // recording happens on a background thread. Saying "no flow" there would read as
+        // "the proxy did not record my request", which invites sending it again.
+        None if id > 0 && id <= ctx.store.peek_id() => {
+            return Err(format!(
+                "flow {id} has been allocated but is not in the store yet: recording happens on a background thread. Retry once. If it never appears, it was not recorded."
+            ))
+        }
+        None => return Err(format!("no flow {id}")),
+    };
+
+    let want_req = side != "response";
+    let want_res = side != "request";
+    let mut out = json!({
         "summary": serde_json::to_value(&flow.summary).unwrap_or(Value::Null),
-        "request": raw::request_text_full(&flow),
-        "response": raw::response_text_full(&flow),
-    }))
+        "view": if view == "extension" { "extension" } else { "wire" },
+        "side": side,
+        "part": part,
+    });
+    if b64 {
+        out["encoding"] = json!("base64");
+    }
+    // Was only ever English appended to the end of the text before, which a sliced read
+    // would have dropped silently.
+    if flow.summary.streaming {
+        out["streaming"] = json!(true);
+        out["streamingNote"] = json!("This response is a provisional preview; a final version will replace it.");
+    }
+    // WebSocket messages are not part of the handshake, so a flow that carried them
+    // looks empty here unless it says so. Omitted entirely when there are none.
+    if let Ok(ws) = ctx.store.ws_stats(id) {
+        if ws.count > 0 {
+            out["wsMessages"] = json!(ws.count);
+            out["wsNote"] = json!(format!(
+                "This flow carried {} WebSocket messages, which are not part of the handshake above. Call ws_messages with flowId {id} to read them.",
+                ws.count
+            ));
+        }
+    }
+
+    // Computing a decoded version runs an extension hook, a synchronous Python round
+    // trip, so a headers-only read must not pay for one.
+    let variants = if part == "headers" || view == "wire" {
+        if part == "headers" && view != "wire" && ctx.extensions.active() {
+            out["versionsNote"] = json!("part=headers never includes other versions: producing one runs an extension hook, which is wasted when only headers were asked for. Ask for the body to see them.");
+        }
+        None
+    } else {
+        Some(crate::commands::flow_variants(ctx, &flow))
+    };
+
+    let add = |out: &mut Value, key: &str, s: Side| {
+        out[key] = json!(s.text);
+        if let Some(r) = s.receipt {
+            out[format!("{key}Slice")] = r;
+        }
+    };
+
+    // Only count a version that actually DIFFERS from the wire. A hook that changed
+    // nothing can still come back as "changed": the extension runner re-serializes with
+    // CRLF and `flow_variants` normalises that back, so the bytes differed while the
+    // text did not. Rendering the wire text to compare against is not free, so it only
+    // happens when there is a variant to compare at all, which usually there is not.
+    let (mut req_ext, mut res_ext, mut req_orig, mut res_orig) = (None, None, None, None);
+    if let Some(v) = &variants {
+        if !v.is_empty() {
+            let wire_req = raw::request_text_full(&flow);
+            let wire_res = raw::response_text_full(&flow);
+            let keep = |alt: &Option<String>, wire: &str| alt.as_deref().filter(|t| *t != wire).map(str::to_string);
+            req_ext = keep(&v.req_extension, &wire_req);
+            res_ext = keep(&v.res_extension, &wire_res);
+            req_orig = keep(&v.req_original, &wire_req);
+            res_orig = keep(&v.res_original, &wire_res);
+        }
+    }
+
+    if view == "extension" {
+        // The readable form in the usual place, for a caller that only wants plaintext.
+        // Falling back to the wire keeps the shape predictable: there is always a message
+        // here, and the flags say whether a decode produced it.
+        if want_req {
+            add(&mut out, "request", match &req_ext {
+                Some(t) => variant_side(t, &part, offset, max),
+                None => wire_side(&flow, true, &part, offset, max, b64),
+            });
+            out["requestDecoded"] = json!(req_ext.is_some());
+        }
+        if want_res {
+            add(&mut out, "response", match &res_ext {
+                Some(t) => variant_side(t, &part, offset, max),
+                None => wire_side(&flow, false, &part, offset, max, b64),
+            });
+            out["responseDecoded"] = json!(res_ext.is_some());
+        }
+        return ok_json(out);
+    }
+
+    if want_req {
+        add(&mut out, "request", wire_side(&flow, true, &part, offset, max, b64));
+    }
+    if want_res {
+        add(&mut out, "response", wire_side(&flow, false, &part, offset, max, b64));
+    }
+
+    {
+        // Identical text would double what the caller has to read for nothing, and this
+        // mirrors the window, where the switcher appears only when a version differs.
+        let candidates = [
+            ("requestExtension", req_ext, true),
+            ("responseExtension", res_ext, false),
+            ("requestOriginal", req_orig, true),
+            ("responseOriginal", res_orig, false),
+        ];
+        let mut versions = serde_json::Map::new();
+        for (key, text, is_req) in candidates {
+            if (is_req && !want_req) || (!is_req && !want_res) {
+                continue;
+            }
+            if let Some(t) = text {
+                let s = variant_side(&t, &part, offset, max);
+                versions.insert(key.into(), Value::String(s.text));
+                if let Some(r) = s.receipt {
+                    versions.insert(format!("{key}Slice"), r);
+                }
+            }
+        }
+        if !versions.is_empty() {
+            out["versions"] = Value::Object(versions);
+            out["versionsNote"] = json!(VERSIONS_NOTE);
+        }
+    }
+    ok_json(out)
 }
+
+/// Why a search that found nothing is not evidence that nothing is there. Emitted only
+/// on an empty result, which is the case where silence gets read as absence and then
+/// written into a report.
+const SEARCH_EMPTY_NOTE: &str = "No match is not proof of absence here. The index holds only the first 256 KB of each decoded body, skips binary bodies, and matches whole tokens for queries of 3 characters or more, so a needle can be present and unfound. Confirm with history_get on the specific flow before reporting that something does not occur.";
+
+/// How a match inside a WebSocket message is made actionable. Without this, a search can
+/// return a flow whose only match is in a frame, history_get shows the bare handshake,
+/// and the caller concludes the search was wrong.
+const SEARCH_WS_NOTE: &str = "The flows in `wsMatches` matched inside a WebSocket message, not in the HTTP request or response. Call ws_messages with that flowId and the same text as `contains` to read the matching messages.";
 
 fn history_search(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
     let query = arg_str(a, "query");
     if query.trim().is_empty() {
         return Err("query is required".into());
     }
-    let limit = arg_u64(a, "limit", 100).clamp(1, 1000) as usize;
+    let limit = arg_int(a, "limit", 100)?.clamp(1, 1000) as usize;
+    reject_arg(a, "offset", "pass beforeId, set to the nextBeforeId from your last page")?;
+    let before = arg_int(a, "beforeId", 0)?;
     let ids: std::collections::HashSet<u64> = ctx.store.search(&query).map_err(|e| e.to_string())?.into_iter().collect();
-    let items: Vec<Value> = ctx
-        .store
-        .summaries()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .filter(|f| ids.contains(&f.id))
-        .rev()
-        .take(limit)
-        .map(|f| serde_json::to_value(f).unwrap_or(Value::Null))
-        .collect();
-    ok_json(json!({ "matches": ids.len(), "returned": items.len(), "flows": items }))
+    // Which of the hits came from a WebSocket message rather than the exchange itself.
+    // One extra indexed query for the whole call, not one per row.
+    let ws_hits: Vec<u64> = ctx.store.ws_search(&query).map_err(|e| e.to_string())?;
+    let mut all = ctx.store.summaries().map_err(|e| e.to_string())?;
+    all.retain(|f| ids.contains(&f.id));
+    let (items, has_more, next) = page_flows(&all, before, limit);
+    let mut out = json!({ "matches": ids.len(), "returned": items.len(), "hasMore": has_more, "flows": items });
+    if let Some(n) = next {
+        out["nextBeforeId"] = json!(n);
+    }
+    if !ws_hits.is_empty() {
+        out["wsMatches"] = json!(ws_hits);
+        out["wsNote"] = json!(SEARCH_WS_NOTE);
+    }
+    if ids.is_empty() {
+        out["note"] = json!(SEARCH_EMPTY_NOTE);
+    }
+    ok_json(out)
 }
 
 /// Highlight colours a flow or saved request can be tagged with (mirrors HIGHLIGHTS in
@@ -329,6 +797,153 @@ fn history_get_color(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
     ok_json(json!({ "colors": colors }))
 }
 
+// ---- websocket --------------------------------------------------------------
+
+/// Defaults and ceilings for reading a WebSocket conversation. Every one of these is
+/// load bearing: capture keeps up to `ws::WS_CAPTURE_LIMIT` (1 MB) PER MESSAGE, so a
+/// socket of a thousand messages can hold a gigabyte, and this tool can be called in a
+/// loop.
+const WS_LIMIT_DEFAULT: u64 = 50;
+const WS_LIMIT_MAX: u64 = 500;
+const WS_BYTES_DEFAULT: usize = 2 * 1024;
+const WS_BYTES_MAX: usize = 64 * 1024;
+
+/// A hex dump runs to about five characters per byte, so a payload that renders as hex
+/// is cut harder. 256 bytes is enough to recognise a magic number, a length prefix or a
+/// protobuf tag, which is what a hex dump is actually for here.
+const WS_HEX_BYTES: usize = 256;
+
+/// Total payload text one call will return. This overrides `limit` x `maxBytes`, which
+/// at their ceilings would otherwise permit a 32 MB reply.
+const WS_BUDGET: usize = 64 * 1024;
+
+/// Why the payload in a message row is not simply "the frame".
+const WS_NOTE: &str = "`payload` is a rendering, not the bytes: a binary message is shown as a hex dump of its first 256 bytes, and a close message as its code and reason. `length` is what the peer sent, `stored` is what capture kept, `returned` is what this page read. Only trust `payload` as the whole payload when `complete` is true, and cite `length` rather than the size of the text.";
+
+/// The opcode's name, for a reader that should not have to know the numbers.
+fn ws_opcode_name(opcode: u8) -> &'static str {
+    match opcode {
+        0x0 => "continuation",
+        0x1 => "text",
+        0x2 => "binary",
+        0x8 => "close",
+        0x9 => "ping",
+        0xa => "pong",
+        _ => "reserved",
+    }
+}
+
+/// How `ws::display` will render this payload. Mirrors its own condition, so the label
+/// cannot disagree with the string it describes.
+fn ws_rendered_as(opcode: u8, data: &[u8]) -> &'static str {
+    match opcode {
+        0x8 => "close",
+        0x2 if std::str::from_utf8(data).is_err() || data.contains(&0) => "hex",
+        _ => "text",
+    }
+}
+
+fn ws_messages(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
+    let flow_id = arg_int(a, "flowId", 0)?;
+    if flow_id == 0 {
+        return Err("flowId is required".into());
+    }
+    reject_arg(a, "offset", "pass afterId, set to the nextAfterId from your last page; message ids stay stable while the socket is still open, an index does not")?;
+    let after = arg_int(a, "afterId", 0)?;
+    let dir = arg_enum(a, "direction", &["both", "client", "server"], "both")?;
+    let contains = arg_str(a, "contains").trim().to_string();
+    let limit = arg_int(a, "limit", WS_LIMIT_DEFAULT)?.clamp(1, WS_LIMIT_MAX) as usize;
+    let max = arg_int(a, "maxBytes", WS_BYTES_DEFAULT as u64)?.clamp(64, WS_BYTES_MAX as u64) as usize;
+
+    let stats = ctx.store.ws_stats(flow_id).map_err(|e| e.to_string())?;
+    if stats.count == 0 {
+        // Only here is the whole flow loaded, to tell "no such flow" (an error, like
+        // every other tool) from "that flow carried no messages" (a fact).
+        if ctx.store.get(flow_id).map_err(|e| e.to_string())?.is_none() {
+            return Err(format!("no flow {flow_id}"));
+        }
+        return ok_json(json!({
+            "flowId": flow_id, "total": 0, "returned": 0, "hasMore": false, "messages": [],
+            "note": "That flow carried no WebSocket messages. Only a flow whose response was 101 Switching Protocols has any.",
+        }));
+    }
+
+    // One row more than asked for, so "more follow" is known rather than guessed.
+    let rows = ctx
+        .store
+        .ws_page(
+            flow_id,
+            after,
+            (dir != "both").then_some(dir.as_str()),
+            (!contains.is_empty()).then_some(contains.as_str()),
+            limit + 1,
+            max,
+        )
+        .map_err(|e| e.to_string())?;
+    let more_rows = rows.len() > limit;
+
+    let mut messages: Vec<Value> = Vec::with_capacity(rows.len().min(limit));
+    let (mut spent, mut last, mut budget_hit, mut any_cut) = (0usize, after, false, false);
+    for row in rows.into_iter().take(limit) {
+        let m = row.msg;
+        let rendered_as = ws_rendered_as(m.opcode, &m.data);
+        let shown = if rendered_as == "hex" { m.data.slice(..m.data.len().min(WS_HEX_BYTES)) } else { m.data.clone() };
+        let payload = crate::ws::display(m.opcode, &shown);
+        // The budget wins over `limit`, but never over making progress: a single message
+        // larger than the whole budget still comes back, alone.
+        if !messages.is_empty() && spent + payload.len() > WS_BUDGET {
+            budget_hit = true;
+            break;
+        }
+        spent += payload.len();
+        last = m.id;
+        let complete = shown.len() as u64 == m.length;
+        any_cut |= !complete;
+        messages.push(json!({
+            "id": m.id,
+            "ts": m.ts,
+            "direction": m.direction,
+            "opcode": m.opcode,
+            "type": ws_opcode_name(m.opcode),
+            "length": m.length,
+            "stored": row.stored,
+            "returned": shown.len(),
+            "renderedAs": rendered_as,
+            "complete": complete,
+            "payload": payload,
+        }));
+    }
+
+    let has_more = budget_hit || more_rows;
+    let mut out = json!({
+        "flowId": flow_id,
+        "total": stats.count,
+        "client": stats.client,
+        "server": stats.server,
+        "totalBytes": stats.bytes,
+        "returned": messages.len(),
+        "hasMore": has_more,
+        "messages": messages,
+    });
+    if has_more {
+        out["nextAfterId"] = json!(last);
+    }
+    if budget_hit {
+        out["budgetReached"] = json!(true);
+    }
+    if any_cut || budget_hit {
+        out["note"] = json!(WS_NOTE);
+    }
+    if !contains.is_empty() {
+        // `ws_fts` indexes only text and binary messages, and only their start, so a
+        // filtered page is not the same thing as "these are all the matches".
+        out["containsNote"] = json!(
+            "`contains` is answered from the message index, which covers only text and binary messages and only the first 256 KB of each. A ping payload, or anything past that, cannot be found this way."
+        );
+    }
+    ok_json(out)
+}
+
 // ---- scope ------------------------------------------------------------------
 
 fn scope_get(ctx: &Arc<Ctx>) -> Result<String, String> {
@@ -346,9 +961,22 @@ fn scope_set(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
         .iter()
         .filter_map(|x| x.as_str().map(String::from))
         .collect();
+    // Taken before the live scope is touched: this both stores the scope AND sets the
+    // running proxy's, so applying it to a project the operator has since left would
+    // hand the new project the previous engagement's scope, which is what "delete out of
+    // scope" then uses to decide what to destroy.
+    let gen = ctx.store.generation();
     ctx.scope.set(patterns);
     let normalized = ctx.scope.get(); // trimmed, lowercased, deduped
-    ctx.store.put_list(crate::commands::SCOPE_KEY, &normalized).map_err(|e| e.to_string())?;
+    let value = serde_json::to_value(&normalized).map_err(|e| e.to_string())?;
+    if !ctx.store.put_setting_at(crate::commands::SCOPE_KEY, &value, gen).map_err(|e| e.to_string())? {
+        // Put the live scope back to the one belonging to the project that IS open.
+        if let Ok(list) = ctx.store.get_list(crate::commands::SCOPE_KEY) {
+            ctx.scope.set(list);
+        }
+        return Err("the project changed while this scope was being applied; nothing was saved".into());
+    }
+    ctx.events.emit(crate::proxy::SETTING_EVENT, &json!({ "key": crate::commands::SCOPE_KEY }));
     ok_json(json!({ "patterns": normalized, "allInScope": normalized.is_empty() }))
 }
 
@@ -384,14 +1012,44 @@ async fn repeater_send(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
     let (target, raw) = resolve_request(ctx, a)?;
     let tab = arg_u64(a, "tab", 9001);
     let res = crate::commands::send_recorded(ctx, Some(tab), &target, &raw, true).await?;
-    let preview: String = res.response_raw.chars().take(RESP_PREVIEW).collect();
-    ok_json(json!({
+    let (preview, cut) = clip(&res.response_raw, RESP_PREVIEW);
+    let mut out = json!({
         "tab": tab,
         "status": res.status,
         "length": res.length,
         "durationMs": res.duration_ms,
         "response": preview,
-    }))
+    });
+    // The id of the History row this send became, so the caller can read its own
+    // exchange back instead of guessing which row was its own.
+    if let Some(id) = res.flow_id {
+        out["flowId"] = json!(id);
+        out["flowTs"] = json!(res.flow_ts);
+        // Say the preview was cut AND how to get the rest. A silently cut response is
+        // how a caller comes to report a truncated body as the whole body.
+        if cut {
+            out["responseTruncated"] = json!(true);
+            out["responseNote"] = json!(format!(
+                "`response` is the first {RESP_PREVIEW} bytes. For the rest: history_get {{\"id\":{id},\"side\":\"response\",\"part\":\"body\"}} and page with offset."
+            ));
+        }
+    } else if cut {
+        out["responseTruncated"] = json!(true);
+    }
+    // A repeater-scope extension may have rewritten the request on its way out (e.g.
+    // re-encrypted it) and made the reply readable on its way in. Both versions go back,
+    // or the caller cannot tell what it really sent and what really arrived.
+    if let Some(sent) = &res.request_final {
+        out["requestSent"] = json!(sent);
+    }
+    if let Some(original) = &res.response_original {
+        out["responseWire"] = json!(clip(original, RESP_PREVIEW).0);
+    }
+    if res.request_final.is_some() || res.response_original.is_some() {
+        out["extensionNote"] =
+            json!("An extension transformed this exchange. `requestSent` is what left the proxy (vs the request you passed) and `responseWire` is what arrived before the extension made `response` readable.");
+    }
+    ok_json(out)
 }
 
 async fn send_many(ctx: &Arc<Ctx>, tab: u64, target: &str, raw: &str, count: usize, parallel: bool) -> Vec<Value> {
@@ -400,7 +1058,7 @@ async fn send_many(ctx: &Arc<Ctx>, tab: u64, target: &str, raw: &str, count: usi
         async move {
             let started = Instant::now();
             match crate::commands::send_recorded(&ctx, Some(tab), &target, &raw, true).await {
-                Ok(r) => json!({ "i": i, "status": r.status, "length": r.length, "durationMs": r.duration_ms }),
+                Ok(r) => json!({ "i": i, "flowId": r.flow_id, "status": r.status, "length": r.length, "durationMs": r.duration_ms }),
                 Err(e) => json!({ "i": i, "error": e, "elapsedMs": started.elapsed().as_millis() as u64 }),
             }
         }
@@ -480,7 +1138,7 @@ async fn repeater_send_group(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String
         let ctx = ctx.clone();
         async move {
             match crate::commands::send_recorded(&ctx, Some(id), &target, &raw, true).await {
-                Ok(r) => json!({ "tab": id, "status": r.status, "length": r.length, "durationMs": r.duration_ms }),
+                Ok(r) => json!({ "tab": id, "flowId": r.flow_id, "status": r.status, "length": r.length, "durationMs": r.duration_ms }),
                 Err(e) => json!({ "tab": id, "error": e }),
             }
         }
@@ -634,7 +1292,7 @@ async fn intruder_run(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
             let _permit = sem.acquire_owned().await.ok();
             let started = Instant::now();
             match crate::commands::send_recorded(&ctx, None, &target, &raw, true).await {
-                Ok(r) => json!({ "n": n, "payloads": payloads, "status": r.status, "length": r.length, "timeMs": r.duration_ms }),
+                Ok(r) => json!({ "n": n, "payloads": payloads, "flowId": r.flow_id, "status": r.status, "length": r.length, "timeMs": r.duration_ms }),
                 Err(e) => json!({ "n": n, "payloads": payloads, "error": e, "timeMs": started.elapsed().as_millis() as u64 }),
             }
         });
@@ -664,7 +1322,24 @@ fn passive_findings(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
         .into_iter()
         .filter(|f| sev.is_empty() || f.get("severity").and_then(|s| s.as_str()) == Some(sev.as_str()))
         .collect();
-    ok_json(json!({ "count": filtered.len(), "findings": filtered }))
+    // Findings are a frozen array rebuilt by passive_scan, with no per-finding id, so a
+    // keyset cursor is impossible here and an index is stable: nothing is inserted into
+    // the middle of this list between two calls. Hence `offset`, unlike the flow lists.
+    let offset = arg_int(a, "offset", 0)? as usize;
+    let limit = arg_int(a, "limit", 200)?.clamp(1, 2000) as usize;
+    let page: Vec<Value> = filtered.iter().skip(offset).take(limit).cloned().collect();
+    let has_more = offset + page.len() < filtered.len();
+    let mut out = json!({
+        "count": filtered.len(),
+        "offset": offset,
+        "returned": page.len(),
+        "hasMore": has_more,
+        "findings": page,
+    });
+    if has_more {
+        out["nextOffset"] = json!(offset + page.len());
+    }
+    ok_json(out)
 }
 
 fn passive_rules_get(ctx: &Arc<Ctx>) -> Result<String, String> {
@@ -682,7 +1357,11 @@ fn passive_rules_set(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
     if !rules.is_array() {
         return Err("`rules` must be an array".into());
     }
-    ctx.store.put_setting("passiveRules", &rules).map_err(|e| e.to_string())?;
+    let gen = ctx.store.generation();
+    if !ctx.store.put_setting_at("passiveRules", &rules, gen).map_err(|e| e.to_string())? {
+        return Err("the project changed; the rules were not saved".into());
+    }
+    ctx.events.emit(crate::proxy::SETTING_EVENT, &json!({ "key": "passiveRules" }));
     ok_json(json!({ "ok": true, "count": rules.as_array().map(|a| a.len()).unwrap_or(0) }))
 }
 
@@ -845,9 +1524,23 @@ fn flow_in_scope(path: &str, mime: &str, scope: &Option<std::collections::HashSe
 }
 
 fn passive_scan(ctx: &Arc<Ctx>) -> Result<String, String> {
+    // The widest window of the three by far: this walks every captured flow, so the
+    // operator has every reason to be doing something else (including opening another
+    // project) while an agent runs it.
+    let gen = ctx.store.generation();
     // Compile builtin rules + custom rules from settings (skip any that fail).
     let mut rules: Vec<(String, String, String, regex::Regex, usize)> = Vec::new();
+    // Built-ins the operator switched off in the window stay off here. Without this an
+    // agent's scan re-raises findings the operator deliberately dismissed, and writes
+    // them into the project as though that decision had never been made.
+    let disabled: std::collections::HashSet<String> = match ctx.store.get_setting("passiveDisabled") {
+        Ok(Some(Value::Array(ids))) => ids.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        _ => std::collections::HashSet::new(),
+    };
     for (id, title, sev, pat, _ci, group) in BUILTIN_RULES {
+        if disabled.contains(*id) {
+            continue;
+        }
         if let Ok(re) = regex::Regex::new(pat) {
             rules.push((id.to_string(), title.to_string(), sev.to_string(), re, *group));
         }
@@ -860,6 +1553,12 @@ fn passive_scan(ctx: &Arc<Ctx>) -> Result<String, String> {
             let flags = r.get("flags").and_then(|v| v.as_str()).unwrap_or("");
             let pat = r.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
             let group = r.get("group").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            // The window writes `enabled: false` when the operator switches a custom
+            // rule off (`toggleCustomRule`), and `effectiveRules()` filters on it. The
+            // same rule firing over MCP would re-raise findings the operator dismissed.
+            if r.get("enabled").is_some_and(|v| v == &Value::Bool(false)) {
+                continue;
+            }
             let full = if flags.contains('i') { format!("(?i){pat}") } else { pat.to_string() };
             if let Ok(re) = regex::Regex::new(&full) {
                 rules.push((id, title, sev, re, group));
@@ -953,8 +1652,20 @@ fn passive_scan(ctx: &Arc<Ctx>) -> Result<String, String> {
 
     let order = |s: &str| match s { "high" => 0, "medium" => 1, "low" => 2, _ => 3 };
     findings.sort_by_key(|f| order(f.get("severity").and_then(|x| x.as_str()).unwrap_or("info")));
-    let _ = ctx.store.put_setting("passiveFindings", &Value::Array(findings.clone()));
-    let _ = ctx.store.put_setting("passiveScanned", &serde_json::to_value(&scanned).unwrap_or(json!([])));
+    let wrote = ctx
+        .store
+        .put_setting_at("passiveFindings", &Value::Array(findings.clone()), gen)
+        .unwrap_or(false);
+    if !wrote {
+        return Err("the project changed during the scan; no findings were saved".into());
+    }
+    let _ = ctx
+        .store
+        .put_setting_at("passiveScanned", &serde_json::to_value(&scanned).unwrap_or(json!([])), gen);
+    // Tell an open window, or it will keep showing its stale copy and overwrite this one
+    // on the operator's next passive action.
+    ctx.events
+        .emit(crate::proxy::PASSIVE_EVENT, &json!({ "findings": findings.len(), "scanned": scanned.len() }));
 
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for f in &findings {
@@ -1058,7 +1769,9 @@ fn organizer_save(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
                 status: (s.status != 0).then_some(s.status),
                 note: s.note.clone(),
                 color: s.color.clone(),
-                source: "history".into(),
+                // Not "history": that is what the window writes when the operator saves
+                // a flow by hand, and an agent's save must not look like one.
+                source: "mcp".into(),
                 ..Default::default()
             }
         }
@@ -1093,6 +1806,125 @@ fn organizer_save(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
     let applied = organizer::apply(&ctx.store, Op::Save { collection, item })?;
     organizer_changed(ctx, &applied.state);
     ok_json(applied_item(&applied)?)
+}
+
+/// Severities an agent finding can carry: the passive scanner's own vocabulary, so an
+/// operator reads both lists the same way.
+const FINDING_SEVERITIES: [&str; 4] = ["high", "medium", "low", "info"];
+
+/// How sure the caller is. Recorded because a claim without it reads as certainty.
+const FINDING_CONFIDENCE: [&str; 3] = ["certain", "firm", "tentative"];
+
+/// Collection an agent finding lands in unless the caller names another.
+const FINDINGS_COLLECTION: &str = "Findings";
+
+/// Written into every agent finding's note, by this server, never by the caller.
+///
+/// The Source column marks the row inside the window, but a note is the part that gets
+/// copied into a report, and a report is where a confusion about who claimed what does
+/// real damage. "Claimed" is the load-bearing word: Ngintip did not verify this.
+const FINDING_HEADER: &str = "[AGENT FINDING - claimed by an LLM over MCP, not verified by Ngintip]";
+
+/// Record a finding the caller is claiming, in the Organizer, where the operator can
+/// actually see it.
+///
+/// Deliberately not a parameter on `organizer_save`: this tool can require the fields a
+/// report needs, and it forces the attribution that a caller must not be able to switch
+/// off. `source`, `color` and the note header are set here and cannot be passed in.
+fn findings_add(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
+    let title = arg_str(a, "title").trim().to_string();
+    let detail = arg_str(a, "detail").trim().to_string();
+    if title.is_empty() || detail.is_empty() {
+        return Err("give title (the claim in a line) and detail (what it is, how it was shown)".into());
+    }
+    let severity = arg_enum(a, "severity", &FINDING_SEVERITIES, "")?;
+    if severity.is_empty() {
+        return Err(format!("severity is required; use one of: {}", FINDING_SEVERITIES.join(", ")));
+    }
+    let confidence = arg_enum(a, "confidence", &FINDING_CONFIDENCE, "tentative")?;
+
+    // Flows named as evidence. The one in `flowId` has its exchange stored with the
+    // item; the rest are cited by id, because a saved item holds a single exchange.
+    let flow_id = arg_int(a, "flowId", 0)?;
+    let mut cited: Vec<u64> = Vec::new();
+    if let Some(list) = a.get("citedFlowIds") {
+        let arr = list.as_array().ok_or("citedFlowIds must be an array of flow ids")?;
+        for v in arr {
+            cited.push(v.as_u64().ok_or("citedFlowIds must be whole numbers")?);
+        }
+    }
+    if flow_id > 0 && !cited.contains(&flow_id) {
+        cited.insert(0, flow_id);
+    }
+
+    let evidence = if cited.is_empty() {
+        "evidence: none cited".to_string()
+    } else {
+        format!("evidence: {} (cite the wire bytes, not a decoded view)", cited.iter().map(|id| format!("flow {id}")).collect::<Vec<_>>().join(", "))
+    };
+    let note = format!("{FINDING_HEADER}\nseverity: {severity}   confidence: {confidence}\n{evidence}\n\n{detail}");
+    let color = match severity.as_str() {
+        "high" => "red",
+        "medium" => "orange",
+        "low" => "yellow",
+        _ => "gray",
+    };
+
+    let mut item = if flow_id > 0 {
+        let flow = ctx.store.get(flow_id).map_err(|e| e.to_string())?.ok_or_else(|| format!("no flow {flow_id}"))?;
+        let s = &flow.summary;
+        NewItem {
+            name: format!("{}{}", s.host, s.path),
+            target: format!("{}://{}", s.scheme, s.host),
+            // The viewer-capped text, not the full one: every Organizer edit rewrites the
+            // whole organizer blob, so embedding megabyte bodies makes each later write
+            // worse. The flow id in the note is the authoritative pointer; this is a copy
+            // kept for convenience.
+            request: raw::request_text(&flow),
+            response: raw::response_text(&flow),
+            status: (s.status != 0).then_some(s.status),
+            ..Default::default()
+        }
+    } else {
+        NewItem { name: title.clone(), ..Default::default() }
+    };
+    // Severity in the label as well: the Organizer already sorts by label, so this makes
+    // agent findings group and order by severity with nothing added to the window.
+    item.label = format!("[agent {severity}] {title}");
+    item.note = note;
+    item.color = color.into();
+    // A distinct source value, not the "mcp" a saved request gets: an agent's CLAIM and
+    // an agent's saved REQUEST must not look the same in the Source column.
+    item.source = "mcp-finding".into();
+
+    let collection = arg_str(a, "collection");
+    let collection = Some(if collection.trim().is_empty() { FINDINGS_COLLECTION.to_string() } else { collection.trim().to_string() });
+    let applied = organizer::apply(&ctx.store, Op::Save { collection, item })?;
+    organizer_changed(ctx, &applied.state);
+
+    let mut out = applied_item(&applied)?;
+    out["attribution"] = json!(
+        "Recorded as a claim by this server, not as a Ngintip finding: source=mcp-finding, the label is prefixed [agent <severity>], and the note opens with the header. Ngintip's own passive scanner never writes here."
+    );
+    // Warn, do not refuse. Reading the capture is unrestricted here, but a finding is
+    // work product, and a finding about a host nobody authorised is not deliverable.
+    let out_of_scope: Vec<u64> = cited
+        .iter()
+        .copied()
+        .filter(|id| {
+            ctx.store
+                .get(*id)
+                .ok()
+                .flatten()
+                .is_some_and(|f| !ctx.scope.contains(&f.summary.host))
+        })
+        .collect();
+    if !out_of_scope.is_empty() {
+        out["scopeWarning"] = json!(format!(
+            "Cited flows {out_of_scope:?} are on hosts outside the target scope. The finding was recorded, but check it belongs in the engagement before it reaches a report."
+        ));
+    }
+    ok_json(out)
 }
 
 /// Set a saved request's label, note and/or colour (omitted fields are kept).
@@ -1138,17 +1970,95 @@ fn vault_get(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
     }
 }
 
+// ---- proxy status -----------------------------------------------------------
+
+/// Said on every status reply, because it is what stops the two mistakes this tool
+/// otherwise invites: thinking it can change the proxy, and thinking the absence of an
+/// address means there is nothing bound.
+const STATUS_NOTE: &str = "Read-only. This server cannot start, stop or rebind a listener; ask the operator. Bind addresses are deliberately not reported: `exposure` says how far a listener reaches without naming an address on the operator's machine or a client's network.";
+
+fn proxy_status(ctx: &Arc<Ctx>) -> Result<String, String> {
+    let addrs = ctx.bound_listeners();
+    // Port and reach, never the address. A tunnel bind is a VPN address on somebody
+    // else's network and a lan bind is the operator's internal address; neither is
+    // needed for any decision a tool caller can make, and this reply may travel to a
+    // model that is not running on this machine.
+    let listeners: Vec<Value> = addrs
+        .iter()
+        .map(|a| json!({ "port": a.port(), "exposure": crate::commands::exposure_of_addr(a) }))
+        .collect();
+
+    let stats = ctx.store.stats().map_err(|e| e.to_string())?;
+    let ext = ctx.extensions.status();
+    let now = crate::store::now_ms();
+
+    let mut out = json!({
+        "listening": !listeners.is_empty(),
+        "listeners": listeners,
+        "flows": stats.flows,
+        "wsMessages": stats.ws_messages,
+        "intercept": {
+            "requests": ctx.intercept.is_enabled(),
+            "responses": ctx.intercept.holds_responses(),
+            // The count, never the held messages: a held request is a stalled
+            // connection, which is the fact that matters here.
+            "pending": ctx.intercept.pending().len(),
+            "websocket": ctx.ws_intercept.is_enabled(),
+            "websocketPending": ctx.ws_intercept.pending().len(),
+        },
+        "invisible": ctx.invisible(),
+        "scopePatterns": ctx.scope.get().len(),
+        "extensions": {
+            "enabled": ext.enabled,
+            // Counts, not the structs: `ExtensionsStatus` also carries interpreter and
+            // virtualenv paths, which contain the operator's username.
+            "loaded": ext.extensions.len(),
+            "running": ext.extensions.iter().filter(|e| e.running).count(),
+            "failed": ext.extensions.iter().filter(|e| e.error.is_some()).count(),
+        },
+        "note": STATUS_NOTE,
+    });
+    if stats.newest_ts > 0 {
+        out["newestFlowTs"] = json!(stats.newest_ts);
+        // Models are unreliable at epoch arithmetic, so the age is computed here.
+        out["newestFlowAgeMs"] = json!(now.saturating_sub(stats.newest_ts));
+    }
+
+    // "Nothing captured" has more than one cause, and a caller handed `listening: true,
+    // flows: 0` will otherwise report that the application makes no HTTP requests. Name
+    // the other causes rather than leaving it to guess.
+    if stats.flows == 0 {
+        let mut hints: Vec<&str> = Vec::new();
+        if listeners.is_empty() {
+            hints.push("No listener is bound: the proxy is not running. Ask the operator to start it.");
+        } else {
+            hints.push("A listener is bound but nothing has been captured. The client may not be pointed at the proxy.");
+            hints.push("The CA may not be trusted on the client, in which case HTTPS fails before anything is recorded.");
+        }
+        if ctx.intercept.is_enabled() && !ctx.intercept.pending().is_empty() {
+            hints.push("Intercept is holding messages, so traffic is stalled waiting for the operator.");
+        }
+        if !ctx.scope.get().is_empty() {
+            hints.push("A target scope is set; it does not hide flows from history_list by default, but it does limit the passive scan.");
+        }
+        out["hints"] = json!(hints);
+    }
+    ok_json(out)
+}
+
 // ---- tool schemas & docs ----------------------------------------------------
 
 fn tool_defs() -> Value {
     let obj = |props: Value, required: Value| json!({ "type": "object", "properties": props, "required": required });
     json!([
-        { "name": "history_list", "description": "List captured HTTP flows (newest first). Filter by method, host substring, status, a 'contains' match on method+host+path, or inScope (only hosts in the target scope; default false = everything).",
-          "inputSchema": obj(json!({ "method": {"type":"string"}, "host": {"type":"string"}, "status": {"type":"integer"}, "contains": {"type":"string"}, "inScope": {"type":"boolean"}, "limit": {"type":"integer"} }), json!([])) },
-        { "name": "history_get", "description": "Full request and response text of one flow by id.",
-          "inputSchema": obj(json!({ "id": {"type":"integer"} }), json!(["id"])) },
-        { "name": "history_search", "description": "Full-text search across request/response bodies; returns matching flow summaries.",
-          "inputSchema": obj(json!({ "query": {"type":"string"}, "limit": {"type":"integer"} }), json!(["query"])) },
+        { "name": "history_list", "description": "List captured HTTP flows (newest first). Filter by method, host substring, status, a 'contains' match on method+host+path, or inScope (only hosts in the target scope; default false = everything). Pages with a cursor, not an index: when `hasMore` is true, pass the returned `nextBeforeId` back as `beforeId` for the next page. `offset` is refused, because an index over a live capture silently re-reads and skips rows. `total` is the matching rows right now and drifts as capture continues; `newestId` shows it moving.",
+          "inputSchema": obj(json!({ "method": {"type":"string"}, "host": {"type":"string"}, "status": {"type":"integer"}, "contains": {"type":"string"}, "inScope": {"type":"boolean"}, "limit": {"type":"integer"}, "beforeId": {"type":"integer"} }), json!([])) },
+        { "name": "history_get", "description": "One flow's request and response. `request`/`response` are the bytes on the wire. Read only what you need: side=request|response halves the reply, part=headers answers a header question for a few hundred bytes, and part=body pages a large body with offset plus the returned nextOffset. A body comes back capped (maxBytes, 32 KB by default); the `requestSlice`/`responseSlice` receipt says what you got, whether it is `complete`, and whether capture itself had already truncated it. A binary body is not returned as text; ask part=body with encoding=base64 for its bytes. When an extension or an intercept edit gives the flow another version - most usefully a decode_* extension that makes an encrypted body readable - those come back under `versions` too (view=auto, the default), cut the same way. view=wire returns the wire alone; view=extension puts the readable form in `request`/`response`.",
+          "inputSchema": obj(json!({ "id": {"type":"integer"}, "view": {"type":"string", "enum": ["auto","wire","extension"]}, "side": {"type":"string", "enum": ["both","request","response"]}, "part": {"type":"string", "enum": ["all","headers","body"]}, "offset": {"type":"integer"}, "maxBytes": {"type":"integer"}, "encoding": {"type":"string", "enum": ["text","base64"]} }), json!(["id"])) },
+        { "name": "history_search", "description": "Full-text search across request/response bodies and WebSocket messages; returns matching flow summaries. Pages like history_list (nextBeforeId -> beforeId). Flows listed in `wsMatches` matched inside a WebSocket message, so read those with ws_messages rather than history_get. The index covers only the first 256 KB of each decoded body and skips binary bodies, so no match is not proof of absence; an empty result says so.",
+          "inputSchema": obj(json!({ "query": {"type":"string"}, "limit": {"type":"integer"}, "beforeId": {"type":"integer"} }), json!(["query"])) },
+        { "name": "ws_messages", "description": "Read one flow's WebSocket messages, oldest first. A WebSocket flow's history_get shows only the handshake, so this is the only way to see what the socket carried. Pages with a cursor (nextAfterId -> afterId) because a live socket keeps growing; filter with direction=client|server and `contains`. `payload` is a rendering: binary comes back as a hex dump of its first 256 bytes and a close message as its code and reason, so cite `length` and check `complete` rather than measuring the text.",
+          "inputSchema": obj(json!({ "flowId": {"type":"integer"}, "afterId": {"type":"integer"}, "direction": {"type":"string","enum":["both","client","server"]}, "contains": {"type":"string"}, "limit": {"type":"integer"}, "maxBytes": {"type":"integer"} }), json!(["flowId"])) },
         { "name": "history_set_note", "description": "Set (or clear) the note on a captured flow by id. It shows in HTTP History; pass an empty note to clear it.",
           "inputSchema": obj(json!({ "id": {"type":"integer"}, "note": {"type":"string"} }), json!(["id","note"])) },
         { "name": "history_set_color", "description": "Set (or clear) the highlight colour on a captured flow by id. It tints the row in HTTP History. Allowed: red, orange, yellow, green, cyan, blue, purple, pink, gray; pass an empty string to clear it.",
@@ -1160,17 +2070,17 @@ fn tool_defs() -> Value {
           "inputSchema": obj(json!({ "patterns": {"type":"array","items":{"type":"string"}} }), json!(["patterns"])) },
         { "name": "scope_check", "description": "Check whether a host is in the target scope; returns inScope and which patterns matched.",
           "inputSchema": obj(json!({ "host": {"type":"string"} }), json!(["host"])) },
-        { "name": "repeater_send", "description": "Send one request (raw+target, or clone flowId) and record it in Repeater history. Returns status/length/response preview.",
+        { "name": "repeater_send", "description": "Send one request (raw+target, or clone flowId) and record it in Repeater history. Returns status/length, an 8 KB response preview, and the `flowId` it was recorded as, so the full exchange can be read back with history_get instead of guessed at. When a repeater-scope extension transformed the exchange, also the request actually sent and the response as it arrived.",
           "inputSchema": obj(json!({ "raw": {"type":"string"}, "target": {"type":"string"}, "flowId": {"type":"integer"}, "tab": {"type":"integer"} }), json!([])) },
-        { "name": "repeater_send_batch", "description": "Send the same request many times, in parallel (default) or sequential. For race conditions (e.g. duplicate-registration).",
+        { "name": "repeater_send_batch", "description": "Send the same request many times, in parallel (default) or sequential. For race conditions (e.g. duplicate-registration). Each row carries the `flowId` it was recorded as, so an interesting one can be read with history_get.",
           "inputSchema": obj(json!({ "raw": {"type":"string"}, "target": {"type":"string"}, "flowId": {"type":"integer"}, "count": {"type":"integer"}, "mode": {"type":"string","enum":["parallel","sequential"]}, "tab": {"type":"integer"} }), json!([])) },
         { "name": "repeater_groups", "description": "List Repeater tab groups and their tabs.", "inputSchema": obj(json!({}), json!([])) },
-        { "name": "repeater_send_group", "description": "Send every tab in a Repeater group, in parallel (default) or sequential.",
+        { "name": "repeater_send_group", "description": "Send every tab in a Repeater group, in parallel (default) or sequential. Each row carries the `flowId` it was recorded as.",
           "inputSchema": obj(json!({ "group": {"type":"string"}, "mode": {"type":"string","enum":["parallel","sequential"]} }), json!(["group"])) },
-        { "name": "intruder_run", "description": "Run an Intruder attack. Mark positions in `raw` with the section sign §. type: sniper|battering|pitchfork|cluster. payloads: a list of lines (one set) or a list of lists (a set per position).",
+        { "name": "intruder_run", "description": "Run an Intruder attack. Mark positions in `raw` with the section sign §. type: sniper|battering|pitchfork|cluster. payloads: a list of lines (one set) or a list of lists (a set per position). Each result row carries the `flowId` it was recorded as, so an outlier can be read with history_get rather than hunted for in history_list.",
           "inputSchema": obj(json!({ "raw": {"type":"string"}, "target": {"type":"string"}, "flowId": {"type":"integer"}, "type": {"type":"string"}, "payloads": {}, "concurrency": {"type":"integer"} }), json!([])) },
-        { "name": "passive_findings", "description": "List passive-scan findings (from the last scan). Filter by severity.",
-          "inputSchema": obj(json!({ "severity": {"type":"string","enum":["high","medium","low","info"]} }), json!([])) },
+        { "name": "passive_findings", "description": "List passive-scan findings (from the last scan). Filter by severity. Paged: `count` is every matching finding, and when `hasMore` is true pass the returned `nextOffset` back as `offset`. An index is right here, unlike the flow lists, because this array is only ever replaced wholesale by passive_scan.",
+          "inputSchema": obj(json!({ "severity": {"type":"string","enum":["high","medium","low","info"]}, "limit": {"type":"integer"}, "offset": {"type":"integer"} }), json!([])) },
         { "name": "passive_scan", "description": "Run the passive scan over all captured flows now (secrets, tokens, risky headers) and store the findings.", "inputSchema": obj(json!({}), json!([])) },
         { "name": "passive_rules_get", "description": "Get the passive rules (built-in + custom).", "inputSchema": obj(json!({}), json!([])) },
         { "name": "passive_rules_set", "description": "Replace the custom passive rules. Each: {id,title,severity,pattern,flags,group}.",
@@ -1183,6 +2093,8 @@ fn tool_defs() -> Value {
           "inputSchema": obj(json!({ "flowId": {"type":"integer"}, "request": {"type":"string"}, "target": {"type":"string"}, "response": {"type":"string"}, "status": {"type":"integer"}, "collection": {"type":"string"}, "name": {"type":"string"}, "label": {"type":"string"}, "note": {"type":"string"}, "color": {"type":"string", "enum": ["red","orange","yellow","green","cyan","blue","purple","pink","gray",""]} }), json!([])) },
         { "name": "organizer_set", "description": "Set the label, note and/or highlight colour of a saved request by id. Omit a field to keep it; an empty string clears it. Colours: red, orange, yellow, green, cyan, blue, purple, pink, gray. The open Organizer updates live.",
           "inputSchema": obj(json!({ "id": {"type":"string"}, "label": {"type":"string"}, "note": {"type":"string"}, "color": {"type":"string", "enum": ["red","orange","yellow","green","cyan","blue","purple","pink","gray",""]} }), json!(["id"])) },
+        { "name": "findings_add", "description": "Record a finding YOU are claiming, where the operator can see it: it lands as an item in the Organizer's Findings collection, live in the open window. Requires title, severity and detail; cite the flows that show it with flowId and citedFlowIds. The attribution is not yours to set: the row is marked source=mcp-finding, the label is prefixed [agent <severity>], and the note opens with a header saying an LLM claimed this and Ngintip did not verify it. That matters because this text can end up in a client-facing report. Cite the wire bytes, not a decoded view.",
+          "inputSchema": obj(json!({ "title": {"type":"string"}, "severity": {"type":"string","enum":["high","medium","low","info"]}, "detail": {"type":"string"}, "confidence": {"type":"string","enum":["certain","firm","tentative"]}, "flowId": {"type":"integer"}, "citedFlowIds": {"type":"array","items":{"type":"integer"}}, "collection": {"type":"string"} }), json!(["title","severity","detail"])) },
         { "name": "vault_list", "description": "List Vault credentials (Settings > Vault): label, role, note and typed fields (username, email, password, apikey, token, url, text). Secret values are hidden; call vault_get for one entry's full values. Optional query matches label, role, note, field names and non-secret values. Read-only.",
           "inputSchema": obj(json!({ "query": {"type":"string"} }), json!([])) },
         { "name": "vault_get", "description": "One Vault credential with every field value, secrets included, by id or by exact label (case-insensitive). Read-only.",
@@ -1193,6 +2105,7 @@ fn tool_defs() -> Value {
         { "name": "extension_toggle", "description": "Enable or disable one extension by id (see extensions_status).",
           "inputSchema": obj(json!({ "id": {"type":"string"}, "enabled": {"type":"boolean"} }), json!(["id","enabled"])) },
         { "name": "extensions_logs", "description": "Recent lines from the extension debug console (script stderr and lifecycle).", "inputSchema": obj(json!({}), json!([])) },
+        { "name": "proxy_status", "description": "Whether the proxy is actually capturing, and if not, why not. Call this first when history_list comes back empty: it tells 'no listener is bound' from 'bound but nothing captured', and when there are no flows it lists the other causes (client not pointed at the proxy, CA not trusted, intercept holding traffic) so they are not mistaken for 'this app makes no HTTP requests'. Read-only: it cannot start, stop or rebind anything. Reports each listener's port and reach, never its bind address.", "inputSchema": obj(json!({}), json!([])) },
     ])
 }
 
@@ -1304,8 +2217,35 @@ If `flowId` is present it is used. Otherwise `raw` is required.
 
 Sends from `repeater_send`, `repeater_send_batch`, `repeater_send_group` and
 `intruder_run` are recorded in History (the flows list), so you can inspect any of
-them afterwards with `history_get`. The Repeater tools also append to a Repeater
+them afterwards with `history_get`, using the `flowId` the send itself hands back rather
+than hunting for the row in `history_list`. Recording happens on a background thread, so
+an id can be read a moment before its row lands; `history_get` says so in that case, and
+one retry is enough. A flow id means something only inside its project, and emptying
+History reseeds the counter, so pin a citation with the `flowTs` returned beside the id.
+The Repeater tools also append to a Repeater
 tab history, chosen with `tab` (default 9001).
+
+### Message versions (extensions)
+
+An extension can define `decode_*` hooks that make an encrypted or encoded body
+readable without changing anything on the wire, and `encode_*` / `process_*` hooks
+that do change the message. A flow can therefore have more than one version:
+
+- the **wire** message, which is what really crossed the connection. This is always
+  what `request` / `response` mean by default, in every tool.
+- the **extension** (decoded) version, produced by a `decode_*` hook. Display only:
+  it was never sent and never received. On an API with encrypted bodies this is the
+  only readable form, so ask for it when the wire body looks like ciphertext.
+- the **original** version, which is what the message was before an intercept edit or
+  an `encode_*` / `process_*` hook rewrote it.
+
+A version is only ever reported when it actually differs from the wire, so an ordinary
+flow carries no extra keys at all. The decoded version is computed on demand and needs
+the extension enabled and the flow's host inside the target scope (`scope_get` /
+`scope_set`); without that only the wire exists.
+
+Never present a decoded body as what the server sent or received. If a finding depends
+on the exact bytes, cite the wire version.
 
 ### Intruder positions and attack types
 
@@ -1327,6 +2267,75 @@ U+00A7, written here as `§`), one pair per position, for example:
 `payloads` is either a list of strings (one shared set) or a list of lists (one
 set per position, required for `pitchfork` and `cluster`). The generated request
 count is capped at 5000.
+
+### Paging
+
+Every list here answers with `hasMore`. When it is true there is also a `next<X>` field,
+and the rule is always the same: **pass the value of `next<X>` back as `<x>`**.
+
+- `history_list`, `history_search`: `nextBeforeId` -> `beforeId`
+- `ws_messages`: `nextAfterId` -> `afterId`
+- `passive_findings`: `nextOffset` -> `offset`
+
+The flow lists page by id, not by index, and refuse an `offset` argument. Capture is
+live: new flows arrive at the newest end, so an index would move under you and you would
+silently re-read rows you had seen and silently skip rows you had not. Ids do not move.
+A flow that arrives while you are paging has a higher id and is simply outside the walk,
+which is the right answer for "list what existed when I started".
+
+`passive_findings` does take an `offset`, because that array is only ever replaced
+wholesale by `passive_scan`; nothing is inserted into the middle of it between calls.
+
+`total` (and `matches`, and `count`) is the size of the matching set at the moment of the
+call. It is not a fixed denominator: it drifts while capture runs.
+
+### Reading only part of a message
+
+`history_get` returns whole messages by default, and a 2 MB body is 2 MB. Three arguments
+keep a read small, and they compose:
+
+- `side=request` or `side=response` returns one message instead of two. The other key is
+  absent, not empty.
+- `part=headers` returns the start line, the headers and the blank line, and no body.
+  This is the cheapest useful read in the whole API: a few hundred bytes to answer a
+  question about `Set-Cookie`, `Authorization` or a CSP header.
+- `part=body` with `offset` and `maxBytes` pages a large body. `offset` counts BYTES of
+  the decoded body, not characters, because every other size here is in bytes. The end is
+  snapped to a character boundary and `nextOffset` reports where it landed, so paging by
+  `nextOffset` never splits a character.
+
+Each returned message carries a receipt, `requestSlice` or `responseSlice`, and the field
+to check is `complete`. Other fields worth reading:
+
+- `bodyBytes`: the decoded body's size. Absent under gzip, br or zstd, where the true
+  length cannot be known without decompressing the whole thing.
+- `capturedTruncated`: capture itself kept only the start of this body. A read can be
+  `complete` and still be less than what crossed the wire; this is how you tell.
+- `binary`: the body is not text, so it was not returned as text. Lossy UTF-8 of binary
+  bytes is replacement characters, which is both larger than the body and useless. Ask
+  again with `part=body` and `encoding=base64` for its bytes.
+
+Nothing is appended to the message text itself when it is partial. The receipt carries
+all of it, so a sliced body can still be diffed or hashed.
+
+### WebSocket traffic
+
+A WebSocket flow's `history_get` shows only the HTTP handshake. Everything the socket
+carried lives in `ws_messages`, keyed by the same `flowId`. `history_get` says so, with
+`wsMessages` and `wsNote`, whenever a flow carried any.
+
+Fragments are already reassembled, so these are messages, not frames. Control messages
+(close, ping, pong) appear as their own entries.
+
+`payload` is a rendering, not the bytes. A binary message is a hex dump of its first 256
+bytes; a close message is its code and reason. Three sizes can differ and all three are
+reported: `length` is what the peer sent, `stored` is what capture kept, `returned` is
+what this page read. Only treat `payload` as the whole payload when `complete` is true,
+and quote `length` rather than measuring the text.
+
+`history_search` matches inside WebSocket messages too. When it does, the flow ids appear
+in `wsMatches`: read those with `ws_messages`, passing the same text as `contains`, or
+`history_get` will show you a bare 101 handshake and look like it lied.
 
 ### Passive scan
 
@@ -1366,10 +2375,18 @@ Arguments (all optional):
 - `inScope` (boolean): only flows whose host is in the target scope. Default false
   (return everything). An empty scope means everything is in scope.
 - `limit` (integer): maximum flows to return, 1 to 1000, default 100.
+- `beforeId` (integer): the paging cursor. Returns flows with a lower id, so pass back
+  the `nextBeforeId` from your last page. Absent or 0 starts at the newest.
 
-Returns: `{ total, returned, flows: [summary, ...] }`. Each summary has `id`, `ts`,
-`method`, `scheme`, `host`, `path`, `status`, `length`, `mime`, `durationMs` and
-more.
+`offset` is refused with an error naming `beforeId`. See Paging above for why an index
+over a live capture silently re-reads and skips rows.
+
+Returns: `{ total, newestId, returned, hasMore, flows: [summary, ...] }`, plus
+`nextBeforeId` when `hasMore` is true. Each summary has `id`, `ts`, `method`, `scheme`,
+`host`, `path`, `status`, `length`, `mime`, `durationMs` and more.
+
+`total` is the rows matching your filters at the moment of the call, not a fixed
+denominator: it drifts while capture runs, and `newestId` is how you see that it moved.
 
 Example arguments:
 
@@ -1379,18 +2396,83 @@ Example arguments:
 
 Full request and response of one flow.
 
-Arguments: `id` (integer, required).
+Arguments:
 
-Returns: `{ summary, request, response }`, where `request` and `response` are the
-full decoded text.
+- `id` (integer, required).
+- `view` (string): `auto` (default), `wire` or `extension`. Selects which versions come
+  back. See Message versions below.
+- `side` (string): `both` (default), `request` or `response`. The side you do not ask for
+  is absent from the reply, not empty.
+- `part` (string): `all` (default), `headers` or `body`.
+- `offset` (integer): byte offset into the body. Requires a single `side`, and is not
+  allowed with `part=headers`.
+- `maxBytes` (integer): body bytes per side. Default 32768, maximum 1048576 (8192 for
+  base64).
+- `encoding` (string): `text` (default) or `base64`. Base64 returns the body's real
+  bytes and requires `part=body`.
+
+Returns: `{ summary, view, side, part, request, response }`, where `request` and
+`response` are the text as it crossed the wire (Content-Encoding undone), cut to what you
+asked for. `streaming` and `streamingNote` appear when the response is a provisional
+preview, and `wsMessages` and `wsNote` when the flow carried WebSocket messages.
+
+A body larger than `maxBytes` comes back cut, with a receipt in `requestSlice` or
+`responseSlice`. The field to check is `complete`:
+
+    { "summary": { "id": 4165, "status": 500, "length": 2097152, ... },
+      "view": "wire", "side": "response", "part": "body",
+      "response": "{\"error\":\"...",
+      "responseSlice": {
+        "part": "body",
+        "unit": "bytes of the decoded body (Content-Encoding undone), rendered as lossy UTF-8",
+        "offset": 0, "returned": 32768, "bodyBytes": 2097152,
+        "complete": false, "hasMore": true, "nextOffset": 32768 } }
+
+Other receipt fields, each present only when it applies: `bodyBytes` (absent under gzip,
+br or zstd, where the decoded length cannot be known without decompressing everything),
+`capturedTruncated` with `captureNote` (capture itself kept only the start, so a read can
+be `complete` and still be less than what crossed the wire), `binary` with `mime` (the
+body was not returned as text), `bodyIncluded: false`, and `noResponse` (the request never
+got one).
+
+Nothing is appended to the message text when it is partial, so a sliced body can still be
+diffed or hashed. See Reading only part of a message above.
+
+With `view=auto`, any version that differs from the wire is added:
+
+    { "summary": { ... },
+      "view": "wire",
+      "request": "POST /api/pay HTTP/1.1\n...\n\n{\"cherry\":\"2EF18CB5...\"}",
+      "response": "HTTP/1.1 200 OK\n...",
+      "versions": { "requestExtension": "POST /api/pay HTTP/1.1\n...\n\n{\"amount\":1}" },
+      "versionsNote": "..." }
+
+`versions` and `versionsNote` are absent when there is nothing to add, which is the
+normal case. See Message versions below.
+
+`view=wire` returns the wire alone, never a `versions` key. `view=extension` puts the
+readable form in `request` / `response` and adds `requestDecoded` / `responseDecoded`
+booleans; when no decode applies it falls back to the wire and the flag is false.
 
 ### history_search
 
-Full-text search across request and response bodies.
+Full-text search across request and response bodies, and WebSocket messages.
 
-Arguments: `query` (string, required); `limit` (integer, 1 to 1000, default 100).
+Arguments: `query` (string, required); `limit` (integer, 1 to 1000, default 100);
+`beforeId` (integer): the paging cursor, exactly as for `history_list`.
 
-Returns: `{ matches, returned, flows: [summary, ...] }`.
+Returns: `{ matches, returned, hasMore, flows: [summary, ...] }`, plus `nextBeforeId`
+when `hasMore` is true.
+
+Two more keys appear when they apply:
+
+- `wsMatches` (plus `wsNote`): flow ids that matched inside a WebSocket message rather
+  than in the HTTP exchange. Read those with `ws_messages`, passing the same text as
+  `contains`, or `history_get` will show you a bare 101 handshake.
+- `note`, on an empty result only: the index holds just the first 256 KB of each decoded
+  body, skips binary bodies, and matches whole tokens for queries of 3 characters or
+  more. **No match is not proof of absence.** Confirm with `history_get` on the specific
+  flow before reporting that something does not occur.
 
 ### history_set_note
 
@@ -1420,6 +2502,75 @@ valid values).
 Arguments: `id` (integer, optional). With an `id`, also returns that flow's current colour.
 
 Returns: `{ colors }`, or `{ id, color, colors }` when an `id` is given.
+
+### ws_messages
+
+One flow's WebSocket messages, oldest first.
+
+Arguments: `flowId` (integer, required); `afterId` (cursor, exclusive); `direction`
+(`both` default, `client`, `server`); `contains` (text filter); `limit` (default 50,
+max 500); `maxBytes` (payload bytes per message, default 2048, max 65536).
+
+Returns:
+
+    { "flowId": 7, "total": 1284, "client": 640, "server": 644, "totalBytes": 3932160,
+      "returned": 50, "hasMore": true, "nextAfterId": 414,
+      "messages": [
+        { "id": 412, "ts": 1731400000123, "direction": "client", "opcode": 1,
+          "type": "text", "length": 68, "stored": 68, "returned": 68,
+          "renderedAs": "text", "complete": true,
+          "payload": "{\"action\":\"subscribe\"}" }
+      ] }
+
+Three caps bound a reply, and the tightest one wins: `limit`, `maxBytes`, and a 64 KB
+budget on the total payload text. The budget overrides the other two, because `limit` and
+`maxBytes` at their ceilings would otherwise permit a 32 MB reply; `budgetReached` says
+when it was the budget that stopped the page. A single message larger than the whole
+budget still comes back, alone, so paging always makes progress.
+
+A payload that renders as hex is cut to 256 bytes, since hex runs to about five characters
+per byte. `contains` is answered from the message index, which covers only text and binary
+messages and only their first 256 KB, so it cannot find a needle in a ping payload or
+past that point.
+
+An unknown `flowId` is an error. A flow that exists but carried no WebSocket messages is
+not: it returns `total: 0` and says so.
+
+### proxy_status
+
+Whether the proxy is capturing, and when it is not, why not.
+
+Arguments: none.
+
+Returns:
+
+    { "listening": true,
+      "listeners": [ { "port": 8080, "exposure": "local" } ],
+      "flows": 1284, "wsMessages": 96,
+      "newestFlowTs": 1731400000123, "newestFlowAgeMs": 4120,
+      "intercept": { "requests": false, "responses": false, "pending": 0,
+                     "websocket": false, "websocketPending": 0 },
+      "invisible": false, "scopePatterns": 2,
+      "extensions": { "enabled": true, "loaded": 3, "running": 3, "failed": 0 },
+      "note": "Read-only. ..." }
+
+Call this when `history_list` comes back empty. "Nothing captured" has several causes and
+only this tool separates them: nothing bound at all, bound but the client is not pointed
+at the proxy, the CA not trusted so HTTPS fails before anything is recorded, or intercept
+holding traffic while it waits for the operator. When `flows` is 0 the reply carries a
+`hints` list naming them, so an empty history is not mistaken for an application that
+makes no HTTP requests.
+
+Read-only by construction: this server is handed no way to start, stop or rebind a
+listener. Ask the operator for that.
+
+Each listener reports its `port` and its `exposure` (`local`, `lan`, `tunnel`, `all`) and
+never its bind address. The reach is what you can act on; the address is an internal fact
+about the operator's machine or a client's network, and it is not sent. `exposure: "all"`
+means every interface, including ones that appear after the listener started.
+
+`extensions` is counts, not detail, because the full status carries interpreter and
+virtualenv paths.
 
 ### scope_get
 
@@ -1459,6 +2610,11 @@ Arguments: `raw` plus `target`, or `flowId` (see Sourcing a request); `tab`
 Returns: `{ tab, status, length, durationMs, response }`, where `response` is the
 first 8 KB of the raw response text. Use `history_get` for the full response.
 
+When a repeater-scope extension transformed the exchange, two more keys appear:
+`requestSent` (what actually left the proxy, which is not the `raw` you passed) and
+`responseWire` (what arrived, before the extension made `response` readable), plus an
+`extensionNote` saying so. See Message versions below.
+
 ### repeater_send_batch
 
 Send the same request many times. This is the tool for race conditions, such as
@@ -1490,8 +2646,9 @@ Send every tab in a named group.
 Arguments: `group` (string, required); `mode` (string, `parallel` default or
 `sequential`).
 
-Returns: `{ group, sent, results: [ { tab, status, length, durationMs } or
-{ tab, error } ] }`.
+Returns: `{ group, sent, results: [ { tab, flowId, status, length, durationMs } or
+{ tab, error } ] }`. Each `flowId` is the History flow that send was recorded as, for
+reading the full exchange with `history_get`.
 
 ### intruder_run
 
@@ -1530,10 +2687,16 @@ Returns: `{ scannedFlows, findings, bySeverity: { high, medium, low, info } }`.
 
 List findings from the last scan.
 
-Arguments: `severity` (string, optional): one of `high`, `medium`, `low`, `info`.
+Arguments (all optional): `severity` (string): one of `high`, `medium`, `low`, `info`;
+`limit` (integer, 1 to 2000, default 200); `offset` (integer): the paging index.
 
-Returns: `{ count, findings: [ { type, title, severity, where, match, flowId,
-method, host, path, status } ] }`.
+Returns: `{ count, offset, returned, hasMore, findings: [ { type, title, severity, where,
+match, flowId, method, host, path, status } ] }`, plus `nextOffset` when `hasMore` is
+true.
+
+An index is right here, unlike the flow lists, because this array is only ever replaced
+wholesale by `passive_scan`; nothing is inserted into the middle of it between calls.
+`count` is every finding matching `severity`, not just the page.
 
 ### passive_rules_get
 
@@ -1581,6 +2744,11 @@ collection, else to "Saved" (created if missing, then made active).
 
 Returns: `{ collection: { id, name, active }, item }`, with the new item's `id`.
 
+The item's `source` is `mcp`, which is how the window's Source column distinguishes a
+save this server made from one the operator made by hand. To record a FINDING rather than
+a request, use `findings_add`: it writes `source: "mcp-finding"` and an attribution header
+you cannot switch off.
+
 ### organizer_set
 
 Change a saved request's label, note and/or colour.
@@ -1590,6 +2758,42 @@ at least one). An omitted field is kept and an empty string clears it. Colours: 
 `orange`, `yellow`, `green`, `cyan`, `blue`, `purple`, `pink`, `gray`.
 
 Returns: `{ collection, item }` as for `organizer_save`.
+
+### findings_add
+
+Record a finding you are claiming, where the operator will actually see it.
+
+Arguments: `title` (required, the claim in a line); `severity` (required: `high`,
+`medium`, `low`, `info`); `detail` (required: what it is, what it allows, how it was
+shown); `confidence` (`certain`, `firm`, `tentative`, default `tentative`); `flowId` (the
+evidence flow, whose exchange is stored with the item); `citedFlowIds` (other flows named
+in the finding); `collection` (default `Findings`).
+
+The finding lands as an item in the Organizer, which is a backend-owned, event-notified
+surface, so it appears in an open window immediately rather than waiting for a reload.
+
+**The attribution is not yours to set.** This server writes, and you cannot override:
+
+- `source: "mcp-finding"`, which shows in the Organizer's Source column, and which is a
+  different value from the `mcp` a saved request gets. An agent's claim and an agent's
+  saved request must not look alike.
+- a label prefixed `[agent <severity>]`, which also makes findings sort together by
+  severity in the existing table.
+- a note header reading `[AGENT FINDING - claimed by an LLM over MCP, not verified by
+  Ngintip]`, followed by the severity, the confidence and the cited flows.
+
+The header exists because the note is the part that gets copied into a report, where a
+confusion about who claimed what does real damage. Ngintip's own passive scanner never
+writes here.
+
+The colour is set from the severity (high red, medium orange, low yellow, info gray).
+
+If a cited flow is on a host outside the target scope the finding is still recorded, and
+the reply carries a `scopeWarning`. Reading the capture is unrestricted; a finding is work
+product, and one about a host nobody authorised is not deliverable.
+
+The stored copy of the exchange is the viewer-capped text, not the full body. The
+`flowId` in the note is the authoritative pointer; use `history_get` for the bytes.
 
 ### vault_list
 
@@ -1664,13 +2868,19 @@ in the JSON-RPC `error` field with a numeric code.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::e2e::test_ctx;
+    use crate::e2e::{test_ctx, test_ctx_with_log};
 
     fn ctx() -> Arc<Ctx> {
         let dir = std::env::temp_dir().join(format!("mcp-test-{}-{}", std::process::id(), rand_suffix()));
         std::fs::create_dir_all(&dir).unwrap();
         Arc::new(test_ctx(&dir))
     }
+    /// Parse a tool's output. Tool output is compact JSON, so a test reads the value it
+    /// cares about instead of matching how the serializer spaced it.
+    fn jparse(s: &str) -> Value {
+        serde_json::from_str(s).unwrap_or_else(|e| panic!("tool output is not JSON ({e}): {s}"))
+    }
+
     fn rand_suffix() -> String {
         // Nanos alone can collide when tests run in parallel (same instant), which
         // would share a store dir; a per-process counter keeps each ctx() isolated.
@@ -1704,10 +2914,10 @@ mod tests {
         let c = ctx();
         // No extensions loaded yet: engine off, empty list.
         let s = call_tool(&c, "extensions_status", &json!({})).await.unwrap();
-        assert!(s.contains("\"enabled\": false"), "{s}");
+        assert_eq!(jparse(&s)["enabled"], false, "{s}");
         // Turning the engine on flips the flag.
         let s = call_tool(&c, "extensions_enable", &json!({"enabled": true})).await.unwrap();
-        assert!(s.contains("\"enabled\": true"), "{s}");
+        assert_eq!(jparse(&s)["enabled"], true, "{s}");
         // Toggling a missing extension is an error.
         assert!(call_tool(&c, "extension_toggle", &json!({"id":"nope","enabled":true})).await.is_err());
         // Logs come back as a JSON array.
@@ -1741,7 +2951,7 @@ mod tests {
         let id = c.store.push(flow).unwrap().id;
 
         let out = call_tool(&c, "history_list", &json!({"host":"example"})).await.unwrap();
-        assert!(out.contains("\"total\": 1"), "{out}");
+        assert_eq!(jparse(&out)["total"], 1, "{out}");
         let got = call_tool(&c, "history_get", &json!({"id": id})).await.unwrap();
         assert!(got.contains("GET https://example.com/secret") || got.contains("GET /secret"), "{got}");
 
@@ -1787,7 +2997,8 @@ mod tests {
         assert!(avail.contains("\"red\"") && avail.contains("\"gray\""), "{avail}");
         call_tool(&c, "history_set_color", &json!({"id": in_id, "color": "blue"})).await.unwrap();
         let cur = call_tool(&c, "history_get_color", &json!({"id": in_id})).await.unwrap();
-        assert!(cur.contains("\"color\": \"blue\"") && cur.contains("\"colors\""), "{cur}");
+        assert_eq!(jparse(&cur)["color"], "blue", "{cur}");
+        assert!(jparse(&cur)["colors"].is_array(), "{cur}");
         call_tool(&c, "history_set_color", &json!({"id": in_id, "color": ""})).await.unwrap();
 
         // Scope set (normalizes + persists), then get/check.
@@ -1799,19 +3010,65 @@ mod tests {
         assert!(call_tool(&c, "scope_set", &json!({})).await.is_err(), "patterns required");
 
         let got = call_tool(&c, "scope_get", &json!({})).await.unwrap();
-        assert!(got.contains("*.example.com") && got.contains("\"allInScope\": false"), "{got}");
+        assert!(got.contains("*.example.com"), "{got}");
+        assert_eq!(jparse(&got)["allInScope"], false, "{got}");
         let chk = call_tool(&c, "scope_check", &json!({"host": "in.example.com"})).await.unwrap();
-        assert!(chk.contains("\"inScope\": true"), "{chk}");
+        assert_eq!(jparse(&chk)["inScope"], true, "{chk}");
         let chk2 = call_tool(&c, "scope_check", &json!({"host": "out.other.com"})).await.unwrap();
-        assert!(chk2.contains("\"inScope\": false"), "{chk2}");
+        assert_eq!(jparse(&chk2)["inScope"], false, "{chk2}");
         assert!(call_tool(&c, "scope_check", &json!({})).await.is_err(), "host required");
 
         // history_list inScope filter (default off = both, on = only in-scope).
         let both = call_tool(&c, "history_list", &json!({})).await.unwrap();
-        assert!(both.contains("\"total\": 2"), "{both}");
+        assert_eq!(jparse(&both)["total"], 2, "{both}");
         let scoped = call_tool(&c, "history_list", &json!({"inScope": true})).await.unwrap();
-        assert!(scoped.contains("\"total\": 1"), "only in-scope: {scoped}");
+        assert_eq!(jparse(&scoped)["total"], 1, "only in-scope: {scoped}");
         let _ = out_id;
+    }
+
+    /// The window only learns about an MCP write through an event, so the channel name
+    /// and the payload shape are a contract across the Rust/JS boundary. Both sides are
+    /// otherwise tested with doubles, which is exactly the situation where a renamed
+    /// channel passes every test and does nothing in the running app. The literals here
+    /// are the ones `store.svelte.js` listens on and reads.
+    #[tokio::test]
+    async fn mcp_writes_announce_themselves_on_the_channels_the_window_listens_on() {
+        use crate::store::Flow;
+        use http::{HeaderMap, Method as M, StatusCode, Uri, Version};
+
+        let dir = std::env::temp_dir().join(format!("mcp-ev-{}-{}", std::process::id(), rand_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (c, events) = test_ctx_with_log(&dir);
+        let c = std::sync::Arc::new(c);
+
+        let uri: Uri = "https://example.com/a".parse().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("access-control-allow-origin", "*".parse().unwrap());
+        let mut flow = Flow::request(c.store.next_id(), &M::GET, &uri, Version::HTTP_11, &HeaderMap::new(), bytes::Bytes::new());
+        flow.set_response(StatusCode::OK, Version::HTTP_11, &h, bytes::Bytes::from_static(b"x"));
+        c.store.push(flow).unwrap();
+
+        call_tool(&c, "passive_scan", &json!({})).await.unwrap();
+        call_tool(&c, "scope_set", &json!({ "patterns": ["example.com"] })).await.unwrap();
+        call_tool(&c, "passive_rules_set", &json!({ "rules": [] })).await.unwrap();
+
+        let log = events.lock().unwrap().clone();
+        let named = |n: &str| log.iter().find(|(e, _)| e == n).map(|(_, p)| p.clone());
+
+        // store.svelte.js: listen('passive', ...) and reads payload.findings
+        let passive = named("passive").expect("no event on the 'passive' channel");
+        assert!(passive.get("findings").and_then(|v| v.as_u64()).is_some(), "payload has no numeric `findings`: {passive}");
+
+        // store.svelte.js: listen('setting', ...) and switches on payload.key
+        let keys: Vec<String> = log
+            .iter()
+            .filter(|(e, _)| e == "setting")
+            .filter_map(|(_, p)| p.get("key").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        assert!(keys.contains(&"scope".to_string()), "scope_set announced no `scope` key: {keys:?}");
+        assert!(keys.contains(&"passiveRules".to_string()), "passive_rules_set announced no `passiveRules` key: {keys:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1827,7 +3084,7 @@ mod tests {
         c.store.push(flow).unwrap();
 
         let scan = call_tool(&c, "passive_scan", &json!({})).await.unwrap();
-        assert!(scan.contains("\"scannedFlows\": 1"), "{scan}");
+        assert_eq!(jparse(&scan)["scannedFlows"], 1, "{scan}");
         let found = call_tool(&c, "passive_findings", &json!({})).await.unwrap();
         assert!(found.contains("email"), "{found}");
         assert!(found.contains("cors"), "{found}");
@@ -1835,7 +3092,7 @@ mod tests {
         // Custom rules persist.
         call_tool(&c, "passive_rules_set", &json!({"rules":[{"id":"x","title":"X","severity":"low","pattern":"foo","flags":""}]})).await.unwrap();
         let rules = call_tool(&c, "passive_rules_get", &json!({})).await.unwrap();
-        assert!(rules.contains("\"pattern\": \"foo\""), "{rules}");
+        assert!(rules.contains("\"pattern\":\"foo\""), "{rules}");
     }
 
     #[tokio::test]
@@ -1851,12 +3108,12 @@ mod tests {
         }
         // Without the setting, both hosts are scanned.
         let all = call_tool(&c, "passive_scan", &json!({})).await.unwrap();
-        assert!(all.contains("\"scannedFlows\": 2"), "{all}");
+        assert_eq!(jparse(&all)["scannedFlows"], 2, "{all}");
         // Scope to example.com and restrict to in-scope only.
         c.scope.set(vec!["*.example.com".to_string()]);
         c.store.put_setting("passiveInScope", &json!(true)).unwrap();
         let scoped = call_tool(&c, "passive_scan", &json!({})).await.unwrap();
-        assert!(scoped.contains("\"scannedFlows\": 1"), "only the in-scope host: {scoped}");
+        assert_eq!(jparse(&scoped)["scannedFlows"], 1, "only the in-scope host: {scoped}");
     }
 
     #[test]
@@ -1938,10 +3195,40 @@ mod tests {
         // Only plain hyphens: no em dash or en dash anywhere.
         assert!(!d.contains('\u{2014}'), "docs contain an em dash");
         assert!(!d.contains('\u{2013}'), "docs contain an en dash");
-        // Every tool is documented.
+        // Every tool is documented, and so is every argument it accepts. Checking only
+        // the name let a real gap through once: six tools gained arguments that the
+        // schema advertised and this page did not mention, so a reader of the docs would
+        // never have passed them.
         for t in tool_defs().as_array().unwrap() {
             let name = t["name"].as_str().unwrap();
-            assert!(d.contains(name), "docs missing tool {name}");
+            let section = d
+                .split("\n### ")
+                .find(|s| s.starts_with(name) && s[name.len()..].starts_with('\n'))
+                .unwrap_or_else(|| panic!("docs missing a '### {name}' section"));
+            // Where a reader actually looks for an argument: the paragraph beginning
+            // "Arguments" plus the section's bullet lines. Searching the whole section
+            // has no teeth, which this test proved on itself: a cursor argument removed
+            // from the argument list still "passed" on a passing mention of it in the
+            // prose two paragraphs down.
+            let mut spec = String::new();
+            let mut in_args = false;
+            for line in section.lines() {
+                if line.starts_with("Arguments") {
+                    in_args = true;
+                } else if in_args && line.trim().is_empty() {
+                    in_args = false;
+                }
+                if in_args || line.starts_with("- `") {
+                    spec.push_str(line);
+                    spec.push('\n');
+                }
+            }
+            for arg in t["inputSchema"]["properties"].as_object().unwrap().keys() {
+                assert!(
+                    spec.contains(&format!("`{arg}`")),
+                    "the docs for {name} never list its `{arg}` argument (found: {spec})"
+                );
+            }
         }
         // Detailed, with the key concepts covered.
         assert!(d.len() > 4000, "docs should be detailed, got {} bytes", d.len());
@@ -2006,7 +3293,9 @@ mod tests {
         assert_eq!((item["method"].as_str(), item["host"].as_str(), item["path"].as_str()), (Some("GET"), Some("shop.test"), Some("/api/orders/7")));
         assert_eq!(
             (item["status"].as_u64(), item["label"].as_str(), item["note"].as_str(), item["color"].as_str(), item["source"].as_str()),
-            (Some(200), Some("IDOR?"), Some("owner check"), Some("red"), Some("history"))
+            // "mcp", not "history": the Source column has to distinguish a save this
+            // server made from one the operator made by hand in the window.
+            (Some(200), Some("IDOR?"), Some("owner check"), Some("red"), Some("mcp"))
         );
         let id = item["id"].as_str().unwrap().to_string();
         // The UI was told about the new revision.
@@ -2014,7 +3303,12 @@ mod tests {
 
         // A raw request into a named collection, created on the fly (not made active).
         let raw = call("organizer_save", json!({"request": "POST /login HTTP/1.1\r\nHost: shop.test\r\n\r\nu=a", "target": "https://shop.test", "collection": "Auth", "color": "blue"})).await.unwrap();
-        assert!(raw.contains("\"name\": \"Auth\"") && raw.contains("\"source\": \"mcp\"") && raw.contains("\"active\": false"), "{raw}");
+        let rawv = jparse(&raw);
+        assert_eq!(
+            (rawv["collection"]["name"].as_str(), rawv["item"]["source"].as_str(), rawv["collection"]["active"].as_bool()),
+            (Some("Auth"), Some("mcp"), Some(false)),
+            "{raw}"
+        );
         // Bad input errors and saves nothing.
         assert!(call("organizer_save", json!({"target": "https://x"})).await.is_err());
         assert!(call("organizer_save", json!({"flowId": fid, "color": "teal"})).await.is_err());
@@ -2046,6 +3340,506 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A few flows with bodies, for the paging and slicing tests.
+    fn seed_flows(c: &Arc<Ctx>, n: usize, body: &'static [u8]) -> Vec<u64> {
+        use crate::store::Flow;
+        use http::{HeaderMap, HeaderValue, Method as M, StatusCode, Uri, Version};
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let uri: Uri = format!("https://api.test/item/{i}").parse().unwrap();
+            let mut h = HeaderMap::new();
+            h.insert("content-length", HeaderValue::from_static("0"));
+            let mut f = Flow::request(c.store.next_id(), &M::GET, &uri, Version::HTTP_11, &h, bytes::Bytes::new());
+            let mut rh = HeaderMap::new();
+            rh.insert("content-type", HeaderValue::from_static("application/json"));
+            rh.insert("content-length", HeaderValue::from_str(&body.len().to_string()).unwrap());
+            f.set_response(StatusCode::OK, Version::HTTP_11, &rh, bytes::Bytes::from_static(body));
+            ids.push(c.store.push(f).unwrap().id);
+        }
+        ids
+    }
+
+    /// Paging a live capture by index silently re-reads and skips rows, so these lists
+    /// page by id and refuse an index. The test walks a list while inserting, which is
+    /// the case an index gets wrong.
+    #[tokio::test]
+    async fn history_lists_page_by_cursor_and_refuse_an_index() {
+        let c = ctx();
+        let ids = seed_flows(&c, 12, b"{}");
+
+        // Walk the whole history in pages of 5, following the cursor.
+        let mut seen: Vec<u64> = Vec::new();
+        let mut before = 0u64;
+        for _ in 0..10 {
+            let args = if before == 0 { json!({"limit": 5}) } else { json!({"limit": 5, "beforeId": before}) };
+            let page = jparse(&call_tool(&c, "history_list", &args).await.unwrap());
+            for f in page["flows"].as_array().unwrap() {
+                seen.push(f["id"].as_u64().unwrap());
+            }
+            if !page["hasMore"].as_bool().unwrap() {
+                // Exhausted: no cursor is offered, so there is no loop to fall into.
+                assert!(page.get("nextBeforeId").is_none(), "{page}");
+                break;
+            }
+            before = page["nextBeforeId"].as_u64().expect("a cursor while more remain");
+        }
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(seen.len(), ids.len(), "every flow seen exactly once: {seen:?}");
+        assert_eq!(sorted.len(), seen.len(), "no flow seen twice: {seen:?}");
+
+        // Newest first, and a flow arriving mid-walk has a higher id, so it is simply
+        // outside the walk instead of shifting a page boundary.
+        let first = jparse(&call_tool(&c, "history_list", &json!({"limit": 5})).await.unwrap());
+        let cursor = first["nextBeforeId"].as_u64().unwrap();
+        seed_flows(&c, 3, b"{}");
+        let next = jparse(&call_tool(&c, "history_list", &json!({"limit": 5, "beforeId": cursor})).await.unwrap());
+        let next_ids: Vec<u64> = next["flows"].as_array().unwrap().iter().map(|f| f["id"].as_u64().unwrap()).collect();
+        assert!(next_ids.iter().all(|id| *id <= cursor), "the walk does not jump to new arrivals: {next_ids:?}");
+        assert!(next["newestId"].as_u64().unwrap() > cursor, "and it can see that capture moved");
+
+        // An index is refused by name rather than ignored.
+        let err = call_tool(&c, "history_list", &json!({"offset": 5})).await.unwrap_err();
+        assert!(err.contains("beforeId"), "{err}");
+        // A cursor sent as a string is refused too: falling back to the default here
+        // would mean re-reading page one forever.
+        let err = call_tool(&c, "history_list", &json!({"beforeId": "7"})).await;
+        assert!(err.is_ok(), "an all-digit string is a near miss, not a different intent");
+        let err = call_tool(&c, "history_list", &json!({"beforeId": "newest"})).await.unwrap_err();
+        assert!(err.contains("whole number"), "{err}");
+
+        // Search pages the same way, with the same words.
+        let s = jparse(&call_tool(&c, "history_search", &json!({"query": "api.test", "limit": 4})).await.unwrap());
+        assert_eq!(s["returned"], 4);
+        assert!(s["hasMore"].as_bool().unwrap() && s["nextBeforeId"].is_number(), "{s}");
+        // A search that finds nothing says why that is not proof of absence.
+        let none = jparse(&call_tool(&c, "history_search", &json!({"query": "zzz-not-there"})).await.unwrap());
+        assert_eq!(none["matches"], 0);
+        assert!(none["note"].as_str().is_some_and(|n| n.contains("not proof of absence")), "{none}");
+    }
+
+    /// Reading a whole 2 MB body to answer a question about a header is the most
+    /// expensive mistake this surface used to force.
+    #[tokio::test]
+    async fn history_get_reads_only_the_part_asked_for() {
+        let c = ctx();
+        // 40 KB of body, over the default 32 KB cap.
+        static BIG: &[u8] = &[b'x'; 40 * 1024];
+        let id = seed_flows(&c, 1, BIG)[0];
+
+        // Default: one side is capped, and the receipt says so and how to continue.
+        let d = jparse(&call_tool(&c, "history_get", &json!({"id": id})).await.unwrap());
+        let r = &d["responseSlice"];
+        assert_eq!(r["complete"], false, "{d}");
+        assert_eq!(r["hasMore"], true);
+        assert_eq!(r["bodyBytes"], 40 * 1024);
+        assert_eq!(r["returned"], 32 * 1024);
+        assert!(r["unit"].as_str().unwrap().contains("bytes"), "{r}");
+
+        // Paging the body reassembles it exactly, and nothing but the body comes back.
+        let mut body = String::new();
+        let mut at = 0u64;
+        loop {
+            let p = jparse(
+                &call_tool(&c, "history_get", &json!({"id": id, "side": "response", "part": "body", "offset": at, "maxBytes": 9000}))
+                    .await
+                    .unwrap(),
+            );
+            body.push_str(p["response"].as_str().unwrap());
+            assert!(p.get("request").is_none(), "side=response returns one message: {p}");
+            if !p["responseSlice"]["hasMore"].as_bool().unwrap() {
+                break;
+            }
+            at = p["responseSlice"]["nextOffset"].as_u64().unwrap();
+        }
+        assert_eq!(body.len(), BIG.len(), "the body reassembles from its pages");
+
+        // Headers only: a few hundred bytes, no body, and it does not pretend to be all.
+        let h = jparse(&call_tool(&c, "history_get", &json!({"id": id, "side": "response", "part": "headers"})).await.unwrap());
+        let text = h["response"].as_str().unwrap();
+        assert!(text.starts_with("HTTP/1.1 200") && text.ends_with("\n\n") && text.len() < 400, "{text}");
+        assert_eq!(h["responseSlice"]["bodyIncluded"], false);
+        assert_eq!(h["responseSlice"]["bodyBytes"], 40 * 1024);
+
+        // An offset with no side named is ambiguous, so it is refused rather than guessed.
+        assert!(call_tool(&c, "history_get", &json!({"id": id, "offset": 10})).await.is_err());
+        assert!(call_tool(&c, "history_get", &json!({"id": id, "side": "response", "part": "headers", "offset": 10})).await.is_err());
+        assert!(call_tool(&c, "history_get", &json!({"id": id, "encoding": "base64"})).await.is_err(), "base64 needs part=body");
+        assert!(call_tool(&c, "history_get", &json!({"id": id, "part": "trailer"})).await.is_err());
+
+        // A small flow is unchanged: no receipt at all, and the text it always returned.
+        let small = seed_flows(&c, 1, b"{\"ok\":true}")[0];
+        let s = jparse(&call_tool(&c, "history_get", &json!({"id": small, "view": "wire"})).await.unwrap());
+        assert!(s.get("responseSlice").is_none() && s.get("requestSlice").is_none(), "{s}");
+        assert!(s["response"].as_str().unwrap().ends_with("{\"ok\":true}"));
+    }
+
+    /// Lossy UTF-8 of binary bytes is replacement characters: bigger than the body and
+    /// worth nothing. It must not be the default answer.
+    #[tokio::test]
+    async fn history_get_does_not_dump_a_binary_body_as_text() {
+        use crate::store::Flow;
+        use http::{HeaderMap, HeaderValue, Method as M, StatusCode, Uri, Version};
+        let c = ctx();
+        let png: Vec<u8> = b"\x89PNG\r\n\x1a\n".iter().copied().chain((0u8..=255).cycle().take(4096)).collect();
+        let uri: Uri = "https://api.test/logo.png".parse().unwrap();
+        let mut f = Flow::request(c.store.next_id(), &M::GET, &uri, Version::HTTP_11, &HeaderMap::new(), bytes::Bytes::new());
+        let mut rh = HeaderMap::new();
+        rh.insert("content-type", HeaderValue::from_static("image/png"));
+        rh.insert("content-length", HeaderValue::from_str(&png.len().to_string()).unwrap());
+        f.set_response(StatusCode::OK, Version::HTTP_11, &rh, bytes::Bytes::from(png.clone()));
+        let id = c.store.push(f).unwrap().id;
+
+        let d = jparse(&call_tool(&c, "history_get", &json!({"id": id, "side": "response"})).await.unwrap());
+        let r = &d["responseSlice"];
+        assert_eq!((r["binary"].as_bool(), r["bodyIncluded"].as_bool(), r["returned"].as_u64()), (Some(true), Some(false), Some(0)), "{d}");
+        assert!(!d["response"].as_str().unwrap().contains('\u{fffd}'), "no replacement characters are shipped");
+        assert!(r["note"].as_str().unwrap().contains("base64"), "and it says how to get the bytes: {r}");
+
+        // base64 returns the real bytes, capped, and the range reassembles.
+        let b = jparse(
+            &call_tool(&c, "history_get", &json!({"id": id, "side": "response", "part": "body", "encoding": "base64", "maxBytes": 64}))
+                .await
+                .unwrap(),
+        );
+        let decoded = STANDARD.decode(b["response"].as_str().unwrap()).expect("valid base64");
+        assert_eq!(decoded, png[..64], "the first bytes, exactly");
+        assert_eq!(b["responseSlice"]["nextOffset"], 64);
+    }
+
+    /// A WebSocket flow's history_get is only the handshake, so the messages have to be
+    /// reachable and have to describe themselves honestly.
+    #[tokio::test]
+    async fn ws_messages_pages_a_socket_and_says_what_a_payload_is() {
+        use crate::store::Flow;
+        use http::{HeaderMap, Method as M, StatusCode, Uri, Version};
+        let c = ctx();
+        let uri: Uri = "https://api.test/socket".parse().unwrap();
+        let mut f = Flow::request(c.store.next_id(), &M::GET, &uri, Version::HTTP_11, &HeaderMap::new(), bytes::Bytes::new());
+        f.set_response(StatusCode::SWITCHING_PROTOCOLS, Version::HTTP_11, &HeaderMap::new(), bytes::Bytes::new());
+        let fid = c.store.push(f).unwrap().id;
+
+        for i in 0..6 {
+            let dir = if i % 2 == 0 { "client" } else { "server" };
+            let text = format!("{{\"n\":{i},\"token\":\"needle-{i}\"}}");
+            c.store.push_ws(fid, 1000 + i, dir, 1, text.len() as u64, text.as_bytes()).unwrap();
+        }
+        // A binary message whose true size is larger than what capture kept.
+        let blob: Vec<u8> = b"\x00\x01\x02\x03".iter().copied().cycle().take(2048).collect();
+        c.store.push_ws(fid, 2000, "server", 2, 9_000_000, &blob).unwrap();
+        // And a close message.
+        c.store.push_ws(fid, 2001, "server", 8, 5, b"\x03\xe8bye").unwrap();
+
+        // Totals, then a page, then the cursor.
+        let p1 = jparse(&call_tool(&c, "ws_messages", &json!({"flowId": fid, "limit": 3})).await.unwrap());
+        assert_eq!((p1["total"].as_u64(), p1["client"].as_u64(), p1["server"].as_u64()), (Some(8), Some(3), Some(5)), "{p1}");
+        assert_eq!(p1["returned"], 3);
+        assert_eq!(p1["hasMore"], true);
+        let cursor = p1["nextAfterId"].as_u64().unwrap();
+        let p2 = jparse(&call_tool(&c, "ws_messages", &json!({"flowId": fid, "afterId": cursor, "limit": 100})).await.unwrap());
+        let ids: Vec<u64> = p2["messages"].as_array().unwrap().iter().map(|m| m["id"].as_u64().unwrap()).collect();
+        assert!(ids.iter().all(|i| *i > cursor), "the cursor does not repeat a message: {ids:?}");
+        assert_eq!(p1["returned"].as_u64().unwrap() + p2["returned"].as_u64().unwrap(), 8);
+
+        // The binary message: hex, cut, and all three sizes reported, so nobody quotes
+        // the length of the text as the size of the payload.
+        let all = jparse(&call_tool(&c, "ws_messages", &json!({"flowId": fid, "limit": 100, "maxBytes": 65536})).await.unwrap());
+        let bin = all["messages"].as_array().unwrap().iter().find(|m| m["opcode"] == 2).expect("the binary message");
+        assert_eq!((bin["type"].as_str(), bin["renderedAs"].as_str()), (Some("binary"), Some("hex")), "{bin}");
+        assert_eq!((bin["length"].as_u64(), bin["stored"].as_u64(), bin["returned"].as_u64()), (Some(9_000_000), Some(2048), Some(256)));
+        assert_eq!(bin["complete"], false);
+        assert!(bin["payload"].as_str().unwrap().starts_with("00000000  00 01 02 03"), "{bin}");
+        assert!(all["note"].as_str().is_some_and(|n| n.contains("rendering")), "{all}");
+        // The close message reads as a close, not as bytes.
+        let close = all["messages"].as_array().unwrap().iter().find(|m| m["opcode"] == 8).expect("the close message");
+        assert_eq!((close["type"].as_str(), close["renderedAs"].as_str(), close["payload"].as_str()), (Some("close"), Some("close"), Some("close 1000 bye")));
+
+        // Filters.
+        let only = jparse(&call_tool(&c, "ws_messages", &json!({"flowId": fid, "direction": "client", "limit": 100})).await.unwrap());
+        assert!(only["messages"].as_array().unwrap().iter().all(|m| m["direction"] == "client"), "{only}");
+        let found = jparse(&call_tool(&c, "ws_messages", &json!({"flowId": fid, "contains": "needle-3"})).await.unwrap());
+        assert_eq!(found["returned"], 1, "{found}");
+        assert!(found["containsNote"].as_str().is_some(), "the index's limits are stated: {found}");
+        assert!(call_tool(&c, "ws_messages", &json!({"flowId": fid, "direction": "upstream"})).await.is_err());
+
+        // The handshake flow points at them, so a reader is not left thinking it is empty.
+        let hs = jparse(&call_tool(&c, "history_get", &json!({"id": fid})).await.unwrap());
+        assert_eq!(hs["wsMessages"], 8, "{hs}");
+        assert!(hs["wsNote"].as_str().unwrap().contains("ws_messages"), "{hs}");
+
+        // A search that matched inside a message says so, instead of handing back a flow
+        // whose history_get shows only a 101 handshake.
+        let s = jparse(&call_tool(&c, "history_search", &json!({"query": "needle-3"})).await.unwrap());
+        assert_eq!(s["wsMatches"], json!([fid]), "{s}");
+        assert!(s["wsNote"].as_str().unwrap().contains("ws_messages"), "{s}");
+
+        // A flow with no messages is a fact, not an error; an unknown flow is an error.
+        let plain = seed_flows(&c, 1, b"{}")[0];
+        let empty = jparse(&call_tool(&c, "ws_messages", &json!({"flowId": plain})).await.unwrap());
+        assert_eq!((empty["total"].as_u64(), empty["returned"].as_u64()), (Some(0), Some(0)), "{empty}");
+        assert!(empty["note"].as_str().unwrap().contains("no WebSocket"), "{empty}");
+        assert!(call_tool(&c, "ws_messages", &json!({"flowId": 99999})).await.is_err());
+        assert!(call_tool(&c, "ws_messages", &json!({})).await.is_err(), "flowId is required");
+    }
+
+    /// The budget has to beat limit x maxBytes, or one call can return 32 MB.
+    #[tokio::test]
+    async fn ws_messages_stops_at_its_byte_budget() {
+        use crate::store::Flow;
+        use http::{HeaderMap, Method as M, StatusCode, Uri, Version};
+        let c = ctx();
+        let uri: Uri = "https://api.test/firehose".parse().unwrap();
+        let mut f = Flow::request(c.store.next_id(), &M::GET, &uri, Version::HTTP_11, &HeaderMap::new(), bytes::Bytes::new());
+        f.set_response(StatusCode::SWITCHING_PROTOCOLS, Version::HTTP_11, &HeaderMap::new(), bytes::Bytes::new());
+        let fid = c.store.push(f).unwrap().id;
+        let big = "y".repeat(WS_BYTES_MAX);
+        for i in 0..40 {
+            c.store.push_ws(fid, 3000 + i, "server", 1, big.len() as u64, big.as_bytes()).unwrap();
+        }
+        let out = jparse(&call_tool(&c, "ws_messages", &json!({"flowId": fid, "limit": 500, "maxBytes": WS_BYTES_MAX})).await.unwrap());
+        assert_eq!(out["budgetReached"], true, "{}", out["returned"]);
+        let spent: usize = out["messages"].as_array().unwrap().iter().map(|m| m["payload"].as_str().unwrap().len()).sum();
+        assert!(spent <= WS_BUDGET + WS_BYTES_MAX, "bounded at about the budget, got {spent}");
+        assert!(out["returned"].as_u64().unwrap() < 40, "it stopped early: {}", out["returned"]);
+        assert!(out["nextAfterId"].is_number(), "and it can be continued: {out}");
+    }
+
+    /// An empty History has several causes, and a caller that cannot tell them apart
+    /// reports that the application makes no HTTP requests.
+    #[tokio::test]
+    async fn proxy_status_diagnoses_an_empty_capture_without_leaking_addresses() {
+        let c = ctx();
+        let s = jparse(&call_tool(&c, "proxy_status", &json!({})).await.unwrap());
+        assert_eq!((s["listening"].as_bool(), s["flows"].as_u64()), (Some(false), Some(0)));
+        let hints = s["hints"].as_array().expect("hints when nothing was captured");
+        assert!(hints.iter().any(|h| h.as_str().unwrap().contains("not running")), "{hints:?}");
+        assert!(s["note"].as_str().unwrap().contains("Read-only"), "{s}");
+
+        // A loopback listener and a non-loopback one: the port and the reach are
+        // reported, the address never is.
+        c.add_listener("127.0.0.1:8080".parse().unwrap());
+        c.add_listener("10.1.2.3:8081".parse().unwrap());
+        let s = jparse(&call_tool(&c, "proxy_status", &json!({})).await.unwrap());
+        assert_eq!(s["listening"], true);
+        let ls = s["listeners"].as_array().unwrap();
+        assert_eq!(ls.len(), 2, "{s}");
+        for l in ls {
+            assert!(l["port"].is_number() && l["exposure"].is_string(), "{l}");
+            assert!(l.get("host").is_none() && l.get("addr").is_none(), "no bind address is reported: {l}");
+        }
+        let text = serde_json::to_string(&s).unwrap();
+        assert!(!text.contains("10.1.2.3"), "a LAN address must not reach a tool result: {text}");
+        assert!(!text.contains("127.0.0.1"), "nor a loopback one, so the rule has no exceptions to learn");
+        // The counts stand in for the extension status, which carries filesystem paths.
+        assert!(s["extensions"]["loaded"].is_number() && s["extensions"].get("python").is_none(), "{s}");
+
+        // Once something is captured, the hints stop and the age appears.
+        seed_flows(&c, 2, b"{}");
+        let s = jparse(&call_tool(&c, "proxy_status", &json!({})).await.unwrap());
+        assert_eq!(s["flows"], 2);
+        assert!(s.get("hints").is_none(), "{s}");
+        assert!(s["newestFlowAgeMs"].is_number() && s["newestFlowTs"].is_number(), "{s}");
+    }
+
+    /// A finding this server records can end up in a client-facing report, so it must be
+    /// impossible to make it look like one Ngintip itself produced.
+    #[tokio::test]
+    async fn findings_add_records_a_claim_the_caller_cannot_disown() {
+        let c = ctx();
+        let id = seed_flows(&c, 1, b"{\"order\":7}")[0];
+
+        let out = jparse(
+            &call_tool(
+                &c,
+                "findings_add",
+                &json!({
+                    "title": "IDOR on /item/{id}",
+                    "severity": "high",
+                    "confidence": "firm",
+                    "detail": "Item 0 belongs to another user; only the path id was changed.",
+                    "flowId": id,
+                    "citedFlowIds": [id],
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let item = &out["item"];
+        // The three attribution layers, none of them settable by the caller.
+        assert_eq!(item["source"], "mcp-finding", "distinct from a saved request's 'mcp': {item}");
+        assert!(item["label"].as_str().unwrap().starts_with("[agent high] "), "{item}");
+        let note = item["note"].as_str().unwrap();
+        assert!(note.starts_with(FINDING_HEADER), "{note}");
+        assert!(note.contains("claimed by an LLM"), "the load-bearing word: {note}");
+        assert!(note.contains("severity: high") && note.contains("confidence: firm"), "{note}");
+        assert!(note.contains(&format!("flow {id}")), "the evidence is cited: {note}");
+        assert!(note.ends_with("only the path id was changed."), "{note}");
+        assert_eq!(item["color"], "red", "severity sets the colour: {item}");
+        assert_eq!(out["collection"]["name"], "Findings");
+        assert!(out["attribution"].as_str().unwrap().contains("mcp-finding"), "{out}");
+
+        // Attempts to dress it up as something else are ignored, not honoured.
+        let faked = jparse(
+            &call_tool(
+                &c,
+                "findings_add",
+                &json!({"title": "x", "severity": "info", "detail": "y", "source": "passive", "color": "green", "note": "clean"}),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(faked["item"]["source"], "mcp-finding", "{faked}");
+        assert_eq!(faked["item"]["color"], "gray");
+        assert!(faked["item"]["note"].as_str().unwrap().starts_with(FINDING_HEADER));
+
+        // The fields a report needs are required, and the vocabulary is the scanner's.
+        assert!(call_tool(&c, "findings_add", &json!({"title": "x", "severity": "high"})).await.is_err());
+        assert!(call_tool(&c, "findings_add", &json!({"title": "x", "detail": "y"})).await.is_err(), "severity required");
+        assert!(call_tool(&c, "findings_add", &json!({"title": "x", "severity": "critical", "detail": "y"})).await.is_err());
+        assert!(call_tool(&c, "findings_add", &json!({"title": "x", "severity": "low", "detail": "y", "flowId": 99999})).await.is_err());
+
+        // Out of scope is a warning, not a refusal: reading the capture is unrestricted,
+        // but a finding is work product.
+        c.scope.set(vec!["elsewhere.test".into()]);
+        let warned = jparse(
+            &call_tool(&c, "findings_add", &json!({"title": "x", "severity": "low", "detail": "y", "flowId": id})).await.unwrap(),
+        );
+        assert!(warned["scopeWarning"].as_str().is_some_and(|w| w.contains("outside the target scope")), "{warned}");
+        assert_eq!(warned["item"]["source"], "mcp-finding", "still recorded");
+
+        // It lands in the Organizer, and the window is told, so it is not a write-only
+        // hole: the whole point of choosing this surface.
+        let listed = jparse(&call_tool(&c, "organizer_list", &json!({"collection": "Findings"})).await.unwrap());
+        assert_eq!(listed["collections"][0]["count"], 3, "{listed}");
+    }
+
+    /// An encrypted API is readable in the window, so it has to be readable over MCP
+    /// too: the version a `decode_*` extension produces must reach `history_get`
+    /// without ever displacing the bytes that actually crossed the wire.
+    #[tokio::test]
+    async fn history_get_serves_the_decoded_version_beside_the_wire() {
+        use crate::store::Flow;
+        use http::{HeaderMap, HeaderValue, Method as M, StatusCode, Uri, Version};
+        if crate::extensions::detect_python().is_none() {
+            eprintln!("skipping: no python interpreter");
+            return;
+        }
+        let c = ctx();
+        let parse = |s: String| serde_json::from_str::<Value>(&s).unwrap();
+        // Real captures carry Content-Length, and a hook that changes nothing then
+        // re-serializes to identical bytes, which is what "no change" relies on.
+        let with_len = |n: usize| {
+            let mut h = HeaderMap::new();
+            h.insert("content-length", HeaderValue::from_str(&n.to_string()).unwrap());
+            h
+        };
+
+        // A captured flow whose bodies stand in for ciphertext.
+        let uri: Uri = "https://api.t/blue/api/transfer".parse().unwrap();
+        let body = bytes::Bytes::from_static(b"cherry-request");
+        let mut flow = Flow::request(c.store.next_id(), &M::POST, &uri, Version::HTTP_11, &with_len(body.len()), body);
+        let res_body = bytes::Bytes::from_static(b"cherry-response");
+        flow.set_response(StatusCode::OK, Version::HTTP_11, &with_len(res_body.len()), res_body);
+        let fid = c.store.push(flow).unwrap().id;
+
+        // With no extension loaded there is one version and no extra keys at all.
+        let bare = parse(call_tool(&c, "history_get", &json!({"id": fid})).await.unwrap());
+        assert_eq!(bare["request"].as_str().unwrap().lines().next(), Some("POST /blue/api/transfer HTTP/1.1"));
+        assert!(bare.get("versions").is_none(), "nothing to add: {bare}");
+
+        // A decode-only extension, scoped to this host by the script itself.
+        let dir = crate::e2e::temp_dir("mcp-decode");
+        let script = dir.join("d.py");
+        std::fs::write(
+            &script,
+            "def decode_request(req, ctx):\n    if ctx.host == 'api.t':\n        req.text = req.text.upper()\n\n\
+             def decode_response(req, ctx):\n    if ctx.host == 'api.t':\n        req.text = req.text.upper()\n",
+        )
+        .unwrap();
+        c.extensions.configure(dir.clone(), None, None);
+        c.extensions.set_extensions(vec![crate::extensions::ExtensionSpec {
+            id: "d".into(),
+            name: "decode".into(),
+            path: script.to_string_lossy().into_owned(),
+            enabled: true,
+            scope: "both".into(),
+            requirements: vec![],
+            body: String::new(),
+        }]);
+        c.extensions.set_enabled(true);
+        assert!(c.extensions.active(), "extension worker should be running");
+
+        // auto (the default): the wire stays where it was, the readable form is added.
+        let auto = parse(call_tool(&c, "history_get", &json!({"id": fid})).await.unwrap());
+        assert_eq!(auto["view"], "wire");
+        assert!(auto["request"].as_str().unwrap().contains("cherry-request"), "wire untouched: {auto}");
+        assert!(auto["response"].as_str().unwrap().contains("cherry-response"), "wire untouched: {auto}");
+        assert!(auto["versions"]["requestExtension"].as_str().unwrap().contains("CHERRY-REQUEST"), "{auto}");
+        assert!(auto["versions"]["responseExtension"].as_str().unwrap().contains("CHERRY-RESPONSE"), "{auto}");
+        assert!(auto["versionsNote"].as_str().is_some_and(|n| n.contains("decode_*")), "{auto}");
+        // decode_* changes nothing on the wire, so there is no Original to report.
+        assert!(auto["versions"].get("requestOriginal").is_none(), "{auto}");
+        assert!(auto["versions"].get("responseOriginal").is_none(), "{auto}");
+
+        // view=wire: the thrifty shape this tool had before, even with a decode active.
+        let wire = parse(call_tool(&c, "history_get", &json!({"id": fid, "view": "wire"})).await.unwrap());
+        assert!(wire.get("versions").is_none(), "{wire}");
+        assert!(wire["request"].as_str().unwrap().contains("cherry-request"));
+
+        // view=extension: the readable form in the usual place, flagged as decoded.
+        let ext = parse(call_tool(&c, "history_get", &json!({"id": fid, "view": "extension"})).await.unwrap());
+        assert!(ext["request"].as_str().unwrap().contains("CHERRY-REQUEST"), "{ext}");
+        assert!(ext["response"].as_str().unwrap().contains("CHERRY-RESPONSE"), "{ext}");
+        assert_eq!((ext["requestDecoded"].as_bool(), ext["responseDecoded"].as_bool()), (Some(true), Some(true)));
+
+        // A host the script ignores gets no decoded version, so nothing is invented.
+        let other: Uri = "https://other.t/x".parse().unwrap();
+        let mut f2 = Flow::request(c.store.next_id(), &M::GET, &other, Version::HTTP_11, &HeaderMap::new(), bytes::Bytes::new());
+        let plain = bytes::Bytes::from_static(b"plain");
+        f2.set_response(StatusCode::OK, Version::HTTP_11, &with_len(plain.len()), plain);
+        let other_id = c.store.push(f2).unwrap().id;
+        let out = parse(call_tool(&c, "history_get", &json!({"id": other_id})).await.unwrap());
+        assert!(out.get("versions").is_none(), "no decode for a host the script skips: {out}");
+        let ext_other = parse(call_tool(&c, "history_get", &json!({"id": other_id, "view": "extension"})).await.unwrap());
+        assert_eq!(ext_other["requestDecoded"], false, "falls back to the wire, and says so: {ext_other}");
+        assert!(ext_other["response"].as_str().unwrap().contains("plain"));
+
+        // An unknown view is refused rather than quietly treated as the default.
+        assert!(call_tool(&c, "history_get", &json!({"id": fid, "view": "plaintext"})).await.is_err());
+        // And through the path a real client takes, not just the dispatcher: the schema
+        // has to advertise the parameter, or no client will ever pass it.
+        let list = handle_rpc(&c, json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).await.unwrap();
+        let def = list["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "history_get").cloned().expect("history_get listed");
+        let views: Vec<&str> = def["inputSchema"]["properties"]["view"]["enum"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(views, VIEWS.to_vec(), "schema advertises the views: {def}");
+        let rpc = handle_rpc(
+            &c,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"history_get","arguments":{"id":fid,"view":"extension"}}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rpc["result"]["isError"], false, "{rpc}");
+        let text = rpc["result"]["content"][0]["text"].as_str().unwrap().to_string();
+        assert!(parse(text.clone())["request"].as_str().unwrap().contains("CHERRY-REQUEST"), "{text}");
+        // A rejected view is a tool error the model can read, not a protocol error.
+        let bad = handle_rpc(
+            &c,
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"history_get","arguments":{"id":fid,"view":"nope"}}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bad["result"]["isError"], true, "{bad}");
+        assert!(bad["result"]["content"][0]["text"].as_str().unwrap().contains("invalid view"), "{bad}");
+
+        // Out of scope, the decode never runs: the wire is all there is.
+        c.scope.set(vec!["other.t".into()]);
+        let scoped = parse(call_tool(&c, "history_get", &json!({"id": fid})).await.unwrap());
+        assert!(scoped.get("versions").is_none(), "host out of Target scope: {scoped}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn vault_tools_hide_secrets_in_listings_and_never_write() {
         let c = ctx();
@@ -2061,8 +3855,8 @@ mod tests {
         let list = call_tool(&c, "vault_list", &json!({})).await.unwrap();
         assert!(list.contains("admin@shop.test") && list.contains(vault::HIDDEN), "{list}");
         assert!(!list.contains("S3cret!") && !list.contains("toor"), "no secret in a listing: {list}");
-        assert!(call_tool(&c, "vault_list", &json!({"query": "root"})).await.unwrap().contains("\"returned\": 1"));
-        assert!(call_tool(&c, "vault_list", &json!({"query": "S3cret"})).await.unwrap().contains("\"returned\": 0"));
+        assert_eq!(jparse(&call_tool(&c, "vault_list", &json!({"query": "root"})).await.unwrap())["returned"], 1);
+        assert_eq!(jparse(&call_tool(&c, "vault_list", &json!({"query": "S3cret"})).await.unwrap())["returned"], 0);
 
         // vault_get returns the secrets; a label two entries share must use the id.
         assert!(call_tool(&c, "vault_get", &json!({"id": "v1"})).await.unwrap().contains("S3cret!"));

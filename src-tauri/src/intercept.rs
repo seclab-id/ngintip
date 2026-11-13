@@ -148,6 +148,23 @@ impl Intercept {
         self.filter.lock().unwrap().allows(method, host, path, url)
     }
 
+    /// Release every held message by DROPPING it, and switch intercept off.
+    ///
+    /// For a project change, not for the operator turning intercept off. A held REQUEST
+    /// has not reached the target yet, which is what holding means, so dropping it has no
+    /// effect on the client's system. Forwarding does: it would send a request to a
+    /// client's production system after the operator has left that engagement, and it
+    /// could not be recorded anywhere either, because the project it belongs to is closed
+    /// by the time the round trip finishes. An unrecordable request against a client is
+    /// the one outcome a testing tool must not produce.
+    pub fn drain_dropped(&self) {
+        self.enabled.store(false, Ordering::Relaxed);
+        self.responses.store(false, Ordering::Relaxed);
+        for p in self.queue.lock().unwrap().drain(..) {
+            let _ = p.tx.send(Decision::Drop);
+        }
+    }
+
     /// Turning intercept off releases everything still held, unchanged.
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);

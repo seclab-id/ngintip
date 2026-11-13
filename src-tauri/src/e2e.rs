@@ -334,6 +334,75 @@ async fn origin(req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
         .unwrap())
 }
 
+/// A flow captured in one project must never be written into the next one.
+///
+/// This is the generation guard going through the real path, not through `push_batch_at`
+/// directly: a live proxy round trip, `record_flow`, the mpsc queue and the writer
+/// thread, with the store switched to another project while the flow is still in flight.
+/// Before the guard, that flow was committed into the project the operator had just
+/// opened, carrying an id minted from the previous project's counter, so `INSERT OR
+/// REPLACE` could also overwrite a row that was really there.
+#[tokio::test]
+async fn a_flow_captured_before_a_project_switch_never_lands_in_the_next_project() {
+    let h = Harness::start("switch-guard").await;
+
+    // Project A: one ordinary request, recorded the usual way.
+    let res = h.get(&format!("http://{}/ok", h.origin)).await;
+    assert!(res.contains("200"), "proxy did not serve the request: {res}");
+    for _ in 0..200 {
+        if !h.ctx.store.summaries().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let in_a = h.ctx.store.summaries().unwrap().len();
+    assert_eq!(in_a, 1, "the ordinary path still records");
+
+    // A flow captured under A, held back as if its upstream round trip were still
+    // running when the operator opened another project.
+    let late = {
+        let (id, gen) = h.ctx.store.next_id_at();
+        let uri: http::Uri = "http://late.test/x".parse().unwrap();
+        let mut f = crate::store::Flow::request(id, &http::Method::GET, &uri, http::Version::HTTP_11, &http::HeaderMap::new(), bytes::Bytes::new())
+            .at(gen);
+        f.set_response(http::StatusCode::OK, http::Version::HTTP_11, &http::HeaderMap::new(), bytes::Bytes::from_static(b"from project A"));
+        f
+    };
+
+    // The operator opens project B.
+    let b_path = h.ctx.store.path().with_file_name("project-b.intip");
+    let _ = std::fs::remove_file(&b_path);
+    h.ctx.store.switch(&b_path).unwrap();
+    assert_eq!(h.ctx.store.summaries().unwrap().len(), 0, "project B starts empty");
+
+    // Only now does A's flow reach the writer.
+    h.ctx.record_flow(late);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert_eq!(
+        h.ctx.store.summaries().unwrap().len(),
+        0,
+        "a flow captured in the previous project was written into the one just opened"
+    );
+
+    // And the guard has not simply broken recording: a flow captured in B still lands.
+    let (id, gen) = h.ctx.store.next_id_at();
+    let uri: http::Uri = "http://b.test/x".parse().unwrap();
+    let mut mine = crate::store::Flow::request(id, &http::Method::GET, &uri, http::Version::HTTP_11, &http::HeaderMap::new(), bytes::Bytes::new()).at(gen);
+    mine.set_response(http::StatusCode::OK, http::Version::HTTP_11, &http::HeaderMap::new(), bytes::Bytes::new());
+    h.ctx.record_flow(mine);
+    for _ in 0..200 {
+        if !h.ctx.store.summaries().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let rows = h.ctx.store.summaries().unwrap();
+    assert_eq!(rows.len(), 1, "the guard stopped the new project recording too");
+    assert_eq!(rows[0].host, "b.test");
+    let _ = std::fs::remove_file(&b_path);
+}
+
 #[tokio::test]
 async fn forwards_and_records() {
     let h = Harness::start("forward").await;
@@ -742,16 +811,10 @@ async fn decode_hook_shows_plaintext_without_changing_the_wire() {
     assert!(!String::from_utf8_lossy(&flow.res_body).contains("SECRET-42"), "recorded response stays encrypted");
     assert!(flow.variants.res_original.is_none(), "decode sets no Original; it is display-only");
 
-    // The "Decoded" view get_flow surfaces: run the decode hook on the recorded
-    // response, exactly as get_flow does, and it yields the readable plaintext.
-    let txt = crate::raw::response_text_for_processing(&flow);
-    let hc = crate::extensions::HookCtx { host: flow.summary.host.clone(), ..Default::default() };
-    let decoded = h
-        .ctx
-        .extensions
-        .decode(crate::extensions::Phase::Response, txt.as_bytes(), crate::extensions::Surface::Proxy, &hc)
-        .expect("a decoded view");
-    assert!(String::from_utf8_lossy(&decoded).contains("SECRET-42"), "the decoded view is the plaintext");
+    // The "Decoded" view, through the one helper the window and the MCP server share,
+    // so this can no longer drift from what either of them actually shows.
+    let decoded = crate::commands::flow_variants(&h.ctx, &flow).res_extension.expect("a decoded view");
+    assert!(decoded.contains("SECRET-42"), "the decoded view is the plaintext");
 
     let _ = std::fs::remove_dir_all(&sdir);
 }
@@ -1062,11 +1125,17 @@ async fn extension_scope_controls_where_it_runs() {
     h.ctx.extensions.set_enabled(true);
     let res = crate::commands::send_recorded(&h.ctx, None, &target, &raw, true).await.unwrap();
     assert!(!res.response_raw.to_lowercase().contains("x-ext: applied"), "proxy-scope must not run in Repeater:\n{}", res.response_raw);
+    assert!(res.request_final.is_none(), "nothing transformed the request, so there is no second version");
 
     // Scope "repeater": the same send IS transformed (origin echoes the added header).
     h.ctx.extensions.set_extensions(vec![spec("repeater")]);
     let res = crate::commands::send_recorded(&h.ctx, None, &target, &raw, true).await.unwrap();
     assert!(res.response_raw.to_lowercase().contains("x-ext: applied"), "repeater-scope should run in Repeater:\n{}", res.response_raw);
+    // The reply itself says what was actually sent. The MCP server has no other way to
+    // see the transformed message, and reports it as `requestSent`.
+    let sent = res.request_final.as_deref().expect("send_recorded surfaces the request it sent");
+    assert!(sent.to_lowercase().contains("x-ext: applied"), "the sent version carries the extension header:\n{sent}");
+    assert!(!raw.to_lowercase().contains("x-ext"), "and it differs from the request that was passed in");
 
     // History keeps the typed request under the Original variant. Both sends record a
     // flow, so wait for the second (the repeater-scope one) before inspecting it.
@@ -1078,6 +1147,26 @@ async fn extension_scope_controls_where_it_runs() {
     let original = flow.variants.req_original.expect("Original request variant");
     assert!(!original.to_lowercase().contains("x-ext"), "Original is the typed request, without the extension header");
     let _ = std::fs::remove_dir_all(&sdir);
+}
+
+/// A send that records a flow has to say WHICH flow, or the caller has to guess which
+/// History row was its own, and a guess in a report is worse than no answer.
+#[tokio::test]
+async fn a_recorded_send_hands_back_an_id_that_reads_back_the_same_exchange() {
+    let h = Arc::new(Harness::start("send-flowid").await);
+    let target = format!("http://{}", h.origin);
+    let raw = format!("GET /echo HTTP/1.1\r\nHost: {}\r\nX-Probe: flowid\r\nConnection: close\r\n\r\n", h.origin);
+
+    let res = crate::commands::send_recorded(&h.ctx, None, &target, &raw, true).await.unwrap();
+    let id = res.flow_id.expect("the send reports the flow it recorded");
+    assert!(res.flow_ts.is_some(), "and pins the citation in time, since ids are reseeded when History is emptied");
+
+    // Recording happens on a background thread, which is exactly why the tool's
+    // not-found message distinguishes "still being written" from "never existed".
+    h.wait_events(proxy::FLOW_EVENT, 1).await;
+    let flow = h.ctx.store.get(id).unwrap().expect("the id resolves to a stored flow");
+    assert!(crate::raw::request_text_full(&flow).contains("X-Probe: flowid"), "and it is this send's own exchange");
+    assert_eq!(flow.summary.status, res.status);
 }
 
 #[tokio::test]

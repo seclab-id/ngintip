@@ -24,6 +24,11 @@ pub const MAGIC: &[u8] = b"NGNTPC";
 /// length as [`MAGIC`]) if back-compat is ever wanted again.
 pub const LEGACY_MAGICS: &[&[u8]] = &[];
 
-/// Developer/author identifier embedded in generated CA certificates (subject OU),
-/// so a trusted root is traceable to its origin.
-pub const DEVELOPER: &str = "http://nikko.id";
+/// Organisation behind the app, embedded in generated CA certificates as the subject
+/// OU, so a trusted root is traceable to its origin. A bare domain, not a URL: a DN
+/// names an entity, it is not a link.
+///
+/// Keep the CA subject to the organisation. Whoever receives a `.cer` to install can
+/// read every attribute in it, on every device it is installed on, for the ten years
+/// the root is valid, so no personal name or contact address belongs here.
+pub const ORG_DOMAIN: &str = "seclab.id";

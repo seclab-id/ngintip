@@ -7,7 +7,6 @@ import { emptyHide } from './hidefilter.js';
 import { scanFlow, compileRules, ruleError, SEVERITY_ORDER, flowInScope, DEFAULT_PASSIVE_SCOPE } from './passive.js';
 import { inScope } from './scope.js';
 import { BUILTIN_RULES } from './passive-rules.js';
-import { isLoopback } from './net.js';
 import { toCurl } from './curl.js';
 import { generate, MAX_REQUESTS, defaultPayloadConfig, clearPositions } from './intruder.js';
 import { followRequest, redirectInfo } from './redirect.js';
@@ -80,6 +79,7 @@ if (typeof window !== 'undefined' && window.matchMedia) {
 }
 
 const REPEATER_SETTING = 'repeater';
+const INTRUDER_SETTING = 'intruder';
 const HISTORY_COLUMNS_SETTING = 'historyColumns';
 const HISTORY_SORT_SETTING = 'historySort';
 const HISTORY_HIDE_SETTING = 'historyHide';
@@ -87,7 +87,13 @@ const HISTORY_HIDE_SETTING = 'historyHide';
 const HISTORY_FILTER_SETTING = 'historyFilter';
 // Auto-save config (enabled + interval seconds), per project.
 const AUTOSAVE_SETTING = 'autoSave';
+// Prefix the backend puts on a save it refused because the document changed on disk
+// (commands.rs STALE_DOC). Saving anyway is a decision for the user, not a retry.
+const STALE_DOC = 'DOCUMENT_CHANGED';
+const saveError = (e) => String(e).replace(new RegExp(`^(Error: )?${STALE_DOC}: `), '');
 // Passive-scan config, per project: custom rules and which built-ins are off.
+// Matches commands::SCOPE_KEY, the key the backend emits on a setting event.
+const SCOPE_SETTING = 'scope';
 const PASSIVE_RULES_SETTING = 'passiveRules';
 const PASSIVE_DISABLED_SETTING = 'passiveDisabled';
 const PASSIVE_FINDINGS_SETTING = 'passiveFindings';
@@ -146,6 +152,21 @@ function makeTab(id, fields = {}) {
 /** A still-default, untouched Repeater tab: its request is the default, nothing was
  *  sent from it and it was not renamed/grouped/noted. Safe to fill in place when the
  *  first real request arrives, instead of leaving a blank tab beside it. */
+/** An Intruder tab still exactly as `makeIntruderTab` left it: nothing to lose by reusing it. */
+function isPristineIntruderTab(t) {
+  return (
+    !!t &&
+    t.raw === DEFAULT_INTRUDER_RAW &&
+    t.target === 'https://example.com' &&
+    t.name === String(t.id) &&
+    t.type === 'sniper' &&
+    !t.running &&
+    !t.collectionId &&
+    (t.results?.length ?? 0) === 0 &&
+    JSON.stringify(t.sets) === JSON.stringify([defaultPayloadConfig()])
+  );
+}
+
 function isPristineTab(t) {
   return (
     !!t &&
@@ -275,6 +296,31 @@ function repeaterSnapshot({ tabs, activeId, groupColors, collapsedGroups }) {
   return { activeId, groupColors: { ...groupColors }, collapsedGroups: [...(collapsedGroups ?? [])], tabs: tabs.map(({ id, name, group, target, raw, note }) => ({ id, name, group, target, raw, note: note || '' })) };
 }
 
+/**
+ * What an Intruder tab is worth keeping with the project: the attack SETUP, never a run.
+ *
+ * `results` holds up to KEEP_RESPONSES full response bodies per tab, which is exactly how
+ * a project file reaches hundreds of megabytes. A run can be repeated; the setup (the
+ * template with its positions, the payload sets, the attack type) is the part that took
+ * work. `running`/`sent`/`total`/`error`/`selected` describe one run, and `rawMode` is
+ * per session by design.
+ */
+function intruderSnapshot({ tabs, activeId }) {
+  return {
+    activeId,
+    tabs: tabs.map(({ id, name, target, raw, type, sets, concurrency, collectionId }) => ({
+      id,
+      name,
+      target,
+      raw,
+      type,
+      sets,
+      concurrency,
+      collectionId: collectionId ?? null,
+    })),
+  };
+}
+
 const DEFAULT_RAW = `GET / HTTP/1.1
 Host: example.com
 User-Agent: ${BRAND.userAgent}
@@ -306,6 +352,9 @@ function makeIntruderTab(id, fields = {}) {
     // The Organizer collection created from this attack ("Save to Organizer (new
     // collection)"), so renaming the tab renames that collection too.
     collectionId: null,
+    // Whether this tab's stored results have been fetched. Per session: a reopened
+    // project loads them the first time the tab is shown (see loadIntruderResults).
+    resultsLoaded: false,
     // Raw mode: skip extensions for this attack (also drops the per-request Python
     // round trip from a bulk run). Per tab and per session, never persisted.
     rawMode: false,
@@ -392,9 +441,31 @@ class Store {
     return { running: up.length > 0, host: primary?.host ?? '127.0.0.1', port: primary?.port ?? 8080 };
   }
 
-  /** Listening where other machines can reach the proxy (any exposed listener). */
+  /** The exposure worth warning about, or null. The backend classifies each bind
+   *  address (see `Exposure` in commands.rs); only two cases are surprising enough to
+   *  interrupt the user:
+   *
+   *  - `all`    - bound to every interface, including any that comes up later.
+   *  - `tunnel` - bound to a VPN address, so the far side of the tunnel can reach it.
+   *
+   *  A deliberate bind to one LAN address is not flagged: that is how you drive the
+   *  proxy from a phone, and a warning that fires on normal work gets ignored. */
+  get exposure() {
+    const running = this.listeners.filter((l) => l.running);
+    if (running.some((l) => l.exposure === 'all')) return 'all';
+    if (running.some((l) => l.exposure === 'tunnel')) return 'tunnel';
+    return null;
+  }
+
+  /** The listener that raised the current warning, for naming it in the tooltip. */
+  get exposedListener() {
+    const kind = this.exposure;
+    return kind ? (this.listeners.find((l) => l.running && l.exposure === kind) ?? null) : null;
+  }
+
+  /** Whether to show the exposure warning at all. */
   get exposed() {
-    return this.listeners.some((l) => l.running && !isLoopback(l.host));
+    return this.exposure !== null;
   }
 
   /** Total saved requests across all Organizer collections (for the sidebar badge). */
@@ -475,7 +546,14 @@ class Store {
     checking: false,
     checked: false,
     url: `https://github.com/${BRAND.repo}/releases`,
+    // Release title, shown in the startup prompt so the user sees what they are getting.
+    name: '',
+    // The startup prompt has had its turn this session (shown, or deliberately skipped).
+    prompted: false,
   });
+  // Startup "a newer version exists" dialog. Opened once per session at most, never
+  // over the project chooser, and never for a version the user chose to skip.
+  updatePrompt = $state(false);
 
   // Held messages (oldest first), keyed by `key`; a request and its response share `id`.
   // `draft` is the editable copy of the selected one.
@@ -484,10 +562,17 @@ class Store {
   // selected one's text payload.
   wsIntercept = $state({ enabled: false, queue: [], selectedKey: null, draft: '' });
 
+  // Bumped on every project change. Long-running work captures it and refuses to write
+  // its result if the project moved underneath: that is how a passive scan started in one
+  // engagement wrote its findings into another engagement's file.
+  #projectGen = 0;
+
   #pending = [];
   #wsListeners = new Set();
   #repeaterSaved = '';
   #repeaterTimer = null;
+  #intruderTimer = null;
+  #intruderSaved = '';
   // Debounced autosave of the History scope + advanced filter (per project).
   #historyFilterSaved = '';
   #historyFilterTimer = null;
@@ -506,9 +591,11 @@ class Store {
     (async () => {
       this.project = await api.projectInfo();
       await this.#loadRepeater();
+      await this.#loadIntruder();
       await this.#loadProjectSettings();
       window.addEventListener('beforeunload', () => {
         this.#flushRepeater();
+        this.#flushIntruder();
         this.#flushHistoryFilter();
         this.#flushNotes();
         this.#flushVault();
@@ -529,9 +616,20 @@ class Store {
       const unlistenDl = await listen('browser-download', (e) => this.#onBrowserDownload(e.payload));
       // Organizer edits made over MCP.
       const unlistenOrg = await listen('organizer', (e) => this.#onOrganizerChanged(e.payload));
+      const unlistenPassive = await listen('passive', (e) => this.#onPassiveChanged(e.payload));
+      const unlistenSetting = await listen('setting', (e) => this.#onSettingChanged(e.payload));
       this.logs = await api.getLogs().catch(() => []);
       unlisten = () =>
-        (unlistenFlow(), unlistenHeld(), unlistenWs(), unlistenWsHeld(), unlistenMenu(), unlistenLog(), unlistenDl(), unlistenOrg());
+        (unlistenFlow(),
+        unlistenHeld(),
+        unlistenWs(),
+        unlistenWsHeld(),
+        unlistenMenu(),
+        unlistenLog(),
+        unlistenDl(),
+        unlistenOrg(),
+        unlistenPassive(),
+        unlistenSetting());
 
       const held = await api.interceptStatus();
       this.intercept.enabled = held.enabled;
@@ -544,10 +642,10 @@ class Store {
         wsHeld.pending.forEach((item) => this.#onWsHeld(item));
       }
 
-      // Bring up the configured listeners (idempotent) and reflect their live state.
+      // Bring up the open project's listeners (idempotent) and reflect their live state.
       this.hostOverrides = Array.isArray(this.config.hostOverrides) ? this.config.hostOverrides : [];
       try {
-        this.listeners = await api.startListeners();
+        this.listeners = await api.syncListeners();
       } catch (e) {
         this.proxyError = String(e);
         this.listeners = await api.listListeners().catch(() => []);
@@ -556,6 +654,10 @@ class Store {
       // Passive-scan any not-yet-scanned flows in the background (trackable via
       // the progress bar + sidebar badge). Only new flows are processed.
       setTimeout(() => this.scanPassive(), 800);
+
+      // Ask GitHub whether a newer release exists. Not awaited: the answer only drives
+      // a dialog, and a slow or unreachable GitHub must not delay startup.
+      this.promptUpdateAtStartup();
     })();
     return () => unlisten?.();
   }
@@ -667,13 +769,25 @@ class Store {
   }
 
   async clear() {
+    const gen = this.#projectGen;
     await api.clearFlows();
+    // The backend refuses to empty a project that is no longer the open one; the window
+    // must not act as though it had.
+    if (gen !== this.#projectGen) return;
     this.flows = [];
     this.selectedId = null;
     this.selectedIds = new Set();
     this.bodyHits = null;
     this.#detailCache.clear();
     this.#detailInflight.clear();
+    this.sitemapNode = null;
+    // Every finding now points at a request that is gone. `deleteFlows` prunes for the
+    // ids it removed and said so in a comment; Clear removes ALL of them and did not,
+    // so clearing History left a project full of findings that error when clicked and
+    // were persisted again on the next passive action.
+    this.passiveFindings = [];
+    this.#passiveScanned.clear();
+    this.#savePassiveResults();
   }
 
   // New project: name it first (typed, or a random dated name) in the New project
@@ -741,13 +855,114 @@ class Store {
     this.chooser = false;
   }
 
+  /**
+   * Drop everything belonging to the project being left.
+   *
+   * These are exactly the fields with no settings key, which is why `#loadProjectSettings`
+   * structurally cannot reach them: session state that was never given a project lifetime.
+   * The membership test is whether a field carries engagement data or engagement
+   * configuration. Theme, split ratios, pane widths, the remembered project folder and the
+   * update skip marker all fail that test and are deliberately left alone.
+   *
+   * Mutated IN PLACE, never reassigned. `IntruderView.svelte:16`, `DecoderView.svelte:5`,
+   * `InterceptView.svelte:20` and `:35` each capture their object with a plain `const`, so
+   * a reassignment leaves a view that is still mounted rendering the previous project's
+   * object. That is not hypothetical: a switch started from the chooser unmounts the
+   * views and hides the problem, while File > New or File > Open from inside a live
+   * project does not. `#loadRepeater` carries the same note for the same reason.
+   */
+  async #resetSessionState() {
+    // Intruder is NOT reset here any more: it is persisted per project, so it belongs to
+    // the reload list (#loadIntruder), which sets it to defaults when a project has none.
+    // Resetting a persisted field to a default is its own data-loss bug the moment a
+    // debounced writer picks the default up.
+    this.comparer.items = [];
+    this.comparer.a = null;
+    this.comparer.b = null;
+    this.decoder.input = '';
+    this.decoder.output = '';
+    this.decoder.last = null;
+    this.decoder.recipe = [];
+    this.filter = '';
+    // `searching` has to go with `filter`: searchBodies only clears it when the query it
+    // started with still matches, and clearing the filter makes that guard fail forever.
+    this.searching = false;
+    this.pendingFinding = null;
+    this.extensions.log = '';
+    // release_project killed the browsers; this is the window's half of that teardown.
+    this.browser.opened = false;
+    // #syncListeners only ever sets this, so without clearing it here project A's bind
+    // failure is still on screen in project B.
+    this.proxyError = null;
+    // `intercept.filter` is deliberately untouched: it is a per-project setting and
+    // #loadInterceptFilter owns it. Resetting it here would race that loader, and the
+    // loser decides which traffic gets held.
+    this.intercept.enabled = false;
+    this.intercept.responses = false;
+    this.intercept.queue = [];
+    this.intercept.selectedKey = null;
+    this.intercept.draft = '';
+    this.wsIntercept.enabled = false;
+    this.wsIntercept.queue = [];
+    this.wsIntercept.selectedKey = null;
+    this.wsIntercept.draft = '';
+    // The backend already released the previous project's holds (release_project) and
+    // left intercept off. Read it back rather than assume, so the window still matches
+    // the proxy if anything was held between the release and the switch.
+    const held = await api.interceptStatus().catch(() => null);
+    if (held) {
+      this.intercept.enabled = held.enabled;
+      this.intercept.responses = held.responses;
+      held.pending.forEach((item) => this.#onHeld(item));
+    }
+    const wsHeld = await api.wsInterceptStatus().catch(() => null);
+    if (wsHeld) {
+      this.wsIntercept.enabled = wsHeld.enabled;
+      wsHeld.pending.forEach((item) => this.#onWsHeld(item));
+    }
+  }
+
+  /**
+   * Stop every timer that belongs to the project being left.
+   *
+   * A pending timer is a write scheduled against a project that is about to stop being
+   * the open one. `#autoSaveTimer` is the one that bites: `#loadAutoSave` re-arms it at
+   * the end of the switch, which makes it look handled, but between the flush and that
+   * reload the old timer can fire a save. `#searchTimer` is the quiet one, firing a body
+   * search 300 ms later with the previous project's query.
+   */
+  #stopProjectWork() {
+    // A running attack outlives a project switch: its loop holds the old tab object, so
+    // it keeps firing at the previous client's target and then writes its results into
+    // whichever project is open when it finishes. Stopping it is the fix; the generation
+    // check in startAttack is the backstop for a run that ends mid-switch.
+    for (const t of this.intruder.tabs) t.running = false;
+    for (const t of [this.#repeaterTimer, this.#intruderTimer, this.#historyFilterTimer, this.#notesTimer, this.#vaultTimer, this.#autoSaveTimer, this.#searchTimer]) {
+      clearTimeout(t);
+    }
+    this.#repeaterTimer = null;
+    this.#intruderTimer = null;
+    this.#historyFilterTimer = null;
+    this.#notesTimer = null;
+    this.#vaultTimer = null;
+    this.#autoSaveTimer = null;
+    this.#searchTimer = null;
+  }
+
   async blankProject() {
+    this.#stopProjectWork();
     await this.#flushRepeater();
+    await this.#flushIntruder();
     await this.#flushHistoryFilter();
     await this.#flushNotes();
     await this.#flushVault();
+    // Bumped before the call, because the backend swaps the store inside it: anything
+    // in flight must see the new generation from the moment the swap can happen.
+    this.#projectGen++;
     this.project = await api.blankProject();
+    await this.#resetSessionState();
     await this.#loadRepeater();
+    await this.#loadIntruder();
     await this.#loadProjectSettings();
     await this.#syncMcp();
     this.scope = await api.getScope();
@@ -762,12 +977,28 @@ class Store {
     this.flows = await api.listFlows();
     this.logs = await api.getLogs().catch(() => []);
     this.logsUnread = 0;
+    await this.#syncListeners();
     this.chooser = false;
   }
 
+  /** Swap the running listeners over to the project that was just opened or created.
+   *  Listeners are saved per project, so the previous one's must not linger. */
+  async #syncListeners() {
+    try {
+      this.listeners = await api.syncListeners();
+      this.config = await api.getConfig();
+    } catch (e) {
+      this.proxyError = String(e);
+      this.listeners = await api.listListeners().catch(() => this.listeners);
+    }
+  }
+
   async #switchProject(path) {
+    // Timers first, so nothing can re-dirty the state behind the flushes.
+    this.#stopProjectWork();
     // Finish writing this project's tabs before the file changes underneath.
     await this.#flushRepeater();
+    await this.#flushIntruder();
     await this.#flushHistoryFilter();
     await this.#flushNotes();
     await this.#flushVault();
@@ -776,9 +1007,12 @@ class Store {
     try {
       // Let the overlay paint before the (blocking) backend work runs.
       await new Promise((r) => setTimeout(r, 60));
+      this.#projectGen++;
       this.project = await api.openProject(path);
+      await this.#resetSessionState();
       this.#rememberProjectDir(path);
       await this.#loadRepeater();
+    await this.#loadIntruder();
       await this.#loadProjectSettings();
       await this.#syncMcp();
       this.scope = await api.getScope();
@@ -793,6 +1027,7 @@ class Store {
       this.flows = await api.listFlows();
       this.logs = await api.getLogs().catch(() => []);
       this.logsUnread = 0;
+      await this.#syncListeners();
       this.chooser = false;
     } catch (e) {
       this.#notify(String(e), true);
@@ -1047,6 +1282,13 @@ class Store {
     else this.browser = { ...this.browser, downloadPct: p.pct ?? this.browser.downloadPct };
   }
 
+  /** Open Settings straight on the proxy listener section (the topbar LAN warning
+   *  points here, since that is where the exposure and auth are configured). */
+  openListenerSettings() {
+    this.settingsSection = 'listener';
+    this.view = 'settings';
+  }
+
   /** Launch the pentest browser (from the History toolbar). Ensures the proxy is
    *  running; if no browser is configured, sends the user to set one up. */
   async openPentestBrowser(url, profile) {
@@ -1110,10 +1352,15 @@ class Store {
       this.#notify('No out-of-scope requests to delete');
       return 0;
     }
-    await this.deleteFlows(ids);
+    const done = await this.deleteFlows(ids);
+    // Report what happened, not what was asked for. And do NOT reseed the id counter
+    // when the delete was aborted: by then it would reseed the project that is open now,
+    // down to its own MAX(id), and flows already in flight above that would be
+    // overwritten by later ones through INSERT OR REPLACE.
+    if (!done) return 0;
     if (resetIds) await api.resetFlowIds().catch(() => {});
-    this.#notify(`Deleted ${ids.length} out-of-scope request${ids.length === 1 ? '' : 's'}${resetIds ? ' and reset flow ids' : ''}`);
-    return ids.length;
+    this.#notify(`Deleted ${done} out-of-scope request${done === 1 ? '' : 's'}${resetIds ? ' and reset flow ids' : ''}`);
+    return done;
   }
 
   /** Delete History flows after a Yes/No warning. Every UI path that removes flows (the
@@ -1148,8 +1395,32 @@ class Store {
 
   async deleteFlows(ids) {
     if (!ids.length) return;
-    await api.deleteFlows(ids);
-    const gone = new Set(ids);
+    // The project this delete belongs to. A short delete means the project CHANGED, so
+    // applying these ids to the list afterwards would remove rows from the new project's
+    // History that were never deleted; id ranges between projects overlap almost exactly.
+    const gen = this.#projectGen;
+    let gone;
+    try {
+      const done = await api.deleteFlows(ids);
+      if (gen !== this.#projectGen) {
+        this.#notify('Delete stopped: another project was opened', true);
+        return 0;
+      }
+      // The backend stops at a project switch and reports how far it got. Applying the
+      // whole list regardless would leave History claiming rows are gone that are still
+      // in the project file.
+      const n = Number.isInteger(done) ? done : ids.length;
+      gone = new Set(ids.slice(0, n));
+      if (n < ids.length) {
+        this.#notify(`Deleted ${n} of ${ids.length}; the project changed before the rest were removed`, true);
+      }
+    } catch (e) {
+      // A failure partway leaves an unknown number deleted, so re-read rather than guess
+      // which rows survived. Guessing is how History starts disagreeing with the file.
+      this.#notify(`Delete failed: ${e}`, true);
+      this.flows = await api.listFlows().catch(() => this.flows);
+      return 0;
+    }
     // Move selection to the next remaining row so keyboard deletion can continue.
     const i = this.flows.findIndex((f) => f.id === this.selectedId);
     this.flows = this.flows.filter((f) => !gone.has(f.id));
@@ -1160,9 +1431,10 @@ class Store {
     if (this.passiveFindings.some((f) => gone.has(f.flowId))) {
       this.passiveFindings = this.passiveFindings.filter((f) => !gone.has(f.flowId));
     }
-    for (const id of ids) this.#passiveScanned.delete(id);
-    this.#invalidateDetails(ids);
+    for (const id of gone) this.#passiveScanned.delete(id);
+    this.#invalidateDetails([...gone]);
     this.#savePassiveResults();
+    return gone.size;
   }
 
   /** IDs an action should apply to: the multi-selection, else the single selected row. */
@@ -1319,7 +1591,24 @@ class Store {
   async saveProject() {
     // No document yet: prompt for a path (don't mask real save errors as "no doc").
     if (!this.project.path) return await this.saveProjectAs();
-    return await this.#runSave(() => api.saveProject());
+    try {
+      return await this.#runSave(() => api.saveProject(), { rethrow: true });
+    } catch (e) {
+      if (!String(e).includes(STALE_DOC)) {
+        this.#notify(String(e), true);
+        return false;
+      }
+      // The file is not the one this window opened or last wrote. Overwriting is a
+      // real choice (it discards whatever is there now), so it is the user's to make.
+      const ok = await this.confirm({
+        title: 'This project file changed on disk',
+        message: `${saveError(e)}\n\nOverwrite it with this window's project, or cancel and use "Save project as" to keep both.`,
+        yes: 'Overwrite',
+        no: 'Cancel',
+      });
+      if (!ok) return false;
+      return await this.#runSave(() => api.saveProject(true));
+    }
   }
 
   // Choose a path and save (compress) the project to it as a .ngintip document.
@@ -1337,11 +1626,12 @@ class Store {
   // Shared save path: show the saving overlay, flush pending work, then save. The
   // backend does the snapshot + compression off the main thread, so the UI (and
   // this overlay's animation) stays responsive instead of freezing.
-  async #runSave(fn) {
+  async #runSave(fn, { rethrow = false } = {}) {
     this.saving = true;
     try {
       // The overlay paints while the (non-blocking, off-thread) save runs.
       await this.#flushRepeater();
+      await this.#flushIntruder();
       await this.#flushHistoryFilter();
       await this.#flushNotes();
       await this.#flushVault();
@@ -1351,6 +1641,9 @@ class Store {
       this.#notify(`Saved ${r.name} - ${r.summary}`);
       return true;
     } catch (e) {
+      // `rethrow` lets the caller handle a refusal itself (see saveProject), with the
+      // saving overlay already down, so a confirmation is not shown behind it.
+      if (rethrow) throw e;
       this.#notify(String(e), true);
       return false;
     } finally {
@@ -1368,6 +1661,7 @@ class Store {
     clearTimeout(this.#autoSaveTimer);
     this.#autoSaveTimer = null;
     await this.#flushRepeater();
+    await this.#flushIntruder();
     await this.#flushHistoryFilter();
     await this.#flushNotes();
     await this.#flushVault();
@@ -1518,6 +1812,45 @@ class Store {
     this.passive = { scanning: false, done: 0, total: 0 };
   }
 
+  /**
+   * An MCP `passive_scan` replaced the stored findings.
+   *
+   * Reloaded wholesale rather than merged, because that is what the write was:
+   * `passive_scan` rebuilds the array from every captured flow and replaces it, so there
+   * is no "both sides have part of the truth" to reconcile. Without this the agent's
+   * findings were never shown and the operator's next passive action wrote the window's
+   * stale copy back over them.
+   */
+  async #onPassiveChanged(payload) {
+    const findings = await api.getSetting(PASSIVE_FINDINGS_SETTING).catch(() => null);
+    const scanned = await api.getSetting(PASSIVE_SCANNED_SETTING).catch(() => null);
+    if (!Array.isArray(findings)) return;
+    this.passiveFindings = findings;
+    this.#passiveScanned = new Set(Array.isArray(scanned) ? scanned : []);
+    const n = Number.isInteger(payload?.findings) ? payload.findings : findings.length;
+    this.#notify(`Passive scan over MCP: ${n} finding${n === 1 ? '' : 's'}`);
+  }
+
+  /**
+   * An MCP tool replaced a per-project setting this window also caches.
+   *
+   * The window is a write-through cache for these: it holds a copy and writes the whole
+   * value back on any edit. So without reloading, the agent's change is both invisible
+   * and erased by the operator's next click. `scope` is the one that matters most,
+   * because `deleteOutOfScope` decides which flows to DELETE from this cached copy.
+   */
+  async #onSettingChanged(payload) {
+    const key = payload?.key;
+    if (key === SCOPE_SETTING) {
+      this.scope = await api.getScope().catch(() => this.scope);
+      this.#notify(`Target scope changed over MCP: ${this.scope.length || 'everything'} in scope`);
+    } else if (key === PASSIVE_RULES_SETTING) {
+      const rules = await api.getSetting(PASSIVE_RULES_SETTING).catch(() => null);
+      if (Array.isArray(rules)) this.passiveRules = rules;
+      this.#notify('Passive rules changed over MCP');
+    }
+  }
+
   #savePassiveRules() {
     api.setSetting(PASSIVE_RULES_SETTING, this.passiveRules).catch((e) => this.#notify(`Failed to save rules: ${e}`, true));
   }
@@ -1642,8 +1975,15 @@ class Store {
       return;
     }
     this.passive = { scanning: true, done: 0, total: todo.length };
+    // Which project this scan belongs to. A scan over thousands of flows outlives a
+    // project switch easily, and its accumulator holds the findings of the project it
+    // started in.
+    const gen = this.#projectGen;
     const compiled = compileRules(this.effectiveRules());
-    const acc = [...this.passiveFindings];
+    // What THIS scan found, kept apart from the stored set. The old code snapshotted the
+    // stored array at the start and assigned the snapshot back at the end, which erased
+    // anything written in between: an MCP `passive_scan`, or a finding deleted in the UI.
+    const found = [];
     let done = 0;
     let cursor = 0;
     // Fetch bodies concurrently: getFlow is one IPC round-trip each, so doing them
@@ -1651,12 +1991,13 @@ class Store {
     // flooding it. The regex work between awaits is synchronous, so the shared
     // accumulator needs no locking.
     const scanOne = async (f) => {
+      if (gen !== this.#projectGen) return; // project changed: stop, and mark nothing
       this.#passiveScanned.add(f.id);
       try {
         const d = await api.getFlow(f.id);
         if (!d) return;
         for (const item of scanFlow({ requestRaw: d.requestRaw, responseRaw: d.responseRaw, compiled })) {
-          acc.push({
+          found.push({
             ...item,
             flowId: f.id,
             method: f.method,
@@ -1670,8 +2011,8 @@ class Store {
         // skip flows that fail to load
       }
       done++;
-      if (done % 16 === 0) {
-        this.passiveFindings = acc.slice();
+      if (done % 16 === 0 && gen === this.#projectGen) {
+        this.#mergeFindings(found);
         this.passive = { scanning: true, done, total: todo.length };
       }
     };
@@ -1679,10 +2020,30 @@ class Store {
       while (cursor < todo.length) await scanOne(todo[cursor++]);
     };
     await Promise.all(Array.from({ length: Math.min(12, todo.length) }, worker));
-    acc.sort((a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity] || a.flowId - b.flowId);
-    this.passiveFindings = acc;
+    // Discard rather than save: these findings describe the project that was open when
+    // the scan started, and #loadPassiveConfig has already loaded the new one's.
+    if (gen !== this.#projectGen) return;
+    this.#mergeFindings(found);
+    this.passiveFindings = this.passiveFindings
+      .slice()
+      .sort((a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity] || a.flowId - b.flowId);
     this.passive = { scanning: false, done, total: todo.length };
     this.#savePassiveResults();
+  }
+
+  /**
+   * Fold this scan's findings into the stored set, keyed by `key`.
+   *
+   * Merging rather than replacing, because two writers own this array: the window and an
+   * MCP `passive_scan`. Replacing it with a snapshot taken before the scan started is how
+   * an agent's findings were silently erased. `key` is `flowId|type|where|match`, so
+   * re-finding the same thing is idempotent.
+   */
+  #mergeFindings(found) {
+    if (!found.length) return;
+    const byKey = new Map(this.passiveFindings.map((f) => [f.key, f]));
+    for (const f of found) byKey.set(f.key, f);
+    this.passiveFindings = [...byKey.values()];
   }
 
   // A finding whose match History should highlight once the flow's detail loads.
@@ -1819,6 +2180,9 @@ class Store {
     const u = this.update;
     if (u.checking || (u.checked && !force)) return;
     u.checking = true;
+    // A check the user asked for must say something either way. The automatic one stays
+    // quiet: being offline at launch is normal and does not deserve a toast.
+    let told = !force;
     try {
       const res = await fetch(`https://api.github.com/repos/${BRAND.repo}/releases/latest`, {
         headers: { Accept: 'application/vnd.github+json' },
@@ -1829,15 +2193,92 @@ class Store {
         if (latest) {
           u.latest = latest;
           u.newer = compareVersions(latest, u.current) > 0;
+          u.name = String(data.name || '').trim();
           if (data.html_url) u.url = data.html_url;
+          // Leave a trace in the Logs view either way, so "was I told about an update?"
+          // is answerable after the dialog is gone. Failures stay silent below: being
+          // offline is normal and does not deserve a log line every launch.
+          api
+            .appLog(
+              u.newer ? 'info' : 'debug',
+              'update',
+              u.newer
+                ? `update available: v${latest} (running v${u.current})`
+                : `up to date (v${u.current})`,
+            )
+            .catch(() => {});
         }
+      }
+      if (force) {
+        this.#notify(
+          !res.ok
+            ? `Could not reach GitHub (HTTP ${res.status})`
+            : u.newer
+              ? `Update available: v${u.latest}`
+              : `You are on the latest release (v${u.current})`,
+          !res.ok,
+        );
+        told = true;
       }
     } catch {
       // offline, blocked, or no releases yet: keep showing the current version only
     } finally {
       u.checking = false;
       u.checked = true;
+      if (!told) this.#notify('Could not reach GitHub to check for updates', true);
     }
+  }
+
+  /** localStorage key holding the one version the user pressed "Skip" on. */
+  get #skippedVersionKey() {
+    return brandKey('update.skipped');
+  }
+
+  /** Open the startup update dialog, unless there is nothing to say, it has already had
+   *  its turn this session, or the user skipped this version (or an even newer one). */
+  #maybePromptUpdate() {
+    const u = this.update;
+    if (!u.newer || !u.latest || u.prompted) return;
+    let skipped = null;
+    try {
+      skipped = localStorage.getItem(this.#skippedVersionKey);
+    } catch {
+      // private mode / blocked storage: treat it as "nothing skipped" and still prompt
+    }
+    if (skipped && compareVersions(u.latest, skipped) <= 0) return;
+    u.prompted = true;
+    this.updatePrompt = true;
+  }
+
+  /** Run the update check and, when a newer release exists, prompt for it. Called at
+   *  startup; deliberately not awaited, so a slow GitHub never holds up the app. */
+  async promptUpdateAtStartup() {
+    await this.checkUpdate();
+    this.#maybePromptUpdate();
+  }
+
+  /** "Download": open the release page, then close the dialog. */
+  downloadUpdate() {
+    this.openReleases();
+    this.updatePrompt = false;
+  }
+
+  /** "Remind me later": gone for this session, back on the next launch. */
+  dismissUpdate() {
+    this.updatePrompt = false;
+  }
+
+  /** "Skip this version": stay quiet until something newer than this is published. */
+  skipUpdate() {
+    const v = this.update.latest;
+    this.updatePrompt = false;
+    if (!v) return;
+    try {
+      localStorage.setItem(this.#skippedVersionKey, v);
+    } catch {
+      // can't persist: the prompt simply comes back next launch
+    }
+    api.appLog('info', 'update', `skipped v${v}; no reminder until a newer release`).catch(() => {});
   }
 
   /** Open the releases page (the newer release when there is one) in the browser. */
@@ -1892,6 +2333,17 @@ class Store {
   // ---- Intruder ----
   addIntruderTab(fields = {}) {
     const it = this.intruder;
+    // Same rule as Repeater (see addRepeaterTab): seeding the first real attack fills the
+    // untouched default tab in place instead of opening a second tab beside an empty one.
+    // The "+" button passes no raw, so a deliberately blank tab is never consumed.
+    if (fields.raw != null && it.tabs.length === 1 && isPristineIntruderTab(it.tabs[0])) {
+      const t = it.tabs[0];
+      api.clearIntruderResults(t.id).catch(() => {}); // the id is reused; drop stale results
+      Object.assign(t, makeIntruderTab(t.id, fields));
+      it.activeId = t.id;
+      this.view = 'intruder';
+      return;
+    }
     const id = Math.max(0, ...it.tabs.map((t) => t.id)) + 1;
     it.tabs.push(makeIntruderTab(id, fields));
     it.activeId = id;
@@ -1903,6 +2355,7 @@ class Store {
     const i = it.tabs.findIndex((t) => t.id === id);
     if (i === -1) return;
     it.tabs[i].running = false;
+    api.clearIntruderResults(id).catch(() => {});
     it.tabs.splice(i, 1);
     if (!it.tabs.length) it.tabs.push(makeIntruderTab(1));
     if (it.activeId === id) it.activeId = (it.tabs[i] ?? it.tabs[i - 1]).id;
@@ -2405,6 +2858,8 @@ class Store {
 
   async startAttack(tab) {
     if (tab.running) return;
+    // `gen` below is the generated request list; this is the project generation.
+    const projectGen = this.#projectGen;
     const gen = generate(tab.raw, tab.type, tab.sets);
     if (gen.error) {
       tab.error = gen.error;
@@ -2474,6 +2929,58 @@ class Store {
     await Promise.all(Array.from({ length: pool }, worker));
     flush();
     tab.running = false;
+    tab.resultsLoaded = true;
+    // Discard rather than save when the project moved: these results belong to the
+    // engagement this attack was started in, and that project's file is no longer open.
+    if (projectGen !== this.#projectGen) {
+      this.#notify('Attack stopped: another project was opened; its results were not saved', true);
+      return;
+    }
+    // Keep the run with the project, request and response included. Written once at the
+    // end rather than per row: a 5,000-request attack would otherwise mean 5,000 writes
+    // competing with capture for the same connection.
+    await api.intruderSaveResults(tab.id, tab.results).catch((e) => this.#notify(`Failed to save attack results: ${e}`, true));
+  }
+
+  /** Results of this tab's last attack, loaded the first time the tab is shown. */
+  async loadIntruderResults(tab) {
+    if (tab.resultsLoaded || tab.running) return;
+    tab.resultsLoaded = true;
+    // `?? []` as well as the catch: a backend that answers with null is not a rejection.
+    const rows = (await api.intruderResults(tab.id).catch(() => null)) ?? [];
+    // Only adopt them if the tab has nothing of its own: a run started while this was
+    // in flight is the newer truth.
+    if (!tab.running && !tab.results.length && rows.length) {
+      tab.results = rows;
+      tab.total = rows.length;
+      tab.sent = rows.length;
+    }
+  }
+
+  /**
+   * Fill in one stored row's request and response, which the list deliberately omits.
+   *
+   * A run can be thousands of rows and the table only shows number, status, length, time
+   * and payload, so the bodies are fetched when a row is actually opened. Rows from the
+   * run still in memory already carry theirs and are left alone.
+   */
+  async loadIntruderResult(tab, n) {
+    const row = tab.results.find((r) => r.n === n);
+    // A row read back from the project carries EMPTY STRINGS where the bodies go, because
+    // the list read omits them deliberately. So "already has its bodies" means a
+    // non-empty string, not merely a non-null one: `'' != null` is true, and testing for
+    // null alone meant a stored row was never fetched and always showed the
+    // "not kept for this row" placeholder.
+    if (!row || row.bodyLoaded || row.requestRaw || row.responseRaw) return;
+    const full = await api.intruderResult(tab.id, n).catch(() => null);
+    if (!full) return;
+    Object.assign(row, {
+      requestRaw: full.requestRaw || null,
+      responseRaw: full.responseRaw || null,
+      requestFinal: full.requestFinal || null,
+      responseOriginal: full.responseOriginal || null,
+      bodyLoaded: true,
+    });
   }
 
 
@@ -2677,6 +3184,36 @@ class Store {
     }
   }
 
+  saveIntruder() {
+    const json = JSON.stringify(intruderSnapshot(this.intruder));
+    if (json === this.#intruderSaved) return;
+    clearTimeout(this.#intruderTimer);
+    this.#intruderTimer = setTimeout(() => this.#flushIntruder(), 400);
+  }
+
+  async #flushIntruder() {
+    clearTimeout(this.#intruderTimer);
+    this.#intruderTimer = null;
+    const snapshot = intruderSnapshot(this.intruder);
+    const json = JSON.stringify(snapshot);
+    if (json === this.#intruderSaved) return;
+    try {
+      await api.setSetting(INTRUDER_SETTING, snapshot);
+      this.#intruderSaved = json;
+    } catch (e) {
+      this.#notify(`Failed to save Intruder tabs: ${e}`, true);
+    }
+  }
+
+  async #loadIntruder() {
+    const saved = await api.getSetting(INTRUDER_SETTING).catch(() => null);
+    const tabs = saved?.tabs?.length ? saved.tabs.map((t) => makeIntruderTab(t.id, t)) : [makeIntruderTab(1)];
+    // Mutate in place: IntruderView holds a reference to this object.
+    this.intruder.tabs = tabs;
+    this.intruder.activeId = tabs.some((t) => t.id === saved?.activeId) ? saved.activeId : tabs[0].id;
+    this.#intruderSaved = JSON.stringify(intruderSnapshot(this.intruder));
+  }
+
   async #loadRepeater() {
     let saved = await api.getSetting(REPEATER_SETTING).catch(() => null);
     const legacy = !saved?.tabs?.length && takeLegacyRepeater();
@@ -2796,7 +3333,19 @@ class Store {
       return;
     }
     // #runSave re-arms the timer in its finally, so the next auto-save is interval-after.
-    await this.#runSave(() => api.saveProject());
+    // Auto-save never prompts and never forces: a modal nobody asked for, possibly while
+    // the operator is away from the machine, is worse than skipping one save, and
+    // overwriting a file someone else wrote is exactly what this guard exists to stop.
+    try {
+      await this.#runSave(() => api.saveProject(), { rethrow: true });
+    } catch (e) {
+      this.#notify(
+        String(e).includes(STALE_DOC)
+          ? `Auto-save skipped: ${saveError(e)} Use Save to review it.`
+          : String(e),
+        true,
+      );
+    }
   }
 
   // ---- History scope + advanced filter (persisted per project) ----

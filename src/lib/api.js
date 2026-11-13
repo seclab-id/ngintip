@@ -4,6 +4,8 @@ import { invoke } from '@tauri-apps/api/core';
 // Proxy listeners: several can run at once. Each status is { id, host, port, enabled, running }.
 export const listListeners = () => invoke('list_listeners');
 export const startListeners = () => invoke('start_listeners');
+// Make the running listeners match the open project's saved set (listeners are per project).
+export const syncListeners = () => invoke('sync_listeners');
 export const stopListeners = () => invoke('stop_listeners');
 export const addListener = (host, port) => invoke('add_listener', { host, port });
 export const removeListener = (id) => invoke('remove_listener', { id });
@@ -19,6 +21,8 @@ export const listFlows = () => invoke('list_flows');
 export const getLogs = () => invoke('logs');
 export const clearLogs = () => invoke('clear_logs');
 export const deleteLogs = (ids) => invoke('delete_logs', { ids });
+// Record a UI-side event in the same Logs view as the proxy's own lines.
+export const appLog = (level, source, message) => invoke('app_log', { level, source, message });
 export const getFlow = (id) => invoke('get_flow', { id });
 export const flowImage = (id) => invoke('flow_image', { id });
 export const flowHex = (id, side) => invoke('flow_hex', { id, side });
@@ -46,8 +50,17 @@ export const exportHar = (path) => invoke('export_har', { path });
 export const exportBurp = (path) => invoke('export_burp', { path });
 export const saveBinary = (path, data) => invoke('save_binary', { path, data });
 export const copyImage = (width, height, data) => invoke('copy_image', { width, height, data });
+// Intruder results, kept with the project. The list omits request/response text; one
+// row is fetched in full when it is opened (same split as repeater history).
+export const intruderSaveResults = (tab, rows) => invoke('intruder_save_results', { tab, rows });
+export const intruderResults = (tab) => invoke('intruder_results', { tab });
+export const intruderResult = (tab, n) => invoke('intruder_result', { tab, n });
+export const clearIntruderResults = (tab) => invoke('clear_intruder_results', { tab });
+
 export const saveProjectAs = (path) => invoke('save_project_as', { path });
-export const saveProject = () => invoke('save_project');
+// `force` overwrites a document that changed on disk since this window last wrote or
+// opened it; without it the backend refuses (see STALE_DOC in store.svelte.js).
+export const saveProject = (force = false) => invoke('save_project', { force });
 export const defaultProjectDir = () => invoke('default_project_dir');
 export const pathExists = (path) => invoke('path_exists', { path });
 export const interceptStatus = () => invoke('intercept_status');

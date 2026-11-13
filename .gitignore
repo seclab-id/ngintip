@@ -52,3 +52,8 @@ request.txt
 
 # Local vulnerable lab target (run manually, not shipped)
 test-target/
+
+# Working documents: release plans, drafts and notes stay local. README is the one
+# exception, since it is the repository's public front page.
+*.md
+!README.md

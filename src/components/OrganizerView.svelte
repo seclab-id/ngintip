@@ -13,8 +13,32 @@
   import { splitMessage } from '../lib/message.js';
   import { toCurl } from '../lib/curl.js';
   import { loadColumnWidths, saveColumnWidths, columnTemplate, clampCol } from '../lib/colwidth.js';
+  import MarkdownView from './MarkdownView.svelte';
+  import { brandKey } from '../lib/brand.js';
 
-  let tab = $state('collections');
+  // Which half of the Organizer is showing. The view is unmounted when you switch to
+  // History and back, so this has to be remembered somewhere outside the component or
+  // every trip back would land on Collections regardless of where you were. Kept per
+  // viewer, like the column widths and the note Write/Preview choice.
+  const TAB_KEY = brandKey('organizer.tab');
+  const TABS = ['collections', 'notes'];
+  let tab = $state(loadTab());
+  function loadTab() {
+    try {
+      const saved = localStorage.getItem(TAB_KEY);
+      return TABS.includes(saved) ? saved : 'collections';
+    } catch {
+      return 'collections';
+    }
+  }
+  function setTab(next) {
+    tab = next;
+    try {
+      localStorage.setItem(TAB_KEY, next);
+    } catch {
+      /* storage unavailable: the choice just lasts while the view is mounted */
+    }
+  }
   let menu = $state(null);
 
   const org = $derived(store.organizer);
@@ -209,6 +233,7 @@
   let noteDraft = $state('');
   function openNote(it) {
     noteDraft = it.note ?? '';
+    noteModalPreview = false;
     noteModal = { itemId: it.id, heading: `${it.method} ${it.host}${it.path ?? ''}` };
   }
   function saveNote() {
@@ -366,6 +391,28 @@
   // ---- Notes ----
   let noteQuery = $state('');
   let noteId = $state(null);
+  // Notes render markdown in Preview; Write stays a plain textarea so the caret, undo
+  // stack and selection behave normally. Remembered so the choice survives a view
+  // switch, per viewer only (nothing to sync, nothing to save with the project).
+  let notePreviewOn = $state(loadNoteMode());
+  function loadNoteMode() {
+    try {
+      return localStorage.getItem(brandKey('organizer.notePreview')) === '1';
+    } catch {
+      return false;
+    }
+  }
+  function setNoteMode(on) {
+    notePreviewOn = on;
+    try {
+      localStorage.setItem(brandKey('organizer.notePreview'), on ? '1' : '0');
+    } catch {
+      /* storage unavailable: the choice just lasts this session */
+    }
+  }
+  // The per-request note modal gets the same switch, but always opens on Write: it is
+  // reached by "Add note" far more often than to read one back.
+  let noteModalPreview = $state(false);
   let titleEl = $state();
   const shownNotes = $derived(notesView(org.notes, noteQuery));
   const curNote = $derived(org.notes.find((n) => n.id === noteId) ?? null);
@@ -415,11 +462,11 @@
   <header class="head">
     <h1>Organizer</h1>
     <div class="tabs" role="tablist">
-      <button class="tab" class:active={tab === 'collections'} role="tab" aria-selected={tab === 'collections'} onclick={() => (tab = 'collections')}>
+      <button class="tab" class:active={tab === 'collections'} role="tab" aria-selected={tab === 'collections'} onclick={() => setTab('collections')}>
         Collections
         {#if store.organizerCount}<span class="pill">{store.organizerCount}</span>{/if}
       </button>
-      <button class="tab" class:active={tab === 'notes'} role="tab" aria-selected={tab === 'notes'} onclick={() => (tab = 'notes')}>
+      <button class="tab" class:active={tab === 'notes'} role="tab" aria-selected={tab === 'notes'} onclick={() => setTab('notes')}>
         Notes
         {#if org.notes.length}<span class="pill">{org.notes.length}</span>{/if}
       </button>
@@ -595,7 +642,7 @@
                     {#snippet reqPane()}
                       <!-- svelte-ignore a11y_no_static_element_interactions -->
                       <div class="ctxwrap" oncontextmenu={openReqMenu}>
-                        <MessageView bind:this={reqRef} title={runRow ? `Request #${runRow.n}` : 'Request'} raw={shownReq} variants={reqVariants}
+                        <MessageView bind:this={reqRef} title={runRow ? `Request #${runRow.n}` : 'Request'} raw={shownReq} variants={reqVariants} side="req"
                           placeholder={runRow?.trimmed ? 'Request not kept for this row (size cap)' : 'No request saved'} preferPretty
                           ondecode={(t) => (miniDecode = { text: t })} onsend={(t) => store.sendStringToDecoder(t)} />
                       </div>
@@ -603,7 +650,7 @@
                     {#snippet resPane()}
                       <!-- svelte-ignore a11y_no_static_element_interactions -->
                       <div class="ctxwrap" oncontextmenu={openResMenu}>
-                        <MessageView bind:this={resRef} title={runRow ? `Response #${runRow.n}` : 'Response'} raw={runRow?.error ? '' : shownRes} variants={resVariants}
+                        <MessageView bind:this={resRef} title={runRow ? `Response #${runRow.n}` : 'Response'} raw={runRow?.error ? '' : shownRes} variants={resVariants} side="res"
                           placeholder={runRow?.error ? runRow.error : runRow?.trimmed ? 'Response not kept for this row (size cap)' : 'No response saved'} preferPretty
                           ondecode={(t) => (miniDecode = { text: t })} onsend={(t) => store.sendStringToDecoder(t)} />
                       </div>
@@ -656,6 +703,10 @@
           <div class="ne-bar">
             <span class="dim">Edited {fmtDateTime(curNote.updatedAt)}</span>
             <span class="grow"></span>
+            <div class="ne-mode" role="tablist" aria-label="Note mode">
+              <button class="nm" class:active={!notePreviewOn} role="tab" aria-selected={!notePreviewOn} onclick={() => setNoteMode(false)}>Write</button>
+              <button class="nm" class:active={notePreviewOn} role="tab" aria-selected={notePreviewOn} onclick={() => setNoteMode(true)}>Preview</button>
+            </div>
             <span class="dim">{words} word{words === 1 ? '' : 's'} · {curNote.body.length} chars</span>
             <button class="icbtn" title="Duplicate note" aria-label="Duplicate note" onclick={() => (noteId = store.duplicateNote(curNote.id))}>
               <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
@@ -673,14 +724,24 @@
             aria-label="Note title"
             oninput={(e) => store.updateNote(curNote.id, { title: e.currentTarget.value })}
           />
-          <textarea
-            class="ne-body"
-            placeholder="Start writing: findings, payloads, credentials to try, to-dos…"
-            value={curNote.body}
-            spellcheck="false"
-            aria-label="Note body"
-            oninput={(e) => store.updateNote(curNote.id, { body: e.currentTarget.value })}
-          ></textarea>
+          {#if notePreviewOn}
+            <div class="ne-prev">
+              {#if curNote.body.trim()}
+                <MarkdownView source={curNote.body} />
+              {:else}
+                <p class="dim ne-prev-empty">Nothing to preview yet.</p>
+              {/if}
+            </div>
+          {:else}
+            <textarea
+              class="ne-body"
+              placeholder="Start writing: findings, payloads, credentials to try, to-dos… Markdown works."
+              value={curNote.body}
+              spellcheck="false"
+              aria-label="Note body"
+              oninput={(e) => store.updateNote(curNote.id, { body: e.currentTarget.value })}
+            ></textarea>
+          {/if}
         {:else}
           <div class="ne-empty">
             <div class="ne-empty-icon">{@render noteIcon()}</div>
@@ -707,15 +768,31 @@
 {#if noteModal}
   <Modal title="Note" draggable onclose={() => (noteModal = null)}>
     <div class="note-modal">
-      <div class="nm-for mono" title={noteModal.heading}>{noteModal.heading}</div>
-      <textarea
-        class="input mono note-area"
-        bind:value={noteDraft}
-        placeholder="Findings, payloads, reminders…"
-        spellcheck="false"
-        use:autofocus
-        onkeydown={(e) => (e.metaKey || e.ctrlKey) && e.key === 'Enter' && saveNote()}
-      ></textarea>
+      <div class="nm-head">
+        <div class="nm-for mono" title={noteModal.heading}>{noteModal.heading}</div>
+        <div class="ne-mode" role="tablist" aria-label="Note mode">
+          <button class="nm" class:active={!noteModalPreview} role="tab" aria-selected={!noteModalPreview} onclick={() => (noteModalPreview = false)}>Write</button>
+          <button class="nm" class:active={noteModalPreview} role="tab" aria-selected={noteModalPreview} onclick={() => (noteModalPreview = true)}>Preview</button>
+        </div>
+      </div>
+      {#if noteModalPreview}
+        <div class="note-area nm-prev">
+          {#if noteDraft.trim()}
+            <MarkdownView source={noteDraft} />
+          {:else}
+            <p class="dim ne-prev-empty">Nothing to preview yet.</p>
+          {/if}
+        </div>
+      {:else}
+        <textarea
+          class="input mono note-area"
+          bind:value={noteDraft}
+          placeholder="Findings, payloads, reminders… Markdown works."
+          spellcheck="false"
+          use:autofocus
+          onkeydown={(e) => (e.metaKey || e.ctrlKey) && e.key === 'Enter' && saveNote()}
+        ></textarea>
+      {/if}
       <div class="modal-actions">
         <span class="dim">{noteDraft.length} chars · ⌘↵ to save</span>
         <span class="grow"></span>
@@ -1446,6 +1523,64 @@
     color: var(--text);
     font: 13.5px/1.65 var(--sans);
     resize: none;
+  }
+  /* Write / Preview switch, shared by the Notes tab and the per-request note modal. */
+  .ne-mode {
+    display: inline-flex;
+    padding: 2px;
+    border-radius: 6px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+  }
+  .ne-mode .nm {
+    padding: 2px 9px;
+    border: 0;
+    border-radius: 4px;
+    background: none;
+    color: var(--text-dim);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .ne-mode .nm:hover {
+    color: var(--text);
+  }
+  .ne-mode .nm.active {
+    background: var(--bg-elev);
+    color: var(--text);
+    font-weight: 600;
+  }
+  /* Preview shares the editor's left gutter so toggling does not shift the text. */
+  .ne-prev {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 6px 12px 22px 12px;
+  }
+  .ne-prev-empty {
+    margin: 0;
+    font-size: 12.5px;
+  }
+  .nm-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .nm-head .nm-for {
+    min-width: 0;
+  }
+  .nm-head .ne-mode {
+    margin-left: auto;
+    flex: none;
+  }
+  .nm-prev {
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+  }
+  .nm-prev .ne-prev-empty {
+    padding: 8px 12px;
   }
   .ne-empty {
     display: flex;

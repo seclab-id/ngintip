@@ -14,6 +14,18 @@
   import { save } from '@tauri-apps/plugin-dialog';
 
   const iv = store.intruder;
+  // Persist the attack setup (template, positions, payload sets, type) with the project,
+  // the way Repeater tabs already are. Results are deliberately not saved; see
+  // intruderSnapshot.
+  $effect(() => store.saveIntruder());
+  // Results of the last attack, loaded the first time this tab is shown.
+  $effect(() => {
+    if (!tab.resultsLoaded) store.loadIntruderResults(tab);
+  });
+  // A stored row carries no bodies until it is opened.
+  $effect(() => {
+    if (tab.selected != null) store.loadIntruderResult(tab, tab.selected);
+  });
   let tab = $derived(iv.tabs.find((t) => t.id === iv.activeId) ?? iv.tabs[0]);
 
   // Right-click menus: attack tab, request template, result rows and the result's
@@ -697,7 +709,7 @@
                 <MessageView
                   title="Request #{selected.n}"
                   raw={selected.requestFinal || selected.requestRaw || ''}
-                  variants={reqVariants(selected)}
+                  variants={reqVariants(selected)} side="req"
                   placeholder="Request not kept for this row (large run)" />
               </div>
             {/snippet}
@@ -707,7 +719,7 @@
                 <MessageView
                   title="Response #{selected.n}"
                   raw={selected.error ? '' : selected.responseOriginal || selected.responseRaw}
-                  variants={resVariants(selected)}
+                  variants={resVariants(selected)} side="res"
                   placeholder={selected.error ? selected.error : 'Response not kept for this row (large run)'} />
               </div>
             {/snippet}

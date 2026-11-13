@@ -2,6 +2,11 @@
   import { store } from '../lib/store.svelte.js';
   import Logo from './Logo.svelte';
 
+  // Held traffic is red, not amber: a client is blocked waiting on the operator, which
+  // is a different thing from "intercept is switched on". WebSocket holds sit in the
+  // same queue in the UI, so they count too (see Topbar).
+  const heldCount = $derived(store.intercept.queue.length + store.wsIntercept.queue.length);
+
   const items = [
     { id: 'history', label: 'History', icon: 'M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01' },
     { id: 'intercept', label: 'Intercept', icon: 'M10 15V9M14 15V9M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20z' },
@@ -29,8 +34,8 @@
     >
       <svg viewBox="0 0 24 24"><path d={item.icon} /></svg>
       <span class="tip">{item.label}</span>
-      {#if item.id === 'intercept' && store.intercept.queue.length}
-        <span class="count">{store.intercept.queue.length}</span>
+      {#if item.id === 'intercept' && heldCount}
+        <span class="count alert">{heldCount}</span>
       {:else if item.id === 'intercept' && store.intercept.enabled}
         <span class="on"></span>
       {:else if item.id === 'logs' && store.logsUnread}
