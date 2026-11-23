@@ -1,5 +1,11 @@
-# Installable bundles for every desktop platform. Run by hand (Actions tab)
-# or by pushing a tag like v0.2.0.
+# Installable bundles for every desktop platform, and the draft release that ships
+# them. Run by hand (Actions tab) to get bundles only, or push a tag like v0.4.0 to
+# also open a draft release with the notes and checksums already in place.
+#
+# The release is left as a DRAFT on purpose. Publishing it is what makes
+# api.github.com/repos/<repo>/releases/latest return the new version, which is what
+# every running copy of Ngintip reads on launch to tell its user there is an update.
+# That moment should be a decision, not a side effect of pushing a tag.
 name: Build
 
 on:
@@ -15,6 +21,16 @@ jobs:
       matrix:
         os: [ubuntu-22.04, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # Job level, not step level, because a step cannot read its own `env:` block from
+    # its `if:`. The macOS steps below have to ask whether the certificate exists at
+    # all, so that an unsigned build still works where the secrets are not set.
+    env:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
     steps:
       - uses: actions/checkout@v4
       - name: Tauri system libraries
@@ -27,19 +43,104 @@ jobs:
           node-version: 24
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
+      # The runner is Apple silicon, so a plain build would ship an arm64-only app and
+      # every Intel Mac would be told the download is damaged. Both halves are built and
+      # lipo'd into one bundle.
+      - name: Both macOS architectures
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
       - run: npm ci
-      - run: npm run tauri build
+
+      # The identity has to be in a keychain before the build looks for it, which Tauri
+      # documents as its own step rather than something the CLI does. Skipped whole when
+      # the certificate secret is absent, so a fork still produces an unsigned bundle.
+      - name: Import the Developer ID certificate
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        run: |
+          # The keychain lives and dies with this runner, so its password only has to be
+          # unguessable for the length of the job. That is one less secret to rotate.
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import "$RUNNER_TEMP/certificate.p12" -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          # Printed so a signing failure is read off this list rather than guessed at.
+          security find-identity -v -p codesigning build.keychain
+
+      # Signed and notarized when the Apple secrets are set, unsigned when they are not.
+      # An unsigned .dmg installs fine after the Gatekeeper warning; a notarized one
+      # opens with no warning at all. APPLE_SIGNING_IDENTITY is optional: left empty,
+      # the CLI infers it from the certificate that was just imported.
+      - name: Build (macOS, universal)
+        if: runner.os == 'macOS'
+        run: npm run tauri build -- --target universal-apple-darwin
+
+      - name: Build (Linux, Windows)
+        if: runner.os != 'macOS'
+        run: npm run tauri build
+
       - uses: actions/upload-artifact@v4
         with:
-          name: intip-${{ matrix.os }}
+          name: ngintip-${{ matrix.os }}
           path: |
-            src-tauri/target/release/bundle/**/*.dmg
             src-tauri/target/release/bundle/**/*.msi
             src-tauri/target/release/bundle/**/*.exe
             src-tauri/target/release/bundle/**/*.deb
             src-tauri/target/release/bundle/**/*.rpm
             src-tauri/target/release/bundle/**/*.AppImage
+            src-tauri/target/universal-apple-darwin/release/bundle/**/*.dmg
           if-no-files-found: warn
+
+  release:
+    name: draft release
+    needs: bundle
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect the bundles
+        run: |
+          mkdir -p release
+          # The three uploads keep their own directory trees; the release wants a flat
+          # list of installers and nothing else.
+          find artifacts -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \
+            -o -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) \
+            -exec cp {} release/ \;
+          cd release
+          # Checksums over the files as published, so anyone can verify a download
+          # without trusting the page it came from.
+          sha256sum * > SHA256SUMS.txt
+          ls -la
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          NOTES=".github/release-notes/${TAG#v}.md"
+          # A tag with no notes file still gets a draft, rather than failing the run
+          # after a 40 minute build. The body is then written by hand before publishing.
+          if [ ! -f "$NOTES" ]; then
+            echo "no notes at $NOTES; drafting with a placeholder body"
+            mkdir -p "$(dirname "$NOTES")"
+            printf 'Release notes for %s have not been written yet.\n' "$TAG" > "$NOTES"
+          fi
+          gh release create "$TAG" release/* \
+            --draft \
+            --title "Ngintip ${TAG#v}" \
+            --notes-file "$NOTES"
+          echo "Drafted $TAG. Review it, then press Publish: publishing is what tells"
+          echo "every running copy there is an update."

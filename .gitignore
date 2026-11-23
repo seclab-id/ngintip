@@ -54,6 +54,8 @@ request.txt
 test-target/
 
 # Working documents: release plans, drafts and notes stay local. README is the one
-# exception, since it is the repository's public front page.
+# exception, since it is the repository's public front page, and so are release notes,
+# which have to be in the tree for the tag that publishes them to find them.
 *.md
 !README.md
+!.github/release-notes/*.md
