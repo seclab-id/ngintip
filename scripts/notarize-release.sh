@@ -26,13 +26,17 @@ command -v gh >/dev/null || { echo "need the gh CLI" >&2; exit 1; }
 command -v xcrun >/dev/null || { echo "need Xcode command line tools" >&2; exit 1; }
 [ "$(uname)" = "Darwin" ] || { echo "notarization only runs on macOS" >&2; exit 1; }
 
+# Resolved before leaving the checkout: gh works out the repository from the git
+# remote, and every command below runs from a temp directory that has no remote.
+REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
+
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ngintip-notarize.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 cd "$WORK"
 
 echo "==> Downloading the assets of $TAG"
 # Draft releases are reachable by tag to anyone who can see the repository.
-gh release download "$TAG" --pattern '*.dmg' --dir . --clobber
+gh release download "$TAG" --repo "$REPO" --pattern '*.dmg' --dir . --clobber
 DMG="$(ls -1 ./*.dmg 2>/dev/null | head -1)"
 [ -n "${DMG:-}" ] || { echo "no .dmg in release $TAG" >&2; exit 1; }
 echo "    $(basename "$DMG")"
@@ -67,16 +71,16 @@ spctl -a -vvv -t install "$APP" 2>&1 || true
 hdiutil detach "$MOUNT" -quiet
 
 echo "==> Putting the stapled .dmg back and rebuilding the checksums"
-gh release upload "$TAG" "$DMG" --clobber
+gh release upload "$TAG" "$DMG" --repo "$REPO" --clobber
 
 # Every other asset is downloaded only so the checksum file covers the whole release,
 # not just the file that changed.
-gh release download "$TAG" --dir . --clobber --pattern '*' || true
+gh release download "$TAG" --repo "$REPO" --dir . --clobber --pattern '*' || true
 rm -f SHA256SUMS.txt
 shasum -a 256 -- *.dmg *.msi *.exe *.deb *.rpm *.AppImage 2>/dev/null \
   | sed 's|\./||' > SHA256SUMS.txt
 cat SHA256SUMS.txt
-gh release upload "$TAG" SHA256SUMS.txt --clobber
+gh release upload "$TAG" SHA256SUMS.txt --repo "$REPO" --clobber
 
 echo
 echo "Done. $TAG is notarized, stapled and its checksums match what is published."
