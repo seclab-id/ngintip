@@ -15,7 +15,7 @@
   import { inScope } from '../lib/scope.js';
   import { HISTORY_COLUMNS, DEFAULT_COLUMN_KEYS } from '../lib/columns.js';
   import { fmtSize, fmtDateTime } from '../lib/format.js';
-  import { METHODS, STATUS_CLASSES, FILTER_FIELDS, advActive, matchAdvanced } from '../lib/histfilter.js';
+  import { METHODS, STATUS_CLASSES, FILTER_FIELDS, HISTORY_KINDS, advActive, matchAdvanced, filterKind, isWebSocket } from '../lib/histfilter.js';
   import { brandKey } from '../lib/brand.js';
 
   let filtersModal = $state(false);
@@ -62,14 +62,18 @@
   }
 
   let query = $derived(store.filter.trim().toLowerCase());
+  // HTTP or WebSocket, before anything else: it is one integer compare per row, and it
+  // is usually the filter that removes the most.
+  let byKind = $derived(filterKind(store.flows, store.historyKind));
+  let wsCount = $derived(store.flows.reduce((n, f) => n + (isWebSocket(f) ? 1 : 0), 0));
   let scoped = $derived(
-    store.scopeOnly && store.scope.length ? store.flows.filter((f) => inScope(store.scope, f.host)) : store.flows,
+    store.scopeOnly && store.scope.length ? byKind.filter((f) => inScope(store.scope, f.host)) : byKind,
   );
   // "#15559" jumps straight to that flow by id (the id as shown in the table), instead
   // of the usual text search. A bare number still searches status/path as before.
   let idQuery = $derived(/^#\d+$/.test(query) ? Number(query.slice(1)) : null);
   // One search box: match summary fields (path/method/status/host/mime/note) OR the
-  // request/response body (full-text, via store.bodyHits) — the two are unioned.
+  // request/response body (full-text, via store.bodyHits) - the two are unioned.
   let byText = $derived(
     idQuery != null
       ? scoped.filter((f) => f.id === idQuery)
@@ -92,7 +96,14 @@
       x,
       y,
       items: [
-        { label: 'Send to Repeater', hint: '⌘R', run: () => store.sendFlowToRepeater(flow.id) },
+        // A socket cannot be replayed as a request: its handshake is spent. Only the
+        // label changes here - the rule itself lives in one place, so Cmd+R and every
+        // other way in open a socket tab for a 101 too.
+        {
+          label: flow.status === 101 ? 'Open socket in Repeater' : 'Send to Repeater',
+          hint: '⌘R',
+          run: () => store.sendFlowToRepeater(flow.id),
+        },
         { label: 'Send to Intruder', run: () => store.sendFlowToIntruder(flow.id) },
         { label: 'Send request to Comparer', run: () => store.sendFlowToComparer(flow.id, 'request') },
         { label: 'Send response to Comparer', run: () => store.sendFlowToComparer(flow.id, 'response') },
@@ -112,7 +123,7 @@
             run: () => store.setColorMany(ids, !many && flow.color === color ? '' : color),
           })),
         },
-        { label: 'Clear highlight', disabled: !ids.some((id) => store.flows.find((f) => f.id === id)?.color), run: () => store.setColorMany(ids, '') },
+        { label: 'Clear highlight', disabled: !store.hasColor(ids), run: () => store.setColorMany(ids, '') },
         'separator',
         { label: many ? `Delete ${ids.length} requests…` : 'Delete…', hint: '⌫', danger: true, run: () => store.askDeleteFlows(ids) },
       ],
@@ -188,8 +199,11 @@
   let detail = $state(null);
   $effect(() => {
     const id = store.selectedId;
-    // Refetch when a streaming preview is replaced by the final flow.
-    current?.streaming, current?.length;
+    // Refetch when an interim version of the row is replaced by the final one: a
+    // streaming preview by the completed body, or a request recorded on its own by the
+    // response that finally arrived. A response with an empty body changes neither the
+    // streaming flag nor the length, so the status and the error are read too.
+    current?.streaming, current?.length, current?.status, current?.error;
     if (id == null) return void (detail = null);
     // Show a cached detail immediately (no round-trip, no flicker). On a miss,
     // keep the previous pane visible until the new one loads instead of blanking
@@ -277,6 +291,24 @@
         placeholder="Search path, method, status, body… or #15559 for an id"
         spellcheck="false"
       />
+    </div>
+    <div class="kinds" role="group" aria-label="Show">
+      {#each HISTORY_KINDS as k}
+        <button
+          class="kind"
+          class:on={store.historyKind === k.key}
+          type="button"
+          aria-pressed={store.historyKind === k.key}
+          title={k.key === 'ws'
+            ? 'Only WebSocket connections: the GET that answered 101. Their frames are in the WebSocket tab below.'
+            : k.key === 'http'
+              ? 'Hide WebSocket connections'
+              : 'Everything'}
+          onclick={() => (store.historyKind = k.key)}
+        >
+          {k.label}{#if k.key === 'ws' && wsCount}<span class="n">{wsCount}</span>{/if}
+        </button>
+      {/each}
     </div>
     <label class="toggle" title={store.scope.length ? 'Show only in-scope hosts' : 'Scope not set (Settings)'}>
       <input type="checkbox" bind:checked={store.scopeOnly} disabled={!store.scope.length} />
@@ -496,7 +528,7 @@
 {/if}
 
 {#if noteModal && current}
-  <Modal title="Note — request #{current.id}" draggable onclose={() => (noteModal = false)}>
+  <Modal title="Note - request #{current.id}" draggable onclose={() => (noteModal = false)}>
     <div class="note-modal">
       <textarea
         class="input mono note-area"
@@ -637,6 +669,40 @@
     border-color: var(--amber);
     background: color-mix(in srgb, var(--amber) 16%, transparent);
     color: var(--amber);
+  }
+  /* The HTTP / WS switch: one segmented control, so the two halves of a capture are a
+     click apart rather than a filter rule away. */
+  .kinds {
+    display: flex;
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .kind {
+    height: 26px;
+    padding: 0 10px;
+    border: 0;
+    border-right: 1px solid var(--border);
+    background: var(--bg-elev);
+    color: var(--text-dim);
+    font: 12px var(--sans);
+    cursor: pointer;
+  }
+  .kind:last-child {
+    border-right: 0;
+  }
+  .kind:hover {
+    color: var(--text);
+  }
+  .kind.on {
+    background: var(--accent);
+    color: #fff;
+  }
+  .kind .n {
+    margin-left: 5px;
+    opacity: 0.75;
+    font-family: var(--mono);
   }
   .toggle {
     display: flex;

@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Performance - Ngintip docs</title>
+    <meta name="description" content="What one real engagement costs on disk: 41,692 requests, 123 hosts, nine days, one 412 MB file." />
+    <meta name="theme-color" id="tc" content="#f5f6f9" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="Performance - Ngintip docs" />
+    <meta property="og:description" content="What one real engagement costs on disk: 41,692 requests, 123 hosts, nine days, one 412 MB file." />
+    <meta property="og:url" content="https://seclab-id.github.io/ngintip/performance.html" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="style.css" />
+    <script>
+      try {
+        var t = localStorage.getItem('ngintip.site.theme');
+        if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+      } catch (e) {}
+      try {
+        var dark =
+          document.documentElement.dataset.theme === 'dark' ||
+          (!document.documentElement.dataset.theme && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        if (dark) document.getElementById('tc').content = '#0d0f14';
+      } catch (e) {}
+    </script>
+  </head>
+  <body class="doc">
+    <div class="peek" aria-hidden="true">
+      <svg class="eye" viewBox="0 0 120 64" aria-hidden="true">
+        <path class="eye-shape" d="M5 32s19-25 55-25 55 25 55 25-19 25-55 25S5 32 5 32z" />
+        <circle class="eye-iris" cx="60" cy="32" r="12" />
+        <circle class="eye-spark" cx="64.5" cy="27.5" r="3.4" />
+      </svg>
+      <span class="lid top"></span>
+      <span class="lid bottom"></span>
+    </div>
+    <a class="skip" href="#main">Skip to content</a>
+
+    <header class="topbar">
+      <a class="brand" href="./" aria-label="Ngintip home">
+        <span class="badge" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" /><circle cx="12" cy="12" r="3" /></svg>
+        </span>
+        <span class="brand-name">Ngintip</span>
+      </a>
+      <nav aria-label="Sections">
+        <a href="./">Home</a>
+        <a href="https://github.com/seclab-id/ngintip/releases/latest">Download</a>
+        <a href="https://github.com/seclab-id/ngintip">GitHub</a>
+      </nav>
+      <button id="theme" class="icon-btn" type="button" aria-label="Switch theme" title="Switch theme">
+        <svg viewBox="0 0 24 24" aria-hidden="true" class="sun"><circle cx="12" cy="12" r="4.2" /><path d="M12 2.5v2M12 19.5v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M2.5 12h2M19.5 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4" /></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true" class="moon"><path d="M20 14.2A8 8 0 0 1 9.8 4 8.1 8.1 0 1 0 20 14.2z" /></svg>
+      </button>
+    </header>
+
+    <div class="doc-wrap">
+      <aside class="toc">
+        <nav aria-label="Documentation">
+          <p class="toc-title">Ngintip docs</p>
+          <a href="docs.html">Overview</a>
+          <a href="performance.html" aria-current="page">Performance</a>
+          <p class="toc-title">Getting started</p>
+          <a href="install.html">Install</a>
+          <a href="start.html">First run and the CA</a>
+          <a href="browser.html">Built-in browser</a>
+          <p class="toc-title">Capture</p>
+          <a href="history.html">History</a>
+          <a href="intercept.html">Intercept</a>
+          <p class="toc-title">Replay</p>
+          <a href="repeater.html">Repeater</a>
+          <a href="intruder.html">Intruder</a>
+          <a href="organizer.html">Organizer</a>
+          <p class="toc-title">Automation</p>
+          <a href="automation.html">Rules and Passive Scan</a>
+          <a href="extensions.html">Extensions</a>
+          <a href="mcp.html">MCP server</a>
+          <p class="toc-title">Reference</p>
+          <a href="tools.html">Decoder and Comparer</a>
+          <a href="projects.html">Projects and Footprint</a>
+          <a href="about.html">About</a>
+        </nav>
+      </aside>
+
+      <article class="prose" id="main">
+        <h1>Performance</h1>
+        <p class="section-lead">
+  Numbers from one real engagement, measured from its saved project file. Aggregates only: no host, no path and no
+  payload from it appears on this site.
+</p>
+
+<div class="stats">
+  <div class="stat"><strong>41,692</strong><span>requests captured</span></div>
+  <div class="stat"><strong>123</strong><span>hosts touched</span></div>
+  <div class="stat"><strong>9</strong><span>days of work</span></div>
+  <div class="stat"><strong>26%</strong><span>saved size</span></div>
+</div>
+
+<h2 id="file">One file, a quarter of the size</h2>
+<p>
+  The capture is compressed on save and streamed back on open, so the project you hand over is a fraction of the
+  database inside it. Nothing is pruned to get there: every request, answer, header and body is still in the file.
+</p>
+<div class="chart">
+  <div class="row">
+    <span class="label">Database</span>
+    <span class="track"><span class="fill" style="width: 100%"></span></span>
+    <span class="value">1.55 GB</span>
+  </div>
+  <div class="row">
+    <span class="label">Saved file</span>
+    <span class="track"><span class="fill accent" style="width: 26%"></span></span>
+    <span class="value">412.6 MB</span>
+  </div>
+  <p class="chart-note">3.8x smaller, or 74% of the bytes gone, with nothing dropped from the capture.</p>
+</div>
+
+<h2 id="inside">Where the bytes go</h2>
+<p>Inside the uncompressed database the split is not where most people guess:</p>
+<div class="chart">
+  <div class="stack">
+    <span class="seg a" style="width: 66.8%"><span>66.8%</span></span>
+    <span class="seg b" style="width: 32.9%"><span>32.9%</span></span>
+    <span class="seg c" style="width: 0.3%"></span>
+  </div>
+  <ul class="legend">
+    <li><span class="key a"></span>Search index <b>1,058 MB</b></li>
+    <li><span class="key b"></span>Flows: headers, bodies, metadata <b>520 MB</b></li>
+    <li><span class="key c"></span>Settings, Repeater history, logs <b>4.6 MB</b></li>
+  </ul>
+</div>
+<p>
+  Two thirds of the database is the full-text index, not the traffic. That is what makes a search across 41,692
+  decoded bodies answer immediately instead of walking the table, and it is derived data: it compresses hard, which is
+  most of why the saved file is a quarter of the size.
+</p>
+
+<h2 id="engagement">What that engagement held</h2>
+<table class="specs">
+  <caption class="sr-only">What one engagement captured</caption>
+  <tbody>
+    <tr><th scope="row">Requests captured</th><td>41,692</td></tr>
+    <tr><th scope="row">Hosts touched</th><td>123</td></tr>
+    <tr><th scope="row">Span</th><td>9 days</td></tr>
+    <tr><th scope="row">Response bodies stored</th><td>402.7 MB</td></tr>
+    <tr><th scope="row">Largest single response</th><td>32.1 MB</td></tr>
+    <tr><th scope="row">Average response</th><td>10.6 KB</td></tr>
+    <tr><th scope="row">Repeater sends</th><td>149</td></tr>
+    <tr><th scope="row">WebSocket messages</th><td>436</td></tr>
+  </tbody>
+</table>
+
+<h2 id="format">What the file actually is</h2>
+<p>
+  A project is a <strong>SQLite 3 database</strong>, compressed, behind a seven byte header. Nothing exotic: if you
+  want to read a capture with your own tools, you decompress it and open it with any SQLite client.
+</p>
+<pre class="code"><code>4e 47 4e 54 50 43   "NGNTPC"   brand magic
+02                  version    2 = zstd, 1 = gzip (older saves, still read)
+28 b5 2f fd ...     zstd frame containing the SQLite database</code></pre>
+<p>
+  A plain <code>SQLite format 3</code> file with no header at all still opens, so an old uncompressed project is never
+  stranded. The tables inside are the ones you would expect: <code>flows</code>, <code>ws_messages</code>,
+  <code>settings</code>, <code>repeater_history</code>, <code>intruder_results</code>, <code>logs</code>, plus the
+  FTS5 index that makes search instant.
+</p>
+
+<h3>How saving works</h3>
+<p>
+  The app never edits the document in place. It works on a live, uncompressed SQLite file in its data directory, which
+  is what makes writes durable while you capture, and Save streams that file through a zstd encoder straight into the
+  document. Streaming is the part that matters at this size: a 1.55 GB database is never held in memory to be saved.
+</p>
+<p>
+  The level is <strong>zstd 12</strong>, with long distance matching turned on. That setting is deliberate: high
+  enough to comfortably beat gzip's ratio, low enough that multithreaded compression still finishes faster than the
+  old gzip save, and long distance matching is what catches the repeats <em>across</em> flows, since the same
+  framework headers and the same JSON keys appear in thousands of messages.
+</p>
+<p>Opening reverses it, decompressing as a stream so a large project does not have to fit in RAM twice.</p>
+
+<h2 id="app">And the app itself</h2>
+<p>
+  The installer is 5.2 MB on Windows, 6.9 MB on Debian and Fedora, and 12.7 MB on macOS for a universal build carrying
+  both architectures; installed, the macOS bundle is 28 MB. No bundled browser, no runtime to install first, no
+  service left running: the proxy is Rust, and the window is the webview your system already has.
+</p>
+        <nav class="pager" aria-label="Page">
+          <a class="prev" href="docs.html"><span>Previous</span>Overview</a>
+          <a class="next" href="install.html"><span>Next</span>Install</a>
+        </nav>
+      </article>
+    </div>
+
+    <footer>
+      <div class="foot-row">
+        <a class="brand small" href="./">
+          <span class="badge" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" /><circle cx="12" cy="12" r="3" /></svg>
+          </span>
+          <span class="brand-name">Ngintip</span>
+        </a>
+        <nav aria-label="Links">
+          <a href="docs.html">Docs</a>
+          <a href="https://github.com/seclab-id/ngintip">Repository</a>
+          <a href="https://github.com/seclab-id/ngintip/releases">Releases</a>
+          <a href="https://github.com/seclab-id/ngintip/issues">Issues</a>
+        </nav>
+      </div>
+    </footer>
+
+    <script src="app.js" defer></script>
+  </body>
+</html>

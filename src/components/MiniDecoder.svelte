@@ -96,7 +96,7 @@
     <label class="row">
       <span class="lbl">As</span>
       <select class="input sel" bind:value={choice}>
-        <option value="auto">Auto{candidates.length ? ` — ${candidates[0].label}` : ''}</option>
+        <option value="auto">Auto{candidates.length ? ` - ${candidates[0].label}` : ''}</option>
         {#each DECODERS as d}
           <option value={d.id}>{d.label}</option>
         {/each}

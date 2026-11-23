@@ -27,6 +27,12 @@ export const getFlow = (id) => invoke('get_flow', { id });
 export const flowImage = (id) => invoke('flow_image', { id });
 export const flowHex = (id, side) => invoke('flow_hex', { id, side });
 export const wsMessages = (flowId) => invoke('ws_messages', { flowId });
+// Repeater sockets: open one, push frames into it, close it. Frames arrive on the same
+// 'ws' event the proxy uses, because a Repeater socket is recorded as an ordinary flow.
+export const wsRepeaterOpen = (url) => invoke('ws_repeater_open', { url });
+export const wsRepeaterSend = (connId, kind, text = null, base64 = null) => invoke('ws_repeater_send', { connId, kind, text, base64 });
+export const wsRepeaterClose = (connId, code = 1000, reason = '') => invoke('ws_repeater_close', { connId, code, reason });
+export const wsRepeaterOpenList = () => invoke('ws_repeater_open_list');
 export const flowBody = (id, side) => invoke('flow_body', { id, side });
 export const clearFlows = () => invoke('clear_flows');
 export const caInfo = () => invoke('ca_info');
@@ -50,6 +56,9 @@ export const exportHar = (path) => invoke('export_har', { path });
 export const exportBurp = (path) => invoke('export_burp', { path });
 export const saveBinary = (path, data) => invoke('save_binary', { path, data });
 export const copyImage = (width, height, data) => invoke('copy_image', { width, height, data });
+// The window's answer to MCP's `history_image`: the PNG it drew, or why it could not.
+// See src/lib/flowimage.js and src-tauri/src/render.rs.
+export const renderResult = (reqId, data, error) => invoke('render_result', { reqId, data, error });
 // Intruder results, kept with the project. The list omits request/response text; one
 // row is fetched in full when it is opened (same split as repeater history).
 export const intruderSaveResults = (tab, rows) => invoke('intruder_save_results', { tab, rows });
@@ -75,6 +84,7 @@ export const setWsIntercept = (enabled) => invoke('set_ws_intercept', { enabled 
 export const wsInterceptForward = (key, text = null) => invoke('ws_intercept_forward', { key, text });
 export const wsInterceptDrop = (key) => invoke('ws_intercept_drop', { key });
 export const setFlowMeta = (id, note, color) => invoke('set_flow_meta', { id, note, color });
+export const setFlowColors = (ids, color) => invoke('set_flow_colors', { ids, color });
 export const listInterfaces = () => invoke('list_interfaces');
 export const deleteFlows = (ids) => invoke('delete_flows', { ids });
 export const resetFlowIds = () => invoke('reset_flow_ids');
@@ -95,6 +105,7 @@ export const launchBrowser = (proxy, url, cdpPort = null, profile = null) => inv
 export const closeLaunchedBrowsers = () => invoke('close_launched_browsers');
 export const browserRunning = () => invoke('browser_running');
 export const setInvisible = (enabled) => invoke('set_invisible', { enabled });
+export const setGiveUpAfter = (seconds) => invoke('set_give_up_after', { seconds });
 export const setThreads = (threads) => invoke('set_threads', { threads });
 export const setAutoContentLength = (enabled) => invoke('set_auto_content_length', { enabled });
 export const getSetting = (key) => invoke('get_setting', { key });

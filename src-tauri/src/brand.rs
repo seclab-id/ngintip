@@ -1,10 +1,10 @@
-//! Global branding & identifier — the single place to rebrand the app.
+//! Global branding & identifier - the single place to rebrand the app.
 //!
 //! Change the constants here and the project file extension, the compressed-file
 //! magic, the CA subject, diagnostic messages, the injected User-Agent and the
 //! exporters all follow. Static manifests that can't read Rust (tauri.conf.json,
 //! Cargo.toml, package.json, index.html) and the frontend (src/lib/brand.js)
-//! carry their own copies — keep them in sync when renaming.
+//! carry their own copies - keep them in sync when renaming.
 
 /// Display name shown to users.
 pub const NAME: &str = "Ngintip";

@@ -22,6 +22,7 @@ mod organizer;
 mod scope;
 mod proxy;
 mod raw;
+mod render;
 mod rules;
 mod store;
 // Echo server used only by tests (the user-facing Test server feature was removed).
@@ -30,6 +31,7 @@ mod testserver;
 mod upstream;
 mod vault;
 mod ws;
+mod wsrepeater;
 
 use std::sync::{Arc, Mutex};
 
@@ -59,6 +61,23 @@ pub struct AppState {
     /// In-flight Repeater sends, by tab id, so a slow send can be cancelled. Sending
     /// on the channel (or dropping it) cancels the awaiting send in `send_raw`.
     pub sends: Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<()>>>,
+    /// Set while a project swap is in progress, so a second one cannot start on top of it.
+    ///
+    /// This used to be guaranteed for free: `open_project` and `blank_project` were both
+    /// synchronous commands, so Tauri ran them on the IPC thread and they could not
+    /// overlap. Making the open non-blocking (which is what lets the window keep
+    /// painting) removed that guarantee, and the swap sequence is not safe against
+    /// itself: `switch_working` reads the working pointer, switches the store, rewrites
+    /// the pointer and then deletes the file the pointer named, and `owner_is_live`
+    /// reports our OWN pid as not-live, so our own working file is always ours to delete.
+    /// Two overlapping swaps can therefore end with the store holding one project's data
+    /// while `document` names another project's file, and the next Save writes the first
+    /// project's flows over the second project's document. `doc_stamp` cannot catch it,
+    /// because the stamp was taken for the file that is about to be overwritten.
+    ///
+    /// Not covered by `Store::generation`, which serialises capture writes and deletes
+    /// against *a* swap; this serialises *two swaps* against each other.
+    pub swapping: std::sync::atomic::AtomicBool,
 }
 
 impl AppState {
@@ -243,6 +262,7 @@ pub fn run() {
                 usage: Mutex::new(usage::Usage::new()),
                 browsers: Mutex::new(Vec::new()),
                 sends: Mutex::new(std::collections::HashMap::new()),
+                swapping: std::sync::atomic::AtomicBool::new(false),
             });
 
             // The MCP server is NOT started here: it is opt-in per project, so the UI
@@ -279,6 +299,7 @@ pub fn run() {
             commands::flow_body,
             commands::clear_flows,
             commands::set_flow_meta,
+            commands::set_flow_colors,
             commands::delete_flows,
             commands::reset_flow_ids,
             commands::search_flows,
@@ -301,6 +322,12 @@ pub fn run() {
             commands::get_config,
             commands::set_auth,
             commands::set_invisible,
+            commands::set_give_up_after,
+            commands::render_result,
+            commands::ws_repeater_open,
+            commands::ws_repeater_send,
+            commands::ws_repeater_close,
+            commands::ws_repeater_open_list,
             commands::set_threads,
             commands::set_mcp,
             commands::mcp_status,

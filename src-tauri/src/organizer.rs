@@ -65,7 +65,26 @@ pub struct SavedRequest {
     /// own results list, instead of one giant concatenated message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub results: Option<Value>,
+    /// A saved WebSocket flow's frames, as `{ total, items: [...] }`.
+    ///
+    /// For a socket the request/response above are only the handshake: a GET and a 101,
+    /// with nothing of what the socket actually carried. The frames live in
+    /// `ws_messages`, keyed by flow id, so a record that does not copy them is empty the
+    /// moment History is cleared or the project is reopened without that flow. Capped
+    /// when saved (see the store), and `total` says how many there really were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Value>,
     pub status: Option<u16>,
+    /// What the response cost, as the view that saved it measured: time on the wire in
+    /// milliseconds and response body size in bytes.
+    ///
+    /// Optional, and `None` is not zero. Records saved before these existed have
+    /// neither, and a 204 really does carry zero bytes, so an absent value has to stay
+    /// tellable from a measured one or the table would invent numbers for old records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<usize>,
     pub label: String,
     pub note: String,
     pub color: String,
@@ -117,7 +136,16 @@ pub struct NewItem {
     pub response_extension: String,
     #[serde(default)]
     pub results: Option<Value>,
+    /// A WebSocket flow's frames, `{ total, items: [...] }`. See `SavedRequest::messages`.
+    #[serde(default)]
+    pub messages: Option<Value>,
     pub status: Option<u16>,
+    /// See `SavedRequest::duration_ms` / `length`: absent means the saving view had no
+    /// measurement, not that the response was instant or empty.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub length: Option<usize>,
     pub label: String,
     pub note: String,
     pub color: String,
@@ -244,6 +272,18 @@ fn host_of(target: &str) -> String {
     authority.rsplit_once('@').map_or(authority, |(_, h)| h).to_string()
 }
 
+/// How much of a socket a saved record carries, shared by every surface that saves one
+/// (the window and the MCP server) so a record means the same thing wherever it came
+/// from. Three limits, because a socket can be long, a frame can be large, and a record
+/// is evidence rather than a second copy of the project:
+///   - at most this many frames, oldest first,
+///   - at most this much rendered text per frame,
+///   - and at most this much text in total, whichever runs out first.
+/// `total` on the record always reports the real number of frames.
+pub const WS_SAVE_FRAMES: usize = 2000;
+pub const WS_SAVE_TEXT: usize = 16 * 1024;
+pub const WS_SAVE_BYTES: usize = 2 * 1024 * 1024;
+
 impl SavedRequest {
     fn from_new(n: NewItem) -> Self {
         let (method, path) = request_line(&n.request);
@@ -266,7 +306,10 @@ impl SavedRequest {
             response_original: n.response_original,
             response_extension: n.response_extension,
             results: n.results,
+            messages: n.messages,
             status: n.status,
+            duration_ms: n.duration_ms,
+            length: n.length,
             label: n.label.trim().to_string(),
             note: n.note,
             color: n.color.trim().to_string(),
@@ -412,6 +455,42 @@ mod tests {
 
     fn item(request: &str, target: &str) -> NewItem {
         NewItem { request: request.into(), target: target.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn a_saved_socket_keeps_its_frames_and_old_records_still_load() {
+        // Frames are stored as opaque JSON, so the shape can grow without a migration.
+        // What must hold is that they survive the round trip, and that a record written
+        // before the field existed still loads instead of failing the whole collection.
+        let frames = json!({
+            "total": 3,
+            "items": [
+                { "id": 1, "direction": "client", "opcode": 1, "length": 5, "text": "hello" },
+                { "id": 2, "direction": "server", "opcode": 9, "length": 0, "text": "" },
+                { "id": 3, "direction": "server", "opcode": 8, "length": 2, "text": "close 1000" },
+            ],
+        });
+        let saved = SavedRequest::from_new(NewItem {
+            messages: Some(frames.clone()),
+            status: Some(101),
+            ..item("GET /ws/chat HTTP/1.1", "http://x")
+        });
+        let text = serde_json::to_string(&saved).unwrap();
+        let back: SavedRequest = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.messages.as_ref(), Some(&frames));
+        assert_eq!(back.messages.as_ref().unwrap()["items"][1]["length"], 0, "an empty ping is a frame too");
+
+        // An ordinary request carries no socket, and must not grow an empty field.
+        let plain = SavedRequest::from_new(item("GET / HTTP/1.1", "http://x"));
+        assert!(plain.messages.is_none());
+        assert!(!serde_json::to_string(&plain).unwrap().contains("messages"));
+
+        // A record from before this existed.
+        let old = r#"{"id":"req-1","name":"old","method":"GET","host":"x","path":"/","target":"http://x",
+                      "request":"GET / HTTP/1.1","response":"","label":"","note":"","color":"","source":"history","savedAt":1}"#;
+        let loaded: SavedRequest = serde_json::from_str(old).unwrap();
+        assert!(loaded.messages.is_none());
+        assert_eq!(loaded.name, "old");
     }
     fn save(org: &mut Organizer, collection: Option<&str>, it: NewItem) -> (String, String) {
         let (c, i) = org.edit(Op::Save { collection: collection.map(str::to_string), item: it }).unwrap();

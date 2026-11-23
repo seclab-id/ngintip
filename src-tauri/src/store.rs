@@ -51,6 +51,23 @@ pub struct FlowSummary {
     pub color: String,
     /// Response still streaming: a preview that a final version will replace.
     pub streaming: bool,
+    /// The request is out at the target right now and this process is still waiting
+    /// for the answer. Like `streaming`, it is emitted and never persisted: being in
+    /// flight is a property of the running process, so it cannot survive it. That is
+    /// deliberate and does the work a sweep would otherwise have to do, because a row
+    /// read back from a project file arrives `false` and is read as what it is, a
+    /// request whose answer was never filed.
+    pub pending: bool,
+    /// The client gave up before this request was handed to the upstream connection, so
+    /// the target never saw it. Unlike `pending` this IS persisted, because it is the
+    /// one thing about such a row that cannot be worked out again later: without it a
+    /// row that never left Ngintip is indistinguishable from one the target received
+    /// and answered into a connection that had already closed, and those two write up
+    /// as completely different findings.
+    ///
+    /// Only ever set on a row that has no response. Every other writer leaves it false
+    /// and nothing reads it for a row that has a status.
+    pub unsent: bool,
     /// The flow was changed from what arrived: edited in the interceptor or
     /// transformed by an extension (i.e. it has Original/Final variants).
     pub modified: bool,
@@ -118,18 +135,14 @@ impl Flow {
         headers: &HeaderMap,
         body: Bytes,
     ) -> Self {
-        Self {
+        let mut flow = Self {
             summary: FlowSummary {
                 id,
                 ts: now_ms(),
-                method: method.to_string(),
-                scheme: uri.scheme_str().unwrap_or("http").to_string(),
-                host: display_host(uri),
-                path: uri
-                    .path_and_query()
-                    .map(|p| p.as_str())
-                    .unwrap_or("/")
-                    .to_string(),
+                method: String::new(),
+                scheme: String::new(),
+                host: String::new(),
+                path: String::new(),
                 status: 0,
                 length: 0,
                 req_length: body.len(),
@@ -139,10 +152,12 @@ impl Flow {
                 note: String::new(),
                 color: String::new(),
                 streaming: false,
+                pending: false,
+                unsent: false,
                 modified: false,
             },
-            version: fmt_version(version).to_string(),
-            req_headers: header_vec(headers),
+            version: String::new(),
+            req_headers: Vec::new(),
             req_body: body,
             res_version: String::new(),
             res_reason: String::new(),
@@ -152,7 +167,28 @@ impl Flow {
             res_truncated: false,
             variants: FlowVariants::default(),
             gen: 0,
-        }
+        };
+        flow.set_request(method, uri, version, headers);
+        flow
+    }
+
+    /// Re-read the request line and headers from a message that has been rewritten.
+    ///
+    /// `Flow::request` builds a row from the request as it arrived. An extension's
+    /// `process_request` then edits those `parts` in place, and from that point the row
+    /// has to name the bytes that actually go upstream or the version that crossed the
+    /// wire exists nowhere. Every field `Flow::request` takes from the message is
+    /// re-read here and nothing else is touched: the id, the timestamp, the captured
+    /// bodies and the variants belong to the exchange, not to this version of it.
+    ///
+    /// `Flow::request` is written in terms of this, so the two cannot drift apart.
+    pub fn set_request(&mut self, method: &Method, uri: &Uri, version: Version, headers: &HeaderMap) {
+        self.summary.method = method.to_string();
+        self.summary.scheme = uri.scheme_str().unwrap_or("http").to_string();
+        self.summary.host = display_host(uri);
+        self.summary.path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
+        self.version = fmt_version(version).to_string();
+        self.req_headers = header_vec(headers);
     }
 
     pub fn set_response(
@@ -326,7 +362,10 @@ CREATE TABLE IF NOT EXISTS flows (
     -- bit 1: request body truncated, bit 2: response body truncated
     truncated   INTEGER NOT NULL DEFAULT 0,
     -- JSON of earlier request/response versions (Original / Extension), when captured
-    variants    TEXT
+    variants    TEXT,
+    -- 1 when the client gave up before the request was handed upstream, so the target
+    -- never saw it. Only meaningful on a row that has no response.
+    unsent      INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS ws_messages (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -387,12 +426,15 @@ CREATE TABLE IF NOT EXISTS logs (
 );
 ";
 
-// note/color sit at index 11 in SUMMARY_COLS and 18 in FULL_COLS (see summary_from_row).
+// Columns are named, never taken in table order, so a project file that reached these
+// columns by migration reads the same as one created with them. note/color sit at index
+// 11 in SUMMARY_COLS and 18 in FULL_COLS, and `unsent` is last in both (see
+// summary_from_row, which is handed it by the caller that knows its index).
 const SUMMARY_COLS: &str =
-    "id, ts, method, scheme, host, path, status, length, mime, duration_ms, error, note, color";
+    "id, ts, method, scheme, host, path, status, length, mime, duration_ms, error, note, color, unsent";
 
 const FULL_COLS: &str = "id, ts, method, scheme, host, path, status, length, mime, duration_ms, error,
-     version, req_headers, req_body, res_version, res_reason, res_headers, res_body, note, color, truncated, variants";
+     version, req_headers, req_body, res_version, res_reason, res_headers, res_body, note, color, truncated, variants, unsent";
 
 struct Db {
     conn: Connection,
@@ -538,8 +580,9 @@ impl Store {
             let mut flow_stmt = tx.prepare_cached(
                 "INSERT OR REPLACE INTO flows
                    (id, ts, method, scheme, host, path, status, length, mime, duration_ms, error,
-                    version, req_headers, req_body, res_version, res_reason, res_headers, res_body, truncated, variants)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                    version, req_headers, req_body, res_version, res_reason, res_headers, res_body, truncated, variants,
+                    unsent)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             )?;
             let mut fts_stmt = tx.prepare_cached("INSERT OR REPLACE INTO flows_fts (rowid, text) VALUES (?1, ?2)")?;
             for (flow, text) in flows.iter().zip(&texts) {
@@ -565,6 +608,7 @@ impl Store {
                     &flow.res_body[..],
                     flow.req_truncated as i64 | (flow.res_truncated as i64) << 1,
                     if flow.variants.is_empty() { None } else { Some(serde_json::to_string(&flow.variants)?) },
+                    s.unsent as i64,
                 ])?;
                 fts_stmt.execute(params![s.id as i64, text])?;
             }
@@ -663,9 +707,9 @@ impl Store {
             .conn
             .prepare(&format!("SELECT {SUMMARY_COLS}, LENGTH(req_body), (variants IS NOT NULL) FROM flows ORDER BY id"))?;
         let rows = stmt.query_map([], |r| {
-            let req_length = r.get::<_, i64>(13)? as usize;
-            let modified = r.get::<_, i64>(14)? != 0;
-            summary_from_row(r, 11, req_length, modified)
+            let req_length = r.get::<_, i64>(14)? as usize;
+            let modified = r.get::<_, i64>(15)? != 0;
+            summary_from_row(r, 11, 13, req_length, modified)
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -695,6 +739,34 @@ impl Store {
             params![note, color, id as i64],
         )?;
         Ok(())
+    }
+
+    /// Highlight (or un-highlight) many flows at once, leaving each one's note alone.
+    ///
+    /// Select-all then highlight used to be one `set_meta` round trip PER FLOW, so a
+    /// 39,662-row project issued 39,662 commands that each took this mutex on the UI
+    /// thread. Chunked and generation-guarded exactly like `delete`: these ids are only
+    /// meaningful in the project they were read from, and a swap partway must stop the
+    /// update rather than paint rows in another engagement's file. Returns how many ids
+    /// were applied, which is less than `ids.len()` only when the project changed.
+    pub fn set_color(&self, ids: &[u64], color: &str, gen: u64) -> Result<usize> {
+        let mut done = 0;
+        for chunk in ids.chunks(Self::DELETE_CHUNK) {
+            let mut db = self.db.lock().unwrap();
+            if self.generation.load(Ordering::SeqCst) != gen {
+                break;
+            }
+            let tx = db.conn.transaction()?;
+            {
+                let mut stmt = tx.prepare("UPDATE flows SET color = ?1 WHERE id = ?2")?;
+                for id in chunk {
+                    stmt.execute(params![color, *id as i64])?;
+                }
+            }
+            tx.commit()?;
+            done += chunk.len();
+        }
+        Ok(done)
     }
 
     /// Project-level setting (scope, Repeater tabs, …), stored as JSON.
@@ -978,9 +1050,14 @@ impl Store {
         params.push(Box::new(after as i64));
         let after_n = params.len();
 
+        // COALESCE is load-bearing: SQLite's SUBSTR over a ZERO-LENGTH blob returns NULL,
+        // not an empty blob (`SELECT typeof(SUBSTR(X'', 1, 10))` is 'null'). An empty
+        // payload is the normal shape of a keepalive ping or pong, so without this one
+        // control frame makes the whole page fail to decode with "Invalid column type
+        // Null", and a long-lived socket is exactly where those frames live.
         let mut sql = format!(
             "SELECT m.id, m.flow_id, m.ts, m.direction, m.opcode, m.length,
-                    SUBSTR(m.data, 1, ?{cap_n}), LENGTH(m.data)
+                    COALESCE(SUBSTR(m.data, 1, ?{cap_n}), X''), LENGTH(m.data)
              FROM ws_messages m"
         );
         if fts.is_some() {
@@ -1227,6 +1304,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("note", "TEXT NOT NULL DEFAULT ''"),
         ("color", "TEXT NOT NULL DEFAULT ''"),
         ("truncated", "INTEGER NOT NULL DEFAULT 0"),
+        ("unsent", "INTEGER NOT NULL DEFAULT 0"),
         ("variants", "TEXT"),
     ];
     for (col, def) in added {
@@ -1237,7 +1315,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn summary_from_row(r: &Row, meta_idx: usize, req_length: usize, modified: bool) -> rusqlite::Result<FlowSummary> {
+fn summary_from_row(r: &Row, meta_idx: usize, unsent_idx: usize, req_length: usize, modified: bool) -> rusqlite::Result<FlowSummary> {
     Ok(FlowSummary {
         id: r.get::<_, i64>(0)? as u64,
         ts: r.get::<_, i64>(1)? as u64,
@@ -1254,6 +1332,12 @@ fn summary_from_row(r: &Row, meta_idx: usize, req_length: usize, modified: bool)
         note: r.get(meta_idx)?,
         color: r.get(meta_idx + 1)?,
         streaming: false,
+        // Not persisted, so a reloaded row is never "still waiting": nothing in this
+        // process is waiting for it any more.
+        pending: false,
+        // This one IS persisted: whether the target ever saw the request cannot be
+        // worked out again from anything else on the row.
+        unsent: r.get::<_, i64>(unsent_idx)? != 0,
         modified,
     })
 }
@@ -1268,7 +1352,7 @@ fn flow_from_row(r: &Row) -> rusqlite::Result<Flow> {
         gen: 0,
         req_truncated: truncated & 1 != 0,
         res_truncated: truncated & 2 != 0,
-        summary: summary_from_row(r, 18, req_body.len(), modified)?,
+        summary: summary_from_row(r, 18, 22, req_body.len(), modified)?,
         version: r.get(11)?,
         req_headers: json_col(r, 12)?,
         req_body,
@@ -1435,6 +1519,109 @@ mod tests {
     /// A delete larger than one chunk must still remove everything. The chunking exists
     /// because a single transaction over a large History holds every dirty FTS page until
     /// the commit; it must not turn into a delete that only half happens.
+    /// A fresh store at a name of its own, so these can run alongside each other.
+    #[cfg(test)]
+    fn store_named(tag: &str) -> (Store, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("ngintip-{tag}-{}.ngintip", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        (store, path)
+    }
+
+    #[test]
+    fn ws_page_survives_an_empty_payload() {
+        // A keepalive ping carries no payload, and SQLite's SUBSTR over a zero-length
+        // blob answers NULL rather than an empty blob. Reading a page of messages used
+        // to fail outright for any socket that had been open long enough to be pinged,
+        // which is every long-lived one. Measured against the live capture before the
+        // fix: "Invalid column type Null at index: 6".
+        let (store, path) = store_named("ws-empty");
+        let flow = add_flows(&store, 1)[0];
+        store.push_ws(flow, 1, "client", 1, 5, b"hello").unwrap();
+        store.push_ws(flow, 2, "server", 9, 0, b"").unwrap(); // ping, no payload
+        store.push_ws(flow, 3, "client", 10, 0, b"").unwrap(); // pong, no payload
+        store.push_ws(flow, 4, "server", 1, 3, b"bye").unwrap();
+
+        let page = store.ws_page(flow, 0, None, None, 50, 4096).unwrap();
+        assert_eq!(page.len(), 4, "every message comes back, control frames included");
+        assert_eq!(page[0].msg.data.as_ref(), b"hello");
+        assert!(page[1].msg.data.is_empty(), "an empty ping reads as empty, not as an error");
+        assert_eq!(page[1].msg.opcode, 9);
+        assert_eq!(page[1].stored, 0);
+        assert_eq!(page[3].msg.data.as_ref(), b"bye");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(test)]
+    fn add_flows(store: &Store, n: usize) -> Vec<u64> {
+        let uri: Uri = "http://a.test/x".parse().unwrap();
+        let mut ids = Vec::with_capacity(n);
+        for _ in 0..n {
+            let id = store.next_id();
+            ids.push(id);
+            store
+                .push(Flow::request(id, &Method::GET, &uri, Version::HTTP_11, &HeaderMap::new(), Bytes::new()))
+                .unwrap();
+        }
+        ids
+    }
+
+    #[test]
+    fn highlighting_many_flows_spans_chunks_and_keeps_notes() {
+        let (store, path) = store_named("hl-chunk");
+        let n = Store::DELETE_CHUNK + 13; // deliberately not a multiple of the chunk
+        let ids = add_flows(&store, n);
+        // Every other flow carries a note, which the bulk highlight must not disturb:
+        // the whole reason for the bulk path is that it does not read or rewrite notes.
+        for (i, id) in ids.iter().enumerate() {
+            if i % 2 == 0 {
+                store.set_meta(*id, "operator note", "").unwrap();
+            }
+        }
+        let gen = store.generation();
+        assert_eq!(store.set_color(&ids, "red", gen).unwrap(), ids.len(), "every id applied");
+
+        let rows = store.summaries().unwrap();
+        assert_eq!(rows.len(), n);
+        assert!(rows.iter().all(|r| r.color == "red"), "all highlighted across chunk boundaries");
+        let noted = rows.iter().filter(|r| r.note == "operator note").count();
+        assert_eq!(noted, n.div_ceil(2), "notes survived the highlight");
+
+        // Clearing the highlight is the same path with an empty colour.
+        assert_eq!(store.set_color(&ids, "", gen).unwrap(), ids.len());
+        let rows = store.summaries().unwrap();
+        assert!(rows.iter().all(|r| r.color.is_empty()), "all cleared");
+        assert_eq!(rows.iter().filter(|r| r.note == "operator note").count(), noted, "notes still there");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn highlighting_stops_when_another_project_is_opened() {
+        let (store, path) = store_named("hl-gen");
+        let ids = add_flows(&store, Store::DELETE_CHUNK * 2);
+        // A generation that is not the current one means these ids were read out of a
+        // project that is no longer open. Ids repeat across projects, so applying them
+        // would highlight unrelated rows in somebody else's engagement.
+        let stale = store.generation() + 1;
+        assert_eq!(store.set_color(&ids, "red", stale).unwrap(), 0, "nothing applied");
+        assert!(store.summaries().unwrap().iter().all(|r| r.color.is_empty()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn highlighting_ignores_ids_the_project_does_not_have() {
+        let (store, path) = store_named("hl-missing");
+        let ids = add_flows(&store, 1);
+        let gen = store.generation();
+        // An id from another project simply is not there: the UPDATE matches nothing, and
+        // that is not an error.
+        store.set_color(&[ids[0], ids[0] + 9999], "amber", gen).unwrap();
+        let rows = store.summaries().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].color, "amber");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn delete_spans_more_than_one_chunk() {
         let path = std::env::temp_dir().join(format!("ngintip-chunk-{}.ngintip", std::process::id()));
@@ -1616,13 +1803,19 @@ mod tests {
         let path = std::env::temp_dir().join(format!("intip-test-{}.intip", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
-        // A project created before note/color/truncated existed.
+        // A project created before note/color/truncated/unsent existed.
         let old = Connection::open(&path).unwrap();
-        let old_schema = SCHEMA.replace(
-            ",\n    note        TEXT    NOT NULL DEFAULT '',\n    color       TEXT    NOT NULL DEFAULT '',\n    -- bit 1: request body truncated, bit 2: response body truncated\n    truncated   INTEGER NOT NULL DEFAULT 0",
-            "",
-        );
+        let old_schema = SCHEMA
+            .replace(
+                ",\n    note        TEXT    NOT NULL DEFAULT '',\n    color       TEXT    NOT NULL DEFAULT '',\n    -- bit 1: request body truncated, bit 2: response body truncated\n    truncated   INTEGER NOT NULL DEFAULT 0",
+                "",
+            )
+            .replace(
+                ",\n    -- 1 when the client gave up before the request was handed upstream, so the target\n    -- never saw it. Only meaningful on a row that has no response.\n    unsent      INTEGER NOT NULL DEFAULT 0",
+                "",
+            );
         assert!(!old_schema.contains("color"), "old schema really lacks the new columns");
+        assert!(!old_schema.contains("unsent"), "old schema really lacks unsent");
         old.execute_batch(&old_schema).unwrap();
         drop(old);
 
@@ -1635,6 +1828,20 @@ mod tests {
         let s = &store.summaries().unwrap()[0];
         assert_eq!((s.note.as_str(), s.color.as_str()), ("cek IDOR di sini", "red"));
         assert_eq!(store.get(id).unwrap().unwrap().summary.note, "cek IDOR di sini");
+        // A column the migration added reads false for a row written before it existed,
+        // which is the right answer: nothing was ever recorded about this one.
+        assert!(!s.unsent, "a migrated row is not claimed to have gone unsent");
+
+        // And it survives a round trip, unlike `pending`, which is deliberately not
+        // stored. Whether the target ever saw the request cannot be worked out again.
+        let mut never_sent = Flow::request(store.next_id(), &Method::GET, &uri, Version::HTTP_11, &HeaderMap::new(), Bytes::new());
+        never_sent.summary.unsent = true;
+        let sid = store.push(never_sent).unwrap().id;
+        let reread = store.summaries().unwrap();
+        let back = reread.iter().find(|f| f.id == sid).unwrap();
+        assert!(back.unsent, "unsent is persisted");
+        assert!(!back.pending, "pending is not");
+        assert!(store.get(sid).unwrap().unwrap().summary.unsent, "and the full read agrees");
 
         let _ = std::fs::remove_file(&path);
     }

@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Docs - Ngintip docs</title>
+    <meta name="description" content="Documentation for Ngintip, an intercepting HTTP(S) proxy." />
+    <meta name="theme-color" id="tc" content="#f5f6f9" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="Docs - Ngintip docs" />
+    <meta property="og:description" content="Documentation for Ngintip, an intercepting HTTP(S) proxy." />
+    <meta property="og:url" content="https://seclab-id.github.io/ngintip/docs.html" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="style.css" />
+    <script>
+      try {
+        var t = localStorage.getItem('ngintip.site.theme');
+        if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+      } catch (e) {}
+      try {
+        var dark =
+          document.documentElement.dataset.theme === 'dark' ||
+          (!document.documentElement.dataset.theme && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        if (dark) document.getElementById('tc').content = '#0d0f14';
+      } catch (e) {}
+    </script>
+  </head>
+  <body class="doc">
+    <div class="peek" aria-hidden="true">
+      <svg class="eye" viewBox="0 0 120 64" aria-hidden="true">
+        <path class="eye-shape" d="M5 32s19-25 55-25 55 25 55 25-19 25-55 25S5 32 5 32z" />
+        <circle class="eye-iris" cx="60" cy="32" r="12" />
+        <circle class="eye-spark" cx="64.5" cy="27.5" r="3.4" />
+      </svg>
+      <span class="lid top"></span>
+      <span class="lid bottom"></span>
+    </div>
+    <a class="skip" href="#main">Skip to content</a>
+
+    <header class="topbar">
+      <a class="brand" href="./" aria-label="Ngintip home">
+        <span class="badge" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" /><circle cx="12" cy="12" r="3" /></svg>
+        </span>
+        <span class="brand-name">Ngintip</span>
+      </a>
+      <nav aria-label="Sections">
+        <a href="./">Home</a>
+        <a href="https://github.com/seclab-id/ngintip/releases/latest">Download</a>
+        <a href="https://github.com/seclab-id/ngintip">GitHub</a>
+      </nav>
+      <button id="theme" class="icon-btn" type="button" aria-label="Switch theme" title="Switch theme">
+        <svg viewBox="0 0 24 24" aria-hidden="true" class="sun"><circle cx="12" cy="12" r="4.2" /><path d="M12 2.5v2M12 19.5v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M2.5 12h2M19.5 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4" /></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true" class="moon"><path d="M20 14.2A8 8 0 0 1 9.8 4 8.1 8.1 0 1 0 20 14.2z" /></svg>
+      </button>
+    </header>
+
+    <div class="doc-wrap">
+      <aside class="toc">
+        <nav aria-label="Documentation">
+          <p class="toc-title">Ngintip docs</p>
+          <a href="docs.html" aria-current="page">Overview</a>
+          <a href="performance.html">Performance</a>
+          <p class="toc-title">Getting started</p>
+          <a href="install.html">Install</a>
+          <a href="start.html">First run and the CA</a>
+          <a href="browser.html">Built-in browser</a>
+          <p class="toc-title">Capture</p>
+          <a href="history.html">History</a>
+          <a href="intercept.html">Intercept</a>
+          <p class="toc-title">Replay</p>
+          <a href="repeater.html">Repeater</a>
+          <a href="intruder.html">Intruder</a>
+          <a href="organizer.html">Organizer</a>
+          <p class="toc-title">Automation</p>
+          <a href="automation.html">Rules and Passive Scan</a>
+          <a href="extensions.html">Extensions</a>
+          <a href="mcp.html">MCP server</a>
+          <p class="toc-title">Reference</p>
+          <a href="tools.html">Decoder and Comparer</a>
+          <a href="projects.html">Projects and Footprint</a>
+          <a href="about.html">About</a>
+        </nav>
+      </aside>
+
+      <article class="prose" id="main">
+        <h1>Docs</h1>
+        <p class="section-lead">
+  Ngintip is an intercepting HTTP(S) proxy: a Rust backend (tokio, hyper, rustls, rcgen) in a Tauri 2 window. Start
+  with Install, then First run. Everything after that is one page per tool.
+</p>
+<p>The app also carries a Guide page with every keyboard shortcut, which this site does not try to duplicate.</p>
+
+<h2></h2>
+<div class="cards">
+<a class="card" href="performance.html"><h3>Performance</h3><p>What one real engagement costs on disk: 41,692 requests, 123 hosts, nine days, one 412 MB file.</p></a>
+</div>
+<h2>Getting started</h2>
+<div class="cards">
+<a class="card" href="install.html"><h3>Install</h3><p>Download a native build of Ngintip for macOS, Windows or Linux, or build it from source.</p></a>
+<a class="card" href="start.html"><h3>First run and the CA</h3><p>Point a client at the proxy on 127.0.0.1:8080, trust the generated root CA, and set your scope.</p></a>
+<a class="card" href="browser.html"><h3>Built-in browser</h3><p>Launch a Chromium already wired to the proxy, with its own profile, downloaded if you do not have one.</p></a>
+</div>
+<h2>Capture</h2>
+<div class="cards">
+<a class="card" href="history.html"><h3>History</h3><p>The capture table: scope filtering, full-text body search, sitemap, viewers and export.</p></a>
+<a class="card" href="intercept.html"><h3>Intercept</h3><p>Hold a request, a response or a WebSocket frame, edit it, then forward or drop it.</p></a>
+</div>
+<h2>Replay</h2>
+<div class="cards">
+<a class="card" href="repeater.html"><h3>Repeater</h3><p>Resend and edit requests in tabs, with bodies that keep the bytes you typed, and capture images.</p></a>
+<a class="card" href="intruder.html"><h3>Intruder</h3><p>Sniper, battering ram, pitchfork and cluster bomb, with a wordlist per position.</p></a>
+<a class="card" href="organizer.html"><h3>Organizer</h3><p>Collections of saved requests, kept with the project and re-runnable later.</p></a>
+</div>
+<h2>Automation</h2>
+<div class="cards">
+<a class="card" href="automation.html"><h3>Rules and Passive Scan</h3><p>Regex match and replace rules, and passive rules that read captured traffic.</p></a>
+<a class="card" href="extensions.html"><h3>Extensions</h3><p>Python hooks: change traffic on the wire, decode a body for reading, or re-encode it on send.</p></a>
+<a class="card" href="mcp.html"><h3>MCP server</h3><p>Expose the capture to an AI client over a local-only MCP server.</p></a>
+</div>
+<h2>Reference</h2>
+<div class="cards">
+<a class="card" href="tools.html"><h3>Decoder and Comparer</h3><p>Decoder for Base64, URL, entities, hex, JWT and hashes, plus a word or byte comparer.</p></a>
+<a class="card" href="projects.html"><h3>Projects and Footprint</h3><p>One SQLite file per engagement, and the three decisions behind the footprint.</p></a>
+<a class="card" href="about.html"><h3>About</h3><p>Who built Ngintip, and the reason it exists: one more option, lighter and faster than what was around.</p></a>
+</div>
+        <nav class="pager" aria-label="Page">
+          <span></span>
+          <a class="next" href="performance.html"><span>Next</span>Performance</a>
+        </nav>
+      </article>
+    </div>
+
+    <footer>
+      <div class="foot-row">
+        <a class="brand small" href="./">
+          <span class="badge" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" /><circle cx="12" cy="12" r="3" /></svg>
+          </span>
+          <span class="brand-name">Ngintip</span>
+        </a>
+        <nav aria-label="Links">
+          <a href="docs.html">Docs</a>
+          <a href="https://github.com/seclab-id/ngintip">Repository</a>
+          <a href="https://github.com/seclab-id/ngintip/releases">Releases</a>
+          <a href="https://github.com/seclab-id/ngintip/issues">Issues</a>
+        </nav>
+      </div>
+    </footer>
+
+    <script src="app.js" defer></script>
+  </body>
+</html>

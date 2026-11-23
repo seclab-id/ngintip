@@ -596,6 +596,103 @@ mod tests {
     }
 
     #[test]
+    fn zero_length_frames_are_still_messages() {
+        // An empty payload is the normal shape of a keepalive ping, of a pong answering
+        // one, and of a close with no code. Every layer downstream has to survive it:
+        // this is the shape that made a page of stored messages fail to decode at all.
+        let mut bytes = frame(0x1, true, b"", None); // empty text
+        bytes.extend(frame(0x9, true, b"", None)); // ping, no payload
+        bytes.extend(frame(0xa, true, b"", Some([7, 7, 7, 7]))); // masked empty pong
+        bytes.extend(frame(0x8, true, b"", None)); // close, no code
+
+        let mut p = Parser::default();
+        let msgs = p.feed(&bytes);
+        assert_eq!(msgs.len(), 4, "an empty frame is a message, not a nothing");
+        for m in &msgs {
+            assert_eq!(m.length, 0);
+            assert!(m.data.is_empty());
+        }
+        assert_eq!(msgs.iter().map(|m| m.opcode).collect::<Vec<_>>(), vec![0x1, 0x9, 0xa, 0x8]);
+        assert_eq!(display(0x8, &Bytes::new()), "close");
+    }
+
+    #[test]
+    fn utf8_split_across_a_fragment_boundary_reassembles() {
+        // A sender may cut a fragment anywhere, including the middle of a multi-byte
+        // character. Each half is mojibake on its own; only the reassembled message is
+        // the text that was sent, so decoding has to happen after the join, not before.
+        let text = "harga Rp10.000 ✓ naïve";
+        let raw = text.as_bytes();
+        let cut = raw.iter().position(|&b| b == 0xe2).unwrap() + 1; // inside the ✓
+        assert!(std::str::from_utf8(&raw[..cut]).is_err(), "the cut really splits a character");
+
+        let mut bytes = frame(0x1, false, &raw[..cut], None);
+        bytes.extend(frame(0x0, true, &raw[cut..], None));
+        let mut p = Parser::default();
+        let msgs = p.feed(&bytes);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(display(msgs[0].opcode, &Bytes::from(msgs[0].data.clone())), text);
+    }
+
+    #[test]
+    fn every_payload_length_path_round_trips() {
+        // RFC 6455 switches header shape at 126 and at 65536. The boundaries are where
+        // an off-by-one lives, so each one is walked rather than assumed.
+        for n in [0usize, 1, 125, 126, 127, 65535, 65536, 65537] {
+            let payload = vec![b'z'; n];
+            let mut p = Parser::default();
+            let msgs = p.feed(&frame(0x2, true, &payload, None));
+            assert_eq!(msgs.len(), 1, "len {n}");
+            assert_eq!(msgs[0].length, n as u64, "declared length at {n}");
+            assert_eq!(msgs[0].data.len(), n, "stored bytes at {n}");
+        }
+    }
+
+    #[test]
+    fn a_close_frame_reads_as_its_code_and_reason() {
+        // The code is the whole point of a close: 1000 is a normal goodbye and 1011 is
+        // the server admitting a fault, and a capture that renders both as "closed" has
+        // thrown away the only part worth reading.
+        let close = |payload: &[u8]| display(0x8, &Bytes::copy_from_slice(payload));
+        let mut with_reason = 1011u16.to_be_bytes().to_vec();
+        with_reason.extend_from_slice(b"policy");
+        assert_eq!(close(&with_reason), "close 1011 policy");
+        assert_eq!(close(&1000u16.to_be_bytes()), "close 1000");
+        assert_eq!(close(b""), "close");
+        // One byte is not a code. It must read as suspect rather than panic on a slice.
+        assert!(close(b"\x03").starts_with("close (invalid payload"));
+    }
+
+    #[test]
+    fn binary_is_shown_as_bytes_only_when_it_is_not_text() {
+        // A "binary" frame carrying UTF-8 is common (many clients send JSON as 0x2), so
+        // it reads as text. One carrying NULs or invalid UTF-8 becomes a hex dump, which
+        // is the honest rendering and the one a proxy must not get backwards.
+        let json = Bytes::from_static(br#"{"ok":true}"#);
+        assert_eq!(display(0x2, &json), r#"{"ok":true}"#);
+        let png = Bytes::from_static(b"\x89PNG\r\n\x1a\n\x00\x00");
+        let shown = display(0x2, &png);
+        assert!(shown.contains("89 50 4e 47"), "a PNG header dumps as hex, got: {shown}");
+    }
+
+    #[test]
+    fn malformed_framing_is_survived_rather_than_trusted() {
+        // None of this is legal traffic, which is exactly why it turns up: a continuation
+        // with nothing to continue, reserved opcodes, and several complete frames in one
+        // chunk. The parser must keep its footing and keep reading.
+        let mut bytes = frame(0x0, true, b"orphan", None); // continuation, no start
+        bytes.extend(frame(0x3, true, b"reserved-data", None)); // reserved data opcode
+        bytes.extend(frame(0xb, true, b"reserved-ctl", None)); // reserved control opcode
+        bytes.extend(frame(0x1, true, b"still here", None)); // and a normal message after
+
+        let mut p = Parser::default();
+        let msgs = p.feed(&bytes);
+        let last = msgs.last().expect("the parser keeps reading after the odd frames");
+        assert_eq!((last.opcode, &last.data[..]), (0x1, &b"still here"[..]));
+        assert!(msgs.len() >= 2, "the odd frames are reported, not silently eaten: {msgs:?}");
+    }
+
+    #[test]
     fn huge_message_is_capped_but_counted() {
         let big = vec![b'x'; WS_CAPTURE_LIMIT + 10];
         let mut p = Parser::default();

@@ -126,9 +126,70 @@ fn proc_message(start_line: &str, headers: &[(String, String)], body: &[u8]) -> 
 }
 
 fn response_text_impl(f: &Flow, full: bool) -> String {
-    // No status line means the request never got a response.
+    // No status line means no response is on file, and that is three different
+    // situations, not one. Telling them apart is the whole point: only one of them is
+    // a failure, and only one of them names the target as the party at fault.
     if f.res_version.is_empty() {
-        let err = f.summary.error.as_deref().unwrap_or("no response");
+        // Still out there. Nothing has gone wrong, so nothing is reported as wrong.
+        if f.summary.pending {
+            return concat!(
+                "-- waiting for the response --\n",
+                "The request is out at the target and no answer has arrived yet. Nothing has\n",
+                "failed, and Ngintip sets no deadline of its own: it waits for as long as the\n",
+                "client holding this exchange open is willing to wait.\n",
+                "\n",
+                "This pane fills in by itself the moment a response is recorded.",
+            )
+            .to_string();
+        }
+        // The client gave up while Ngintip still had the request, so the target was
+        // never asked. Said first because it is the stronger fact: there is no exchange
+        // with the target to reason about at all, and reading this row as evidence that
+        // the target was reached would be reading it exactly backwards.
+        if f.summary.unsent {
+            return concat!(
+                "-- the request never left Ngintip --\n",
+                "The client gave up before this request was handed to the target, so the target\n",
+                "never saw it and never had anything to answer.\n",
+                "\n",
+                "That window is Ngintip's own work on the request: an extension's process_request\n",
+                "hook, which runs as a separate process. A client whose timeout is shorter than\n",
+                "that hook takes hangs up inside it.\n",
+                "\n",
+                "The request is kept because it is what the client asked for, which is evidence\n",
+                "in its own right. It is not evidence about the target.",
+            )
+            .to_string();
+        }
+        // No answer, and nothing is waiting for one any more. Said of the record, not
+        // of the target. Deliberately not "nothing came back": that reads as a target
+        // that went silent, and the usual cause is the opposite. The target answers
+        // fine and there is no longer anything holding the question.
+        let no_answer = concat!(
+            "-- no response recorded --\n",
+            "No answer was ever filed for this request. That is a fact about this record and\n",
+            "not about the target, which may have answered perfectly well.\n",
+            "\n",
+            "The exchange waiting for that answer belongs to the client's connection. When the\n",
+            "client reaches its own timeout and hangs up, the exchange is torn down, and the\n",
+            "part of it that was waiting upstream goes with it: the answer arrives with nothing\n",
+            "left holding the question. The request itself was not withdrawn from the target.\n",
+            "\n",
+            "A target that really failed is recorded with its own failure message instead of\n",
+            "this one, so do not write this up as a timeout or a broken endpoint.",
+        );
+        let Some(err) = f.summary.error.as_deref() else {
+            // An empty error is now how an unanswered request is stored, so this is the
+            // ordinary case: a row reopened from a project file, or one whose client
+            // left while this session was running.
+            return no_answer.to_string();
+        };
+        // Builds before the `pending` flag existed put a sentence in `error` for the
+        // same state, including an older wording of it. Those rows sit in live project
+        // files and a text column has no migration, so they are still read as this.
+        if err.ends_with(crate::proxy::NO_RESPONSE) {
+            return no_answer.to_string();
+        }
         return format!("-- upstream error --\n{err}");
     }
     let start = format!("{} {} {}", f.res_version, f.summary.status, f.res_reason);
@@ -595,6 +656,29 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row with no response must not be presented as a target that failed. One of
+    /// these is Ngintip saying it has no answer on record; the other is the target
+    /// refusing to give one, and they get different headings.
+    #[test]
+    fn a_missing_response_is_only_called_an_upstream_error_when_it_was_one() {
+        let mut waiting = Flow::request(1, &http::Method::GET, &"http://h/p".parse().unwrap(), http::Version::HTTP_11, &http::HeaderMap::new(), bytes::Bytes::new());
+        waiting.set_error(crate::proxy::NO_RESPONSE.to_string());
+        let shown = response_text(&waiting);
+        assert!(shown.starts_with("-- no response recorded --"), "{shown}");
+        assert!(!shown.contains("upstream error"), "{shown}");
+
+        // A row written by the earlier wording of the same state reads the same way.
+        let mut older = waiting.clone();
+        older.set_error("sent upstream, no response recorded".to_string());
+        assert!(response_text(&older).starts_with("-- no response recorded --"));
+
+        let mut failed = waiting.clone();
+        failed.set_error("connection error: Operation timed out (os error 60)".to_string());
+        let shown = response_text(&failed);
+        assert!(shown.starts_with("-- upstream error --"), "{shown}");
+        assert!(shown.contains("os error 60"), "{shown}");
+    }
 
     #[test]
     fn restores_crlf_like_the_original() {

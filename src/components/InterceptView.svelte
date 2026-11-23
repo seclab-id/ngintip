@@ -3,10 +3,11 @@
   import CodeEditor from './CodeEditor.svelte';
   import MiniDecoder from './MiniDecoder.svelte';
   import ContextMenu from './ContextMenu.svelte';
+  import SelectionAction from './SelectionAction.svelte';
   import Modal from './Modal.svelte';
   import FindBar from './FindBar.svelte';
   import { matchRanges, markHtmlRanges } from '../lib/find.js';
-  import { autoDecode } from '../lib/codec.js';
+  import { decodeHint } from '../lib/codec.js';
   import { store } from '../lib/store.svelte.js';
   import { methodClass, statusClass, fmtDateTime } from '../lib/format.js';
   import { prettyBody, splitMessage } from '../lib/message.js';
@@ -67,16 +68,26 @@
     it.selectedKey;
     wsIt.selectedKey;
     miniDecode = null;
+    chip = null;
   });
 
-  /** Selection inside `el`, when it is worth decoding (JWT, Base64, URL, hex, entities). */
-  function decodeSelection(el) {
+  // A selection in the held message puts a Decode chip at the pointer; the dock opens
+  // only when it is clicked. See SelectionAction.
+  let chip = $state(null); // { text, x, y, hint }
+
+  function offerDecode(el, e) {
     const sel = window.getSelection?.();
-    if (!sel || sel.isCollapsed) return;
+    if (!sel || sel.isCollapsed) {
+      chip = null;
+      return;
+    }
     if (el && sel.anchorNode && !el.contains(sel.anchorNode)) return;
     const text = sel.toString();
-    // Selecting ordinary text (to copy a header, say) must not pop the side bar.
-    if (text.trim() && text.length <= 100_000 && autoDecode(text).length) miniDecode = { text };
+    if (!text.trim() || text.length > 100_000) {
+      chip = null;
+      return;
+    }
+    chip = { text, x: e.clientX + 8, y: e.clientY + 14, hint: decodeHint(text) };
   }
 
   let selected = $derived(it.queue.find((q) => q.key === it.selectedKey));
@@ -321,7 +332,7 @@
       </p>
     </div>
   {:else}
-    <div class="grid">
+    <div class="grid" class:with-decoder={miniDecode}>
       <div class="panel queue">
         <header class="panel-head"><span class="panel-title">Queue</span></header>
         <div class="list">
@@ -415,7 +426,7 @@
             bind:this={origPre}
             onpointerenter={() => (origHovered = true)}
             onpointerleave={() => (origHovered = false)}
-            onpointerup={() => decodeSelection(origPre)}>{@html origBody}</pre>
+            onpointerup={(e) => offerDecode(origPre, e)}>{@html origBody}</pre>
           {#if origFindOpen}
             <FindBar bind:value={origQuery} bind:opts={origOpts} error={origMatches?.error} count={origMatches?.count ?? 0} index={origIdx} oninput={() => (origIdx = 0)} onstep={origStep} onclose={closeOrigFind} />
           {/if}
@@ -432,6 +443,18 @@
       {/if}
       {#if miniDecode}
         <aside class="decoder-dock"><MiniDecoder text={miniDecode.text} onclose={() => (miniDecode = null)} /></aside>
+      {/if}
+      {#if chip}
+        <SelectionAction
+          x={chip.x}
+          y={chip.y}
+          hint={chip.hint}
+          onpick={() => {
+            miniDecode = { text: chip.text };
+            chip = null;
+          }}
+          onclose={() => (chip = null)}
+        />
       {/if}
     </div>
   {/if}
@@ -637,15 +660,15 @@
     min-height: 0;
     padding: 10px;
   }
+  /* A column of its own rather than a floating panel over the message, for the same
+     reason as Repeater: a held request is what you are reading while you decode a
+     snippet of it. */
+  .grid.with-decoder {
+    grid-template-columns: minmax(220px, 300px) minmax(0, 1fr) auto;
+  }
   .decoder-dock {
-    position: absolute;
-    top: 10px;
-    right: 10px;
-    bottom: 10px;
-    z-index: 6;
     min-width: 0;
     min-height: 0;
-    border-radius: var(--radius);
   }
   .list {
     overflow: auto;

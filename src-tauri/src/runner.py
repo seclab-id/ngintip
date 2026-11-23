@@ -297,6 +297,19 @@ def _load(path):
     return module
 
 
+def _snapshot(msg):
+    """Everything a hook could have changed, cheap enough to take on every call.
+
+    Comparing two snapshots answers one question: did the hook touch anything? The
+    body is held by reference, so an untouched one compares by identity and costs
+    nothing. Serializing instead would be simpler but would recompute
+    Content-Length, and a hook that wants to see a Content-Length that disagrees
+    with the body (request smuggling work) has to keep seeing the one off the wire.
+    """
+    start = (msg.method, msg.path, msg.version) if msg.is_request else (msg.version, msg.status, msg.reason)
+    return start, tuple(tuple(it) for it in msg.headers._items), msg._body
+
+
 def _result_bytes(result, msg):
     if result is None:
         return msg.to_bytes()
@@ -334,7 +347,17 @@ def main():
             else:
                 msg = HttpMessage(raw, is_request)
                 ctx = Ctx(envelope.get("ctx"))
-                out = _result_bytes(_call(fn, msg, ctx), msg)
+                before = _snapshot(msg)
+                result = _call(fn, msg, ctx)
+                if result is None and _snapshot(msg) == before:
+                    # The hook only looked. Hand the host back its own bytes:
+                    # re-serializing turns \n into \r\n and recomputes
+                    # Content-Length, and the host decides "edited" by comparing
+                    # bytes, so a hook that merely logs would mark every flow as
+                    # modified and fill History with Original vs Final tabs.
+                    out = raw
+                else:
+                    out = _result_bytes(result, msg)
             reply = {"ok": True, "data": base64.b64encode(out).decode("ascii")}
         except Exception as exc:
             reply = {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}

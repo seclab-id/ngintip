@@ -9,8 +9,15 @@ export const SAVED_COLUMNS = [
   { key: 'host', label: 'Host' },
   { key: 'path', label: 'Path' },
   { key: 'status', label: 'Status' },
+  // Same two numbers History shows, under the same names, so a saved record can be
+  // read without going back to the flow it came from.
+  { key: 'durationMs', label: 'Took' },
+  { key: 'length', label: 'Resp size' },
   { key: 'label', label: 'Label' },
 ];
+
+/** Columns sorted as numbers. The rest sort as text. */
+const NUMERIC = new Set(['status', 'durationMs', 'length']);
 
 const text = (v) => String(v ?? '').toLowerCase();
 
@@ -25,7 +32,11 @@ export function savedRows(items, query = '', key = 'n', dir = 1) {
       [it.source, it.method, it.host, it.path, it.status, it.label, it.note, it.name].some((v) => text(v).includes(q)),
     );
   }
-  const value = (r) => (key === 'n' ? r.n : key === 'status' ? Number(r.it.status) || 0 : text(r.it[key]));
+  // A record with no measurement sorts below every measured one rather than beside a
+  // genuine zero: -1 is unreachable for a duration or a size, so it cannot collide
+  // with a real 0 ms or an empty body.
+  const num = (v) => (v == null ? -1 : Number(v) || 0);
+  const value = (r) => (key === 'n' ? r.n : NUMERIC.has(key) ? num(r.it[key]) : text(r.it[key]));
   return rows.sort((a, b) => {
     const x = value(a);
     const y = value(b);

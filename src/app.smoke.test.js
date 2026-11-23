@@ -12,6 +12,10 @@ const flows = [
   { id: 2, ts: 2, method: 'POST', scheme: 'https', host: 'api.example.com', path: '/v1/login', status: 401, length: 10, reqLength: 24, mime: 'json', durationMs: 30, error: null, note: 'cek', color: 'red', streaming: false, modified: true },
   { id: 3, ts: 3, method: 'GET', scheme: 'wss', host: 'chat.example.com', path: '/socket', status: 101, length: 0, reqLength: 0, mime: '', durationMs: 5, error: null, note: '', color: '', streaming: false, modified: false },
 ];
+// Settings the app wrote, so a test can read back what was persisted.
+const settingsWritten = [];
+// What the fake backend saw the Repeater do with a socket.
+const wsRepeater = { opened: [], sent: [], closed: [] };
 // Fake Repeater history, like the repeater_history table.
 const sent = [];
 // Paths handed to save_project_as, and files that "exist" for path_exists.
@@ -85,7 +89,7 @@ function orgApply(a) {
       const it = a.item ?? {};
       const [method = 'GET', path = '/'] = String(it.request ?? '').split('\n')[0].trim().split(/\s+/).filter(Boolean);
       const host = String(it.target ?? '').replace(/^[a-z]+:\/\//i, '').split('/')[0];
-      const saved = { id: `req-${++orgSeq}`, name: it.name || `${method} ${host}${path}`, method, host, path, target: it.target ?? '', request: it.request ?? '', response: it.response ?? '', requestOriginal: it.requestOriginal ?? '', requestExtension: it.requestExtension ?? '', responseOriginal: it.responseOriginal ?? '', responseExtension: it.responseExtension ?? '', results: it.results ?? null, status: it.status ?? null, label: it.label ?? '', note: it.note ?? '', color: it.color ?? '', source: it.source ?? '', savedAt: Date.now() };
+      const saved = { id: `req-${++orgSeq}`, name: it.name || `${method} ${host}${path}`, method, host, path, target: it.target ?? '', request: it.request ?? '', response: it.response ?? '', requestOriginal: it.requestOriginal ?? '', requestExtension: it.requestExtension ?? '', responseOriginal: it.responseOriginal ?? '', responseExtension: it.responseExtension ?? '', results: it.results ?? null, messages: it.messages ?? null, status: it.status ?? null, label: it.label ?? '', note: it.note ?? '', color: it.color ?? '', source: it.source ?? '', savedAt: Date.now() };
       c.items.push(saved);
       collectionId = c.id;
       itemId = saved.id;
@@ -159,7 +163,10 @@ const backend = {
   set_scope: ({ patterns }) => patterns,
   get_rules: () => [{ enabled: true, target: 'requestHeader', match: '', replace: 'X-Test: 1', comment: '' }],
   get_setting: () => null,
-  set_setting: () => null,
+  set_setting: (args) => {
+    settingsWritten.push(args);
+    return null;
+  },
   set_invisible: () => null,
   mcp_status: () => ({ running: false, port: 8082, docsPath: '/docs' }),
   set_mcp: ({ enabled, port, docsPath }) => ({ running: enabled, port: port || 8082, docsPath: docsPath || '/docs' }),
@@ -214,6 +221,20 @@ const backend = {
   flow_body: ({ id, side }) => `FULL ${side} body for ${id} ` + 'x'.repeat(50),
   flow_image: () => null,
   flow_hex: () => '00000000  61 62 63  |abc|',
+  ws_repeater_open: ({ url }) => {
+    wsRepeater.opened.push(url);
+    return { connId: 7, flowId: 3, status: 101, handshake: 'HTTP/1.1 101 Switching Protocols' };
+  },
+  ws_repeater_send: ({ connId, kind, text, base64 }) => {
+    if (connId !== 7) throw `socket ${connId} is not open`;
+    wsRepeater.sent.push({ kind, text, base64 });
+    return 3;
+  },
+  ws_repeater_close: ({ connId, code }) => {
+    wsRepeater.closed.push({ connId, code });
+    return null;
+  },
+  ws_repeater_open_list: () => [],
   ws_messages: () => [
     { id: 1, flowId: 3, ts: 10, direction: 'client', opcode: 1, length: 11, text: '{"hi":true}' },
     { id: 2, flowId: 3, ts: 11, direction: 'server', opcode: 2, length: 2, text: '00000000  00 01' },
@@ -262,7 +283,7 @@ const { BRAND } = await import('./lib/brand.js');
 const { PANE_ATTR, LOCK_ATTR } = await import('./lib/dragselect.js');
 const APP_VERSION = BRAND.version; // from package.json, like the UI
 const { default: App } = await import('./App.svelte');
-const { store } = await import('./lib/store.svelte.js');
+const { store, FLUSH_MS } = await import('./lib/store.svelte.js');
 
 /** Calls to one command, with their arguments (the `calls` array holds names only). */
 async function invokeCallsForImpl(name) {
@@ -274,6 +295,13 @@ async function settle() {
   for (let i = 0; i < 10; i++) {
     await tick();
     await new Promise((r) => setTimeout(r, 0));
+  }
+  // Incoming flows are batched (store.FLUSH_MS) instead of applied per animation frame,
+  // so "settled" has to include that window whenever something is still waiting to be
+  // shown. Only waits when there IS something pending, so the suite does not pay for it.
+  for (let i = 0; i < 20 && store.pendingFlows; i++) {
+    await new Promise((r) => setTimeout(r, FLUSH_MS));
+    await tick();
   }
   flushSync();
 }
@@ -888,6 +916,47 @@ describe('UI smoke test', () => {
     await settle();
   });
 
+  it('captures an image from the Repeater right-click menu, request pane and response pane', async () => {
+    store.view = 'repeater';
+    await settle();
+    const t = store.repeater.tabs.find((x) => x.id === store.repeater.activeId);
+    t.raw = 'GET /shot HTTP/1.1\nHost: example.com\n\n';
+    t.target = 'https://example.com';
+    await settle();
+
+    const capItem = () => $$('.menu .item').find((b) => b.textContent.trim() === 'Capture image');
+    const closeOverlay = async () => {
+      const close = [...document.querySelectorAll('.overlay button')].find((b) => b.textContent.trim() === 'Close');
+      await click(close);
+      expect($('.overlay')).toBeNull();
+    };
+
+    // Request pane: available even before anything has been sent.
+    $$('.repeater .grid .panel')[0].dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 30, clientY: 30 }));
+    await settle();
+    expect(capItem()).toBeTruthy();
+    await click(capItem());
+    expect($('.overlay')).toBeTruthy();
+    await closeOverlay();
+
+    // Response pane: its menu only opens once there IS a response, so give it one.
+    t.response = { status: 200, durationMs: 12, length: 2, responseRaw: 'HTTP/1.1 200 OK\nContent-Type: text/plain\n\nhi' };
+    t.error = null;
+    await settle();
+    const resWrap = $('.repeater .res-wrap');
+    expect(resWrap).toBeTruthy();
+    resWrap.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 30, clientY: 30 }));
+    await settle();
+    expect(capItem()).toBeTruthy();
+    await click(capItem());
+    expect($('.overlay')).toBeTruthy();
+    await closeOverlay();
+
+    t.response = null;
+    store.view = 'history';
+    await settle();
+  });
+
   it('shows a Cancel button for an in-flight Repeater send', async () => {
     store.view = 'repeater';
     await settle();
@@ -971,6 +1040,66 @@ describe('UI smoke test', () => {
     await settle();
     expect($$('.table .row:not(.head)').length).toBe(4);
     expect(text()).toContain('99 ms');
+  });
+
+  it('batches a burst of flows into one History rebuild without losing any', async () => {
+    const before = $$('.table .row:not(.head)').length;
+    // A burst arriving faster than the batching window. Only the first is applied at
+    // once (leading edge); the rest wait out one window together instead of rebuilding
+    // History per animation frame.
+    for (let i = 10; i < 15; i++) listeners.flow({ payload: { ...flows[0], id: i, path: `/burst/${i}` } });
+    expect(store.pendingFlows).toBeGreaterThan(0);
+    await settle();
+    expect(store.pendingFlows).toBe(0);
+    expect($$('.table .row:not(.head)').length).toBe(before + 5);
+    // A re-send of one of them still replaces by id rather than adding a row.
+    listeners.flow({ payload: { ...flows[0], id: 12, path: '/burst/12', durationMs: 4242 } });
+    await settle();
+    expect($$('.table .row:not(.head)').length).toBe(before + 5);
+    expect(text()).toContain('4242 ms');
+    store.flows = store.flows.filter((f) => f.id < 10);
+    await settle();
+  });
+
+  it('comes back to History where it was left, not at the newest end', async () => {
+    store.view = 'history';
+    store.clearAllFilters();
+    await settle();
+    const vp = () => $('.table .viewport');
+    // jsdom reports 0 for scroll metrics; give the viewport a real scroll size so the
+    // tail-follow arithmetic in onScroll behaves like a browser's.
+    const size = (el) => {
+      Object.defineProperty(el, 'scrollHeight', { configurable: true, value: 4000 });
+      Object.defineProperty(el, 'clientHeight', { configurable: true, value: 200 });
+    };
+    size(vp());
+    // Scroll away from the newest end, as an operator reading an older request does.
+    vp().scrollTop = 560;
+    vp().dispatchEvent(new Event('scroll'));
+    await settle();
+    expect(store.historyScroll.follow).toBe(false);
+    expect(store.historyScroll.top).toBe(560);
+
+    // Over to Repeater and back: leaving destroys the table, so this used to come back
+    // with follow reset to true and the view snapped to the newest end.
+    store.view = 'repeater';
+    await settle();
+    store.view = 'history';
+    await settle();
+    expect(vp().scrollTop).toBe(560);
+    expect(store.historyScroll.follow).toBe(false);
+
+    // Back at the newest end, the tail follow takes over again and is remembered as such.
+    size(vp());
+    vp().scrollTop = 3800;
+    vp().dispatchEvent(new Event('scroll'));
+    await settle();
+    expect(store.historyScroll.follow).toBe(true);
+    store.historyScroll = { top: 0, follow: true };
+    store.view = 'repeater';
+    await settle();
+    store.view = 'history';
+    await settle();
   });
 
   it('captures a flow from the History context menu', async () => {
@@ -1439,6 +1568,84 @@ describe('UI smoke test', () => {
       expect(store.passiveFindings).toEqual(fromMcp);
     } finally {
       backend.get_setting = original;
+    }
+  });
+
+  it('a scan interrupted by another writer does not overwrite its rows', async () => {
+    // #mergeFindings keeps its key index across merges, so a scan no longer rebuilds a
+    // 10.000-entry Map every 16 flows. That index is only valid for the array it was
+    // built from. A scan folds in its whole accumulator each time, which is what makes
+    // it survive an MCP `passive_scan` landing mid-scan, so the second merge re-finds
+    // the keys the first one wrote. Against a stale index those keys name the wrong
+    // positions and the merge writes its own rows over whatever is sitting there.
+    store.clearPassive();
+    await settle();
+
+    const fromMcp = { key: '99|token|response|mcp-found', severity: 'high', flowId: 99, type: 'token', where: 'response', match: 'mcp-found' };
+    // Enough flows that the scan merges twice: once at 16, once at the end.
+    const LAST = 216;
+    const original = backend.get_flow;
+    let release;
+    const gate = new Promise((r) => (release = r));
+    backend.get_flow = async (args) => {
+      // One flow held back, so the replacement below lands between the two merges
+      // rather than whenever the pool happens to drain.
+      if (args?.id === LAST) await gate;
+      return args?.id >= 200 ? { ...original({ id: 2 }), summary: store.flows.find((f) => f.id === args.id) } : original(args);
+    };
+    const savedFlows = store.flows.slice();
+    try {
+      for (let id = 200; id <= LAST; id++) listeners.flow({ payload: { ...flows[1], id, path: `/scan/${id}` } });
+      await settle();
+      const scan = store.scanPassive({ rescan: true });
+      for (let i = 0; i < 300 && store.passive.done < 16; i++) await settle();
+      expect(store.passive.done).toBeGreaterThanOrEqual(16);
+      const mine = store.passiveFindings.slice();
+      expect(mine.length).toBeGreaterThan(0); // the first merge has run
+
+      // An MCP passive_scan lands: it REPLACES the array, it does not mutate it.
+      store.passiveFindings = [fromMcp, ...mine];
+      release();
+      await scan;
+      await settle();
+    } finally {
+      backend.get_flow = original;
+      store.flows = savedFlows;
+    }
+
+    expect(store.passiveFindings).toContainEqual(fromMcp);
+    // And one row per key: re-finding the same thing stays idempotent.
+    expect(new Set(store.passiveFindings.map((f) => f.key)).size).toBe(store.passiveFindings.length);
+
+    store.clearPassive();
+    await settle();
+  });
+
+  it('a request the target never saw says so in the table', async () => {
+    // The last link in that chain: the backend writes `unsent` on the row, and the
+    // table has to show it as its own thing rather than as a request the target
+    // ignored. Also checks the duration cell, which would otherwise print "0 ms" for
+    // an exchange that never happened and read as an instant answer.
+    const savedFlows = store.flows.slice();
+    const savedView = store.view;
+    try {
+      store.view = 'history';
+      await settle();
+      listeners.flow({
+        // eslint-disable-next-line prettier/prettier
+        payload: { id: 300, ts: 9, method: 'POST', scheme: 'https', host: 'api.example.com', path: '/never-left', status: 0, length: 0, reqLength: 2, mime: '', durationMs: 0, error: null, note: '', color: '', streaming: false, pending: false, unsent: true },
+      });
+      await settle();
+      const badge = $$('.badge').find((b) => b.textContent.trim() === 'UNSENT');
+      expect(badge).toBeTruthy();
+      expect(badge.getAttribute('title')).toMatch(/never saw it/);
+      // Its row's duration cell shows a dash, not a time.
+      const row = badge.closest('.row') ?? badge.parentElement?.parentElement;
+      expect(row.textContent).not.toMatch(/0 ms/);
+    } finally {
+      store.flows = savedFlows;
+      store.view = savedView;
+      await settle();
     }
   });
 
@@ -2217,6 +2424,31 @@ describe('UI smoke test', () => {
     expect(timer.textContent).toMatch(/\d+\.\d\s*s/); // e.g. "0.0s", counting up
     store.saving = false;
     await settle();
+    // Held briefly on the way out, so a fast save reads as a deliberate animation
+    // instead of a flash. The hold is on the card only: `store.saving` is already false.
+    const held = $('.decompress-timer');
+    expect(held).toBeTruthy();
+    const frozen = held.textContent;
+    await new Promise((r) => setTimeout(r, 180));
+    // And the number must NOT keep climbing through the padding: the figure on screen is
+    // the real duration of the save, not the duration of the animation.
+    expect($('.decompress-timer')?.textContent).toBe(frozen);
+    await new Promise((r) => setTimeout(r, 300));
+    await settle();
+    expect($('.decompress-timer')).toBeNull();
+  });
+
+  it('keeps the overlay wording of the operation that was running', async () => {
+    store.saving = true;
+    await settle();
+    expect(text()).toContain('Saving project');
+    store.saving = false;
+    await settle();
+    // Still on screen for the minimum, and still describing the save: reading the live
+    // flags here would flip the wording to "Opening project" on the way out.
+    expect(text()).toContain('Saving project');
+    await new Promise((r) => setTimeout(r, 450));
+    await settle();
     expect($('.decompress-timer')).toBeNull();
   });
 
@@ -2256,11 +2488,19 @@ describe('UI smoke test', () => {
     onVariant('final');
     store.view = 'passive';
     await settle();
-    // Start clean (a background auto-scan may have run already).
     store.clearPassive();
     await settle();
     expect(store.passiveFindings.length).toBe(0);
-    await click(buttonWith('Scan history'));
+
+    // Nothing has scanned, because nothing scans by itself: the screen that says so is
+    // the screen that starts one, and the button says how much it is about to read.
+    expect(text()).toContain('No findings yet');
+    // The count is what will actually be read, not how many flows exist: the socket
+    // flow is not a resource the scanner reads, so it is not offered.
+    expect(store.passivePending).toBe(2);
+    expect($('.scan-cta').textContent).toMatch(/Scan 2 flows/);
+
+    await click(buttonWith('Scan traffic'));
     await settle();
     await settle();
     // Flow #2 exposes a JWT, a permissive CORS header and a flagless cookie.
@@ -2297,12 +2537,21 @@ describe('UI smoke test', () => {
     expect(resPane.querySelector('mark.mk')).toBeTruthy();
     resPane.querySelector('.find-input')?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     await settle();
-    // Clearing removes the findings.
+    // "Delete all" removes the findings AND the record of which flows were scanned, so
+    // the scan can be run again. Dropping only the findings would leave every flow
+    // marked done and the next Scan would read nothing.
     store.view = 'passive';
     await settle();
-    await click(buttonWith('Clear'));
+    expect(store.passiveScannedCount).toBeGreaterThan(0);
+    await click(buttonWith('Delete all'));
     await answer(true);
     expect(store.passiveFindings.length).toBe(0);
+    expect(store.passiveScannedCount).toBe(0);
+    await settle();
+    await click($('.scan-cta'));
+    await settle();
+    await settle();
+    expect(store.passiveFindings.length).toBeGreaterThanOrEqual(3);
   });
 
   it('expands/collapses finding groups and persists the state', async () => {
@@ -2310,7 +2559,7 @@ describe('UI smoke test', () => {
     await settle();
     store.clearPassive();
     await settle();
-    await click(buttonWith('Scan history'));
+    await click(buttonWith('Scan traffic'));
     await settle();
     await settle();
     expect($$('.group').length).toBeGreaterThanOrEqual(1);
@@ -2345,7 +2594,7 @@ describe('UI smoke test', () => {
     await settle();
     store.clearPassive();
     await settle();
-    await click(buttonWith('Scan history'));
+    await click(buttonWith('Scan traffic'));
     await settle();
     await settle();
     const before = store.passiveFindings.length;
@@ -2370,6 +2619,16 @@ describe('UI smoke test', () => {
     expect(store.passiveFindings.length).toBe(before - firstGroupCount);
     // Deletions persist to the project.
     expect(calls).toContain('set_setting');
+
+    // ...and they stay deleted. This is the difference from "Delete all": the flows
+    // stay marked as read, so scanning again does not resurrect what was deliberately
+    // thrown away. "Delete all" forgets the reading too, which is why everything comes
+    // back after it.
+    await click(buttonWith('Done'));
+    await click(buttonWith('Scan traffic'));
+    await settle();
+    await settle();
+    expect(store.passiveFindings.length).toBe(before - firstGroupCount);
 
     store.clearPassive();
     await settle();
@@ -2641,22 +2900,46 @@ describe('UI smoke test', () => {
     expect(calls).toContain('launch_browser');
   });
 
-  it('passive: "In scope only" toggle persists', async () => {
+  it('a toast is not taken off screen by the previous toast\'s timer', async () => {
+    // Every toast used to arm its own 3.5s timer and leave it behind. Two toasts a few
+    // seconds apart meant the second one was cleared by the first one's timer, long
+    // before it had been read. It also made this suite flaky: a notice from an earlier
+    // test could reach across and clear the one a later test was asserting on.
+    vi.useFakeTimers();
+    try {
+      store.notify('first');
+      vi.advanceTimersByTime(3400);
+      store.notify('second');
+      vi.advanceTimersByTime(300); // the first toast's timer would have fired here
+      expect(store.notice?.text).toBe('second');
+      vi.advanceTimersByTime(3300); // ...and the second one keeps its own full life
+      expect(store.notice).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('passive: "In scope only" is on by default and its toggle persists', async () => {
     store.view = 'passive';
     await settle();
     const cb = $('.inscope input');
     expect(cb).toBeTruthy();
-    expect(cb.checked).toBe(false);
-    cb.checked = true;
-    cb.dispatchEvent(new Event('change', { bubbles: true }));
-    await settle();
+    // On by default: findings from a CDN or an analytics host are noise nobody asked
+    // about. With no project Scope set, "in scope" means everything, so this costs
+    // nothing until there is a scope to respect.
+    expect(cb.checked).toBe(true);
     expect(store.passiveInScopeOnly).toBe(true);
-    expect(calls).toContain('set_setting');
-    // Restore for other tests.
+
     cb.checked = false;
     cb.dispatchEvent(new Event('change', { bubbles: true }));
     await settle();
     expect(store.passiveInScopeOnly).toBe(false);
+    expect(calls).toContain('set_setting');
+    // Restore for other tests.
+    cb.checked = true;
+    cb.dispatchEvent(new Event('change', { bubbles: true }));
+    await settle();
+    expect(store.passiveInScopeOnly).toBe(true);
   });
 
   it('filters modal adds multiple include/exclude rules', async () => {
@@ -2927,6 +3210,352 @@ describe('UI smoke test', () => {
     expect(store.historySort).toEqual({ key: 'host', dir: -1 });
     backend.get_setting = saved;
     store.historySort = { key: 'id', dir: 1 };
+    await settle();
+  });
+
+  it('does not rewrite a JSON escape in a Repeater request when the view is reopened', async () => {
+    // Reported from an engagement: c in a Repeater body came back as `c` after the
+    // project was closed and opened again. The Repeater auto-beautifies a tab's body the
+    // first time that view shows it, and the old beautifier was a JSON round trip, which
+    // normalizes rather than re-indents. The rewritten body is then saved with the
+    // project, so what came back was not what had been typed.
+    //
+    // One backslash, built here so this file asserts the bytes and not an escape its own
+    // reader already resolved.
+    const B = '\\';
+    const payload = `{"user":"ad${B}u0063min","role":"user","role":"admin"}`;
+
+    store.view = 'repeater';
+    await settle();
+    const tab = store.repeater.tabs.find((t) => t.id === store.repeater.activeId);
+    tab.raw = `POST /login HTTP/1.1\nHost: example.com\nContent-Type: application/json\n\n${payload}`;
+    await settle();
+
+    // Leave and come back: the view is torn down, so the auto-beautify runs again on a
+    // body it has already seen. That is the step the report describes.
+    store.view = 'history';
+    await settle();
+    store.view = 'repeater';
+    await settle();
+
+    const t2 = store.repeater.tabs.find((t) => t.id === store.repeater.activeId);
+    expect(t2.raw).toContain(`ad${B}u0063min`);
+    expect(t2.raw).not.toContain('adcmin');
+    // The duplicate key is a payload as well, and a round trip keeps only the last one.
+    expect(t2.raw.match(/"role"/g).length).toBe(2);
+    // Re-indenting IS allowed: only the whitespace between tokens may change.
+    expect(t2.raw.replace(/\s+/g, '')).toBe(
+      `POST/loginHTTP/1.1Host:example.comContent-Type:application/json${payload}`.replace(/\s+/g, ''),
+    );
+
+    store.view = 'history';
+    await settle();
+  });
+
+  it('always answers an MCP image request, even when it cannot draw one', async () => {
+    // MCP's history_image is drawn here, in the window, because the renderer needs a
+    // canvas (src-tauri/src/render.rs explains why). The contract that matters is that
+    // the window ALWAYS replies: a caller that gets nothing can only time out, and a
+    // timeout reads as "the window is stuck" when the truth may be something else.
+    const seen = [];
+    const saved = backend.render_result;
+    backend.render_result = (args) => (seen.push(args), true);
+    try {
+      await listeners['render-flow']({ payload: { reqId: 7, flowId: 1, view: 'wire' } });
+      await settle();
+      expect(seen.length).toBe(1);
+      expect(seen[0].reqId).toBe(7);
+      // jsdom has no canvas, so this run takes the failure path on purpose. The reply is
+      // the point; the pixels are the window's own renderer, which History exercises.
+      expect(seen[0].data).toBeNull();
+      expect(String(seen[0].error)).toBeTruthy();
+      // A reply with no ticket goes nowhere rather than throwing in the listener.
+      await listeners['render-flow']({ payload: {} });
+      await settle();
+      expect(seen.length).toBe(1);
+    } finally {
+      if (saved) backend.render_result = saved;
+      else delete backend.render_result;
+    }
+  });
+
+  it('Organizer sort is persisted per project and restored on reload', async () => {
+    store.setOrganizerSort('host');
+    expect(store.organizerSort).toEqual({ key: 'host', dir: 1 });
+    store.setOrganizerSort('host');
+    expect(store.organizerSort).toEqual({ key: 'host', dir: -1 });
+    const saved = backend.get_setting;
+    backend.get_setting = ({ key }) => (key === 'organizerSort' ? { key: 'status', dir: -1 } : null);
+    await store.blankProject();
+    expect(store.organizerSort).toEqual({ key: 'status', dir: -1 });
+    // A key that is not a column of that table any more falls back to "#", so the
+    // header arrow never goes missing on a column that no longer exists.
+    backend.get_setting = ({ key }) => (key === 'organizerSort' ? { key: 'gone', dir: -1 } : null);
+    await store.blankProject();
+    expect(store.organizerSort).toEqual({ key: 'n', dir: 1 });
+    backend.get_setting = saved;
+    await settle();
+  });
+
+  it('a socket tab connects, sends frames, and can be stopped', async () => {
+    // The Repeater's socket tab is the same Repeater with frames instead of a request.
+    // What matters here is the mechanism: it opens by address, it remembers the flow
+    // the frames are recorded as, a frame leaves in the shape the operator chose, and
+    // closing really releases it rather than only greying the button.
+    wsRepeater.opened.length = 0;
+    wsRepeater.sent.length = 0;
+    wsRepeater.closed.length = 0;
+
+    store.addWsRepeaterTab({ url: 'http://127.0.0.1:6677/ws/notify' });
+    await settle();
+    const tab = store.repeater.tabs.find((t) => t.kind === 'ws');
+    expect(tab).toBeTruthy();
+    // An http:// address pasted out of History is read as the socket it is.
+    expect(tab.url).toBe('ws://127.0.0.1:6677/ws/notify');
+    expect(tab.name).toBe('127.0.0.1:6677');
+
+    await store.connectWsTab(tab);
+    expect(wsRepeater.opened).toEqual(['ws://127.0.0.1:6677/ws/notify']);
+    expect([tab.connId, tab.flowId]).toEqual([7, 3]);
+    await settle();
+
+    // What the operator is looking at: a socket's own toolbar (the request one offers a
+    // Send that can only answer "request is empty"), the state of the connection in
+    // words, and a composer under the frames.
+    expect($('.wstoolbar')).toBeTruthy();
+    expect($('.toolbar .send-split')).toBeNull();
+    expect($('.wsstate').textContent).toMatch(/open/);
+    expect($('.wscompose')).toBeTruthy();
+    expect(buttonWith('Disconnect')).toBeTruthy();
+
+    // Clicking a captured frame and sending it again is the Repeater gesture, applied
+    // to frames. A binary frame is shown as a hex dump, so it comes back as the bytes
+    // it shows rather than as the dump's own text.
+    const frames = $$('.msg');
+    expect(frames.length).toBe(2);
+    await click(frames[1]);
+    await click(buttonWith('↻ Edit'));
+    expect([tab.frameKind, tab.payload]).toEqual(['binary', '00 01']);
+
+    tab.frameKind = 'text';
+    tab.payload = '{"subscribe":"payments"}';
+    await store.sendWsFrame(tab);
+    expect(wsRepeater.sent.at(-1)).toMatchObject({ kind: 'text', text: '{"subscribe":"payments"}' });
+
+    // Cmd+Enter sends one frame and nothing else. It used to fire twice - once as a
+    // frame, once as an HTTP send - and the second one answered "request is empty" in
+    // red under a tab that has no request at all.
+    const sends = wsRepeater.sent.length;
+    const raws = (await invokeCallsForImpl('send_raw')).length;
+    tab.payload = 'via the shortcut';
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', metaKey: true, bubbles: true }));
+    await settle();
+    expect(wsRepeater.sent.length).toBe(sends + 1);
+    expect(wsRepeater.sent.at(-1)).toMatchObject({ kind: 'text', text: 'via the shortcut' });
+    expect((await invokeCallsForImpl('send_raw')).length).toBe(raws);
+    expect(tab.error).toBeNull();
+
+    // Binary is typed as hex and sent as bytes, not as the letters "89 50".
+    tab.frameKind = 'binary';
+    tab.payload = '89 50 4e 47';
+    await store.sendWsFrame(tab);
+    expect(wsRepeater.sent.at(-1).base64).toBe(btoa(String.fromCharCode(0x89, 0x50, 0x4e, 0x47)));
+    // Odd hex is refused on the tab instead of sending half a byte.
+    tab.payload = 'abc';
+    await store.sendWsFrame(tab);
+    expect(tab.error).toMatch(/even number of hex/);
+
+    // Disconnecting uses the tab's own close code, which is what the field in the
+    // toolbar edits; 4000-4999 are the application's to use.
+    tab.closeCode = 4500;
+    await store.closeWsTab(tab);
+    expect(wsRepeater.closed.at(-1)).toEqual({ connId: 7, code: 4500 });
+    expect(tab.connId).toBeNull();
+    expect([tab.wsState, tab.closedBy]).toEqual(['closed', 'you']);
+
+    // Sending from a tab with no socket opens one first. Typing a frame and pressing
+    // Send is one gesture; making it two is what made the panel feel broken, and the
+    // button says what it will do ("Connect & send").
+    const opens = wsRepeater.opened.length;
+    tab.frameKind = 'text';
+    tab.payload = 'again';
+    await store.sendWsFrame(tab);
+    expect(wsRepeater.opened.length).toBe(opens + 1);
+    expect(wsRepeater.sent.at(-1)).toMatchObject({ kind: 'text', text: 'again' });
+    expect(tab.wsState).toBe('open');
+
+    // The far end hanging up reaches the tab, so it stops claiming to be open while
+    // every frame you send quietly goes nowhere.
+    await listeners['ws-repeater']({ payload: { connId: 7, flowId: 3, state: 'closed' } });
+    expect(tab.connId).toBeNull();
+    expect([tab.wsState, tab.closedBy]).toEqual(['closed', 'server']);
+
+    // Closing the tab closes its socket: once the tab is gone nothing in the app can
+    // reach that connection, and it would otherwise keep recording into a dead flow.
+    await store.connectWsTab(tab);
+    const closes = wsRepeater.closed.length;
+    store.closeRepeaterTab(tab.id);
+    await settle();
+    expect(wsRepeater.closed.length).toBe(closes + 1);
+  });
+
+  it('a socket tab is saved with its address, never with its connection', async () => {
+    // Reopening a project must not quietly reconnect to a target, so the live socket is
+    // deliberately not part of the snapshot; the address and the frame you were writing
+    // are, because those are the work.
+    store.addWsRepeaterTab({ url: 'wss://api.example.com/stream' });
+    const tab = store.repeater.tabs.find((t) => t.kind === 'ws');
+    tab.payload = '{"hello":1}';
+    tab.connId = 99;
+    tab.flowId = 42;
+    await settle();
+    await new Promise((r) => setTimeout(r, 450));
+    await settle();
+
+    const written = settingsWritten.filter((w) => w.key === 'repeater');
+    expect(written.length).toBeGreaterThan(0);
+    const savedTab = written.at(-1).value.tabs.find((t) => t.kind === 'ws');
+    expect(savedTab).toMatchObject({ kind: 'ws', url: 'wss://api.example.com/stream', payload: '{"hello":1}' });
+    expect(savedTab.connId).toBeUndefined();
+    expect(savedTab.flowId).toBeUndefined();
+
+    store.closeRepeaterTab(tab.id);
+    await settle();
+  });
+
+  it('a handshake sent to the Repeater opens a socket, not a request that cannot be sent', async () => {
+    // A socket starts life as an ordinary GET answered with 101, so it arrives at the
+    // Repeater looking like any other request - and it is the one request that cannot be
+    // replayed. The tab it used to make could only ever answer "unsupported scheme ws".
+    const raw = 'GET /ws/jumbo?kb=256 HTTP/1.1\r\nHost: 127.0.0.1:6677\r\nUpgrade: websocket\r\n\r\n';
+    store.sendToRepeater({
+      summary: { scheme: 'http', host: '127.0.0.1:6677', path: '/ws/jumbo?kb=256', status: 101 },
+      requestRaw: raw,
+      variants: {},
+    });
+    await settle();
+    let tab = store.repeater.tabs.at(-1);
+    expect(tab.kind).toBe('ws');
+    expect(tab.url).toBe('ws://127.0.0.1:6677/ws/jumbo?kb=256');
+    store.closeRepeaterTab(tab.id);
+    await settle();
+
+    // A handshake that reached a request tab by some other route can be turned into a
+    // socket in place. Sending it as HTTP is refused where the operator can act on it,
+    // instead of being refused by the HTTP client in words about schemes.
+    store.addRepeaterTab({ name: 'h', target: 'ws://127.0.0.1:6677', raw });
+    await settle();
+    tab = store.repeater.tabs.find((t) => t.target === 'ws://127.0.0.1:6677');
+    expect(tab.kind).toBe('http');
+    const raws = (await invokeCallsForImpl('send_raw')).length;
+    await store.sendRepeater(tab);
+    expect((await invokeCallsForImpl('send_raw')).length).toBe(raws);
+    expect(tab.error).toMatch(/Open as socket/);
+
+    await settle();
+    await click(buttonWith('⇅ Open'));
+    // The address keeps the path and its query; the handshake itself is dropped,
+    // because opening a socket writes a fresh one (a new key every time).
+    expect([tab.kind, tab.url, tab.raw]).toEqual(['ws', 'ws://127.0.0.1:6677/ws/jumbo?kb=256', '']);
+    store.closeRepeaterTab(tab.id);
+    await settle();
+  });
+
+  it('saving a WebSocket flow keeps its frames, not just the handshake', async () => {
+    // The handshake is a GET and a 101: everything the socket carried came afterwards,
+    // in frames that live under the flow id. A record that copies only the handshake
+    // looks complete and is empty, and it stays empty once History is cleared.
+    store.view = 'history';
+    await settle();
+    const itemId = await store.saveFlowToOrganizer(3, 'Sockets');
+    expect(itemId).toBeTruthy();
+    const saved = org.collections.flatMap((c) => c.items).find((i) => i.id === itemId);
+    expect(saved.status).toBe(101);
+    expect(saved.messages.total).toBe(2);
+    expect(saved.messages.items.map((m) => m.direction)).toEqual(['client', 'server']);
+    expect(saved.messages.items[0].text).toBe('{"hi":true}');
+    // The binary frame keeps its rendered form and its real length.
+    expect(saved.messages.items[1].opcode).toBe(2);
+    expect(saved.messages.items[1].length).toBe(2);
+
+    // An ordinary HTTP flow gains nothing: no socket, no frames, no empty field.
+    const plain = await store.saveFlowToOrganizer(1, 'Sockets');
+    expect(org.collections.flatMap((c) => c.items).find((i) => i.id === plain).messages).toBeNull();
+
+    // This collection is scratch space. Later Organizer tests read "the last saved
+    // item" and "every collection", so leaving it behind would break them.
+    await store.removeCollection(org.collections.find((c) => c.name === 'Sockets').id);
+    await settle();
+  });
+
+  it('a long socket is capped when saved, and says how many there really were', async () => {
+    // A socket can hold hundreds of thousands of frames and one frame can be megabytes.
+    // Both are capped so a record cannot quietly become a second copy of the project,
+    // and `total` keeps the saved view honest about what was cut.
+    const many = Array.from({ length: 2500 }, (_, i) => ({
+      id: i + 1, flowId: 3, ts: i, direction: i % 2 ? 'server' : 'client', opcode: 1,
+      length: 40000, text: 'x'.repeat(40000),
+    }));
+    const orig = backend.ws_messages;
+    backend.ws_messages = () => many;
+    const itemId = await store.saveFlowToOrganizer(3, 'Sockets');
+    backend.ws_messages = orig;
+
+    const saved = org.collections.flatMap((c) => c.items).find((i) => i.id === itemId);
+    expect(saved.messages.total).toBe(2500, 'the real count is kept whatever was dropped');
+    // Three limits, whichever runs out first. Here it is the total: 2 MB of text at
+    // 16 KB a frame is 128 frames, well under the 2000-frame limit.
+    const kept = saved.messages.items;
+    expect(kept.length).toBe(128);
+    const bytes = kept.reduce((n, m) => n + m.text.length, 0);
+    expect(bytes).toBeLessThanOrEqual(2 * 1024 * 1024);
+    // Each frame's text is cut, but its declared length still reports the real size, so
+    // nothing in the record claims the payload was smaller than it was.
+    expect(kept[0].text.length).toBe(16 * 1024);
+    expect(kept[0].length).toBe(40000);
+
+    await store.removeCollection(org.collections.find((c) => c.name === 'Sockets').id);
+    await settle();
+  });
+
+  it('the HTTP / WS switch splits the capture, and the choice is remembered', async () => {
+    store.view = 'history';
+    store.clearAllFilters();
+    await settle();
+    const kindButton = (label) => $$('.kind').find((b) => b.textContent.trim().startsWith(label));
+    const rowIds = () =>
+      $$('.row')
+        .filter((r) => !r.classList.contains('head') && r.querySelector('.idcell'))
+        .map((r) => Number(r.querySelector('.idcell').textContent));
+
+    // The fixtures are two HTTP flows and one socket (id 3, the GET that answered 101).
+    expect(rowIds()).toEqual(expect.arrayContaining([1, 2, 3]));
+    expect(kindButton('WS').textContent).toContain('1'); // the switch counts them
+
+    await click(kindButton('WS'));
+    expect(store.historyKind).toBe('ws');
+    expect(rowIds()).toEqual([3]);
+
+    await click(kindButton('HTTP'));
+    expect(rowIds().sort()).toEqual([1, 2]);
+    // It counts as a filter, so the "clear filters" affordance appears and works.
+    expect(store.filtersActive).toBe(true);
+
+    // Remembered per project: it is saved with the other History filter state, and a
+    // reopened project comes back on the same half of the capture.
+    const origGet = backend.get_setting;
+    backend.get_setting = ({ key }) => (key === 'historyFilter' ? { kind: 'ws' } : null);
+    await store.blankProject();
+    await settle();
+    expect(store.historyKind).toBe('ws');
+    // A value that is not one of the three falls back to showing everything, rather
+    // than an empty table nobody can explain.
+    backend.get_setting = ({ key }) => (key === 'historyFilter' ? { kind: 'sockets-please' } : null);
+    await store.blankProject();
+    await settle();
+    expect(store.historyKind).toBe('all');
+    backend.get_setting = origGet;
+    store.clearAllFilters();
     await settle();
   });
 
@@ -3405,6 +4034,54 @@ describe('UI smoke test', () => {
     store.view = 'organizer';
     await settle();
     expect(activeTab()).toBe('Collections');
+  });
+
+  it('organizer: keeps the saved-requests sort when you switch menus', async () => {
+    await openOrganizer('collections');
+    // Its own collection with two differently-statused rows: the ones from the earlier
+    // tests have been moved around and no longer hold a pair to sort.
+    store.addCollection('SortMemo');
+    await settle();
+    const memo = store.organizer.collections.find((c) => c.name === 'SortMemo');
+    await store.saveFlowToOrganizer(1, memo.id); // 200
+    await store.saveFlowToOrganizer(2, memo.id); // 401
+    await click($$('.organizer .col-item').find((b) => b.textContent.includes('SortMemo')));
+    await settle();
+    const rowsEl = () => $$('.organizer .rbody .rrow');
+    expect(rowsEl().length).toBe(2);
+    const th = (label) => $$('.organizer .th').find((b) => b.textContent.trim().startsWith(label));
+
+    // Sort by Status descending, so the 401 is on top instead of the saved order.
+    await click(th('Status'));
+    await click(th('Status'));
+    expect(rowsEl()[0].textContent).toContain('401');
+    expect(th('Status').textContent).toContain('\u2193');
+
+    // Leaving the Organizer tears the view down. The order has to come back with it.
+    store.view = 'history';
+    await settle();
+    store.view = 'organizer';
+    await settle();
+    expect(rowsEl()[0].textContent).toContain('401');
+    expect(th('Status').textContent).toContain('\u2193');
+    expect(store.organizerSort).toEqual({ key: 'status', dir: -1 });
+
+    // And it is remembering rather than just keeping the last thing clicked: back to
+    // the saved order, away and back, still the saved order.
+    await click(th('#'));
+    expect(rowsEl()[0].textContent).toContain('200');
+    store.view = 'history';
+    await settle();
+    store.view = 'organizer';
+    await settle();
+    expect(rowsEl()[0].textContent).toContain('200');
+    expect(store.organizerSort).toEqual({ key: 'n', dir: 1 });
+
+    // Take the scratch collection back out: later tests read "the last saved item"
+    // across every collection, and two history rows parked at the end would answer
+    // for the record they just saved.
+    await store.removeCollection(memo.id);
+    await settle();
   });
 
   it('intruder: right-click a tab to save it to the Organizer', async () => {

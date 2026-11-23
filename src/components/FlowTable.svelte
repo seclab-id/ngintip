@@ -1,7 +1,7 @@
 <script>
   import { untrack } from 'svelte';
   import { store } from '../lib/store.svelte.js';
-  import { fmtSize, fmtDateTime, statusClass, methodClass } from '../lib/format.js';
+  import { fmtSize, fmtDateTime, statusClass, methodClass, flowState, fmtWaited } from '../lib/format.js';
   import { HISTORY_COLUMNS, queryOf } from '../lib/columns.js';
 
   // `oncontext(flow, x, y)`: right-click on a row (already selected by then).
@@ -33,22 +33,54 @@
   let sortKey = $derived(store.historySort.key);
   let sortDir = $derived(store.historySort.dir);
   let viewport = $state();
-  let scrollTop = $state(0);
-  let height = $state(0);
-  let follow = $state(true);
+  // Seeded from the store, so leaving History and coming back lands where you left it
+  // instead of snapping to the newest end. See `store.historyScroll`.
+  let scrollTop = $state(store.historyScroll.top);
+  // Seeded too, so the first render builds the window that is actually about to be shown
+  // rather than a 10-row one against a clientHeight that has not been measured yet.
+  let height = $state(store.historyScroll.height);
+  let follow = $state(store.historyScroll.follow);
+  // Remember the measured height for the next mount (cheap: it changes on resize only).
+  $effect(() => {
+    if (height > 0) store.historyScroll = { ...store.historyScroll, height };
+  });
 
   let rows = $derived.by(() => {
     const k = sortKey;
     const d = sortDir;
-    return flows.toSorted((a, b) => {
+    const cmp = (a, b) => {
       const av = sortVal(a, k);
       const bv = sortVal(b, k);
       return av > bv ? d : av < bv ? -d : 0;
-    });
+    };
+    // Flows arrive in id order and the default sort IS id ascending, so the common case
+    // is an array that is already in the right order. Proving that costs 0.115 ms on
+    // 39,662 rows against 0.574 ms to sort and, more to the point, skips allocating a
+    // fresh 39,662-element array on every flush. Returning `flows` itself is safe only
+    // because nothing here mutates `rows`.
+    let ordered = true;
+    for (let i = 1; i < flows.length; i++) {
+      if (cmp(flows[i - 1], flows[i]) > 0) {
+        ordered = false;
+        break;
+      }
+    }
+    return ordered ? flows : flows.toSorted(cmp);
   });
   let start = $derived(Math.max(0, Math.floor(scrollTop / ROW) - OVERSCAN));
   let end = $derived(Math.min(rows.length, Math.ceil((scrollTop + height) / ROW) + OVERSCAN));
   let visible = $derived(rows.slice(start, end));
+
+  // One clock for the whole table, ticking only while something on screen is actually
+  // waiting. A row in flight has no status to show, so its badge counts the wait
+  // instead, and that counting must not cost a timer per row or a repaint of a table
+  // where nothing is waiting.
+  let now = $state(Date.now());
+  $effect(() => {
+    if (!visible.some((f) => f.pending)) return;
+    const t = setInterval(() => (now = Date.now()), 1000);
+    return () => clearInterval(t);
+  });
 
   // Where the newest rows land depends on the sort: when sorting by #/Time
   // descending, new flows appear at the TOP, otherwise at the bottom. The tail
@@ -63,15 +95,35 @@
     if (untrack(() => follow) && viewport) {
       viewport.scrollTop = atTop ? 0 : viewport.scrollHeight;
       scrollTop = viewport.scrollTop; // keep the virtual window in sync
+      store.historyScroll = { ...store.historyScroll, top: scrollTop, follow: true };
     }
   });
 
   function onScroll() {
-    scrollTop = viewport.scrollTop;
-    follow = newestAtTop
-      ? viewport.scrollTop <= ROW
-      : viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - ROW;
+    // A scroll event can be delivered after the component is gone: leaving History
+    // destroys this table while the webview still has a queued event for its viewport,
+    // and `viewport` is null by then. Observed six times during rapid tab switching as
+    // "TypeError: null is not an object (evaluating 'get(viewport).scrollTop')".
+    const vp = viewport;
+    if (!vp) return;
+    scrollTop = vp.scrollTop;
+    follow = newestAtTop ? vp.scrollTop <= ROW : vp.scrollTop + vp.clientHeight >= vp.scrollHeight - ROW;
+    store.historyScroll = { ...store.historyScroll, top: scrollTop, follow };
   }
+
+  // Put the viewport back where it was, once it exists and has a height. Only needed
+  // when the tail follow is OFF: when it is on, the effect below owns the position.
+  // Restoring also keeps that effect from running at all on mount, which is what used to
+  // read `scrollHeight` and force a layout of the whole spacer.
+  let restored = false;
+  $effect(() => {
+    if (restored || !viewport) return;
+    restored = true;
+    // The spacer already carries its inline height on this same render, so the offset
+    // sticks without waiting for `clientHeight` to bind.
+    const top = untrack(() => scrollTop);
+    if (!untrack(() => follow) && top > 0) viewport.scrollTop = top;
+  });
 
   // Warm the detail cache for the rows around the selection so arrow-key
   // navigation and the next click open instantly. `rows` is read untracked so
@@ -199,7 +251,8 @@
               {:else if col.key === 'query'}
                 <span class="cell mono path dim" title={queryOf(f.path)}>{queryOf(f.path)}</span>
               {:else if col.key === 'status'}
-                <span class="cell"><span class="badge {statusClass(f.status)}">{f.status || 'ERR'}</span></span>
+                {@const st = flowState(f, now, store.lateAfterSec * 1000)}
+                <span class="cell"><span class="badge {st.cls}" title={st.title}>{st.badge}</span></span>
               {:else if col.key === 'length'}
                 <span class="cell dim mono">{f.streaming ? '…' : fmtSize(f.length)}</span>
               {:else if col.key === 'reqLength'}
@@ -211,7 +264,12 @@
               {:else if col.key === 'mime'}
                 <span class="cell dim">{f.mime}</span>
               {:else if col.key === 'durationMs'}
-                <span class="cell dim mono" title={f.streaming ? 'Still streaming' : fmtDateTime(f.ts)}>{f.streaming ? 'streaming' : `${f.durationMs} ms`}</span>
+                {@const st = flowState(f, now, store.lateAfterSec * 1000)}
+                <!-- Never a round trip that did not happen. A wait shows the clock that
+                     is still running; a row that never got an answer shows nothing. -->
+                <span class="cell dim mono" title={st.title || (f.streaming ? 'Still streaming' : fmtDateTime(f.ts))}>
+                  {#if f.streaming}streaming{:else if st.kind === 'wait' || st.kind === 'late'}{fmtWaited(st.waited)}{:else if st.kind === 'noresp' || st.kind === 'unsent'}-{:else}{f.durationMs} ms{/if}
+                </span>
               {:else if col.key === 'modified'}
                 <span class="cell mono flag" class:yes={f.modified} title={f.modified ? 'Edited in the interceptor or transformed by an extension' : 'Unchanged'}>{f.modified ? '✓' : '·'}</span>
               {:else if col.key === 'note'}

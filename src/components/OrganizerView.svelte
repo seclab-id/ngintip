@@ -2,13 +2,14 @@
   import { tick } from 'svelte';
   import { store } from '../lib/store.svelte.js';
   import MessageView from './MessageView.svelte';
+  import WsView from './WsView.svelte';
   import MiniDecoder from './MiniDecoder.svelte';
   import SplitPane from './SplitPane.svelte';
   import ContextMenu from './ContextMenu.svelte';
   import Modal from './Modal.svelte';
   import CaptureEditor from './CaptureEditor.svelte';
   import { HIGHLIGHTS } from '../lib/colors.js';
-  import { fmtDateTime, statusClass } from '../lib/format.js';
+  import { fmtDateTime, fmtSize, statusClass } from '../lib/format.js';
   import { SAVED_COLUMNS, savedRows, notesView, notePreview } from '../lib/organizer.js';
   import { splitMessage } from '../lib/message.js';
   import { toCurl } from '../lib/curl.js';
@@ -72,8 +73,11 @@
   let newCol = $state('');
   let selectedId = $state(null);
   let query = $state('');
-  let sortKey = $state('n');
-  let sortDir = $state(1);
+  // The sort lives in the store, not here: this component is torn down whenever you
+  // leave the Organizer, so a local $state would silently reset the order on every
+  // menu switch. Same arrangement as the History table's sort.
+  const sortKey = $derived(store.organizerSort.key);
+  const sortDir = $derived(store.organizerSort.dir);
 
   const view = $derived(org.collections.find((c) => c.id === org.viewId) ?? org.collections[0] ?? null);
   const rows = $derived(view ? savedRows(view.items, query, sortKey, sortDir) : []);
@@ -100,6 +104,9 @@
   // A whole Intruder run saved as one record keeps every result, shown as a table like
   // Intruder's own results list; the picked row drives the request/response panes.
   const runRows = $derived(Array.isArray(selected?.results) && selected.results.length ? selected.results : null);
+  // A saved WebSocket record: its frames, not a request/response pair. The handshake is
+  // still worth showing, so it goes to the viewer's Handshake tab as the response text.
+  const wsFrames = $derived(selected?.messages?.items?.length ? selected.messages : null);
   let runSel = $state(null);
   $effect(() => {
     selectedId;
@@ -126,9 +133,11 @@
   const runRow = $derived(runRows ? (runRows.find((r) => r.n === runSel) ?? runShown?.[0] ?? runRows[0]) : null);
 
   // ---- Resizable table columns ----
-  // Saved requests: the 7 sortable columns plus Note. Widths are px and remembered.
+  // Saved requests: the sortable columns plus Note. Widths are px and remembered.
+  // A stored set from before Took / Resp size existed has the wrong length and is
+  // discarded by loadColumnWidths, so these defaults apply with nothing to migrate.
   const COLS = [...SAVED_COLUMNS, { key: 'note', label: 'Note', plain: true }];
-  const SAVED_W = [44, 82, 64, 160, 260, 56, 120, 46];
+  const SAVED_W = [44, 82, 64, 160, 240, 56, 72, 84, 120, 46];
   const RUN_W = [56, 260, 84, 84, 84];
   let savedW = $state(loadColumnWidths('organizer.saved', SAVED_W));
   let runW = $state(loadColumnWidths('organizer.run', RUN_W));
@@ -184,11 +193,7 @@
     selectedId = null;
   }
   function sortBy(key) {
-    if (sortKey === key) sortDir = -sortDir;
-    else {
-      sortKey = key;
-      sortDir = 1;
-    }
+    store.setOrganizerSort(key);
   }
 
   function openColMenu(c, x, y) {
@@ -559,6 +564,10 @@
                       <span class="cell host" title={it.host}>{it.host}</span>
                       <span class="cell path" title={it.path}>{it.path}</span>
                       <span class="cell status {it.status ? statusClass(it.status) : ''}">{it.status ?? ''}</span>
+                      <!-- Blank, not "0 ms" or "0 B", when nothing was measured: a record
+                           saved before these were kept, or one with no response at all. -->
+                      <span class="cell num" title={it.durationMs == null ? 'Not recorded' : 'Response time'}>{it.durationMs == null ? '' : `${it.durationMs} ms`}</span>
+                      <span class="cell num" title={it.length == null ? 'Not recorded' : 'Response body size'}>{it.length == null ? '' : fmtSize(it.length)}</span>
                       <span class="cell label" title={it.label}>{it.label}</span>
                       <span class="cell notec">
                         <button class="note-btn" class:has={!!it.note} title={it.note ? notePreview(it.note) : 'Add a note'} aria-label="Note" onclick={(e) => (e.stopPropagation(), openNote(it))}>
@@ -586,6 +595,11 @@
                   {#if selected.source}<span class="src src-{selected.source}">{selected.source}</span>{/if}
                   {#if selected.label}<span class="dlabel" title={selected.label}>{selected.label}</span>{/if}
                   <span class="grow"></span>
+                  {#if selected.durationMs != null || selected.length != null}
+                    <span class="dim dmeta" title="Response time and body size, as measured when this was saved">
+                      {#if selected.durationMs != null}{selected.durationMs} ms{/if}{#if selected.durationMs != null && selected.length != null} · {/if}{#if selected.length != null}{fmtSize(selected.length)}{/if}
+                    </span>
+                  {/if}
                   <span class="dim dtime" title="Saved">{fmtDateTime(selected.savedAt)}</span>
                   <button class="icbtn" class:has={!!selected.note} title={selected.note ? 'View / edit note' : 'Add a note'} aria-label="Note" onclick={() => openNote(selected)}>{@render noteIcon()}</button>
                   <button class="icbtn" title="Capture: screenshot the request/response to annotate" aria-label="Capture screenshot" onclick={() => openCapture(selected)}>
@@ -636,7 +650,17 @@
                     </div>
                   </div>
                 {/if}
-                <div class="msgs" class:with-decoder={miniDecode}>
+                {#if wsFrames}
+                  <div class="wspane">
+                    <WsView saved={wsFrames} handshake={selected.response || selected.request} />
+                    {#if wsFrames.items.length < wsFrames.total}
+                      <p class="dim wsnote">
+                        {wsFrames.items.length} of {wsFrames.total} frames kept with this record (size cap).
+                      </p>
+                    {/if}
+                  </div>
+                {/if}
+                <div class="msgs" class:with-decoder={miniDecode} class:hidden={wsFrames}>
                   <div class="msgs-panes">
                     <SplitPane storeKey="organizer" left={reqPane} right={resPane} />
                     {#snippet reqPane()}
@@ -1154,6 +1178,17 @@
   .cell.status {
     font: 600 11.5px var(--mono);
   }
+  /* Numbers read as a column when they line up on the right. */
+  .cell.num {
+    font: 12px var(--mono);
+    color: var(--text-dim);
+    text-align: right;
+    padding-right: 8px;
+  }
+  .dmeta {
+    font: 12px var(--mono);
+    white-space: nowrap;
+  }
   .cell.label {
     color: var(--text);
   }
@@ -1305,6 +1340,30 @@
   .grip:hover::after {
     background: var(--accent);
   }
+  /* A saved WebSocket record shows its frames instead of the two message panes. */
+  .wspane {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+  }
+  /* The viewer is a grid that sizes itself to its own rows; as a flex child it needs
+     both a share of the height and permission to be shorter than its content, or the
+     message detail inside it is clipped instead of scrolled. */
+  .wspane > :global(.panel) {
+    flex: 1;
+    min-height: 0;
+  }
+  .wsnote {
+    flex-shrink: 0;
+    padding: 6px 10px;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+  }
+  .msgs.hidden {
+    display: none;
+  }
+
   /* A saved Intruder run: its results as a compact table above the message panes. */
   .runbar {
     display: flex;

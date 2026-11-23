@@ -52,7 +52,7 @@
         ['History', 'The < and > buttons step through requests you already sent from this tab (with their responses and dates). Unsent edits are kept and reachable at the end.'],
         ['Grouping', 'Right-click a tab > New group / Move to <group>, or drag tabs in and out of groups. Right-click a group label to rename, colour or delete it; click it to collapse. Groups and colours are saved per project.'],
         ['Protocol', 'The version on the request line picks the protocol: write HTTP/2 to send over HTTP/2, otherwise HTTP/1.1.'],
-        ['Edit & resend', 'The request is a plain, fully editable text area — change the method, path, any header or the body directly. After sending you stay in edit mode; keep changing and Send again. + Header / + Body add lines, and Content-Length recomputes to match the body (it is also fixed automatically on send).'],
+        ['Edit & resend', 'The request is a plain, fully editable text area - change the method, path, any header or the body directly. After sending you stay in edit mode; keep changing and Send again. + Header / + Body add lines, and Content-Length recomputes to match the body (it is also fixed automatically on send).'],
         ['Capture', 'Turn the request/response into an image (it reflects how far you scrolled each pane), annotate with box, ellipse, arrow, line, pen, highlighter, text, redact and numbered steps in any colour/width, then Save PNG or Copy image. Undo Cmd/Ctrl+Z, redo Cmd/Ctrl+Y (or Shift+Cmd+Z). Also available from the History right-click menu.'],
       ],
     },
@@ -97,7 +97,7 @@
       items: [
         ['Theme', 'The topbar button cycles system / light / dark.'],
         ['Save as', 'Settings > Project > Save as writes a clean copy and continues in the new file.'],
-        ['Test server', 'Settings > Test server runs a local echo server (127.0.0.1) that reflects what it received, including whether Content-Length matched the body — point Repeater at it (Try in Repeater) to verify edits.'],
+        ['Test server', 'Settings > Test server runs a local echo server (127.0.0.1) that reflects what it received, including whether Content-Length matched the body - point Repeater at it (Try in Repeater) to verify edits.'],
         ['WebSocket', 'ws:// and wss:// are bridged; open a 101 flow in History to see its messages.'],
       ],
     },

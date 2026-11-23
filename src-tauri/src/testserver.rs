@@ -129,7 +129,7 @@ async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infalli
         String::from_utf8_lossy(&body),
         app = crate::brand::NAME,
         cl = declared.as_deref().unwrap_or("(none)"),
-        ok = if matches { "yes" } else { "NO — mismatch" },
+        ok = if matches { "yes" } else { "NO - mismatch" },
     );
     Ok(text(StatusCode::OK, out))
 }
@@ -172,11 +172,11 @@ const INDEX: &str = r#"<!doctype html><meta charset="utf-8"><meta name="viewport
 <h1>Ngintip test server</h1>
 <p>Reflects your request so you can check what actually arrived (handy for verifying edited headers/bodies and Content-Length through Intercept or Repeater).</p>
 <ul>
-<li><b>/echo</b> — echoes the method, headers and body, and whether Content-Length matched the body</li>
-<li><b>/json</b> — the same, as JSON</li>
-<li><b>/secret</b> — a body "encrypted" with XOR+base64 (header <code>X-Encrypted: xor-b64</code>), to test a decrypt/encrypt extension end to end</li>
-<li><b>/test-enc</b> — a page with a button that AES-CBC encrypts a JSON body in the browser and POSTs it (IV in <code>X-Enc-IV</code>), to watch an encrypted request flow through the proxy</li>
-<li><b>/status/&lt;code&gt;</b> — replies with that status code</li>
+<li><b>/echo</b> - echoes the method, headers and body, and whether Content-Length matched the body</li>
+<li><b>/json</b> - the same, as JSON</li>
+<li><b>/secret</b> - a body "encrypted" with XOR+base64 (header <code>X-Encrypted: xor-b64</code>), to test a decrypt/encrypt extension end to end</li>
+<li><b>/test-enc</b> - a page with a button that AES-CBC encrypts a JSON body in the browser and POSTs it (IV in <code>X-Enc-IV</code>), to watch an encrypted request flow through the proxy</li>
+<li><b>/status/&lt;code&gt;</b> - replies with that status code</li>
 </ul>
 <p>Send any method (GET/POST/PUT/…) with any headers and body.</p></body>"#;
 
@@ -245,7 +245,7 @@ mod tests {
 
         // Wrong Content-Length is flagged (the server reads what actually arrived).
         let res = roundtrip(addr, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhello").await;
-        assert!(res.contains("NO — mismatch") || res.contains("Actual body bytes: 2"), "{res}");
+        assert!(res.contains("NO - mismatch") || res.contains("Actual body bytes: 2"), "{res}");
 
         // Status route.
         let res = roundtrip(addr, "GET /status/418 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;

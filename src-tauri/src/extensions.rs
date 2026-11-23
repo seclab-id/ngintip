@@ -386,7 +386,12 @@ impl Inner {
                 }
             };
             // Scan the source for which hooks it defines, so we only call ones it has.
-            let src = if !spec.body.is_empty() { spec.body.clone() } else { std::fs::read_to_string(&script).unwrap_or_default() };
+            // Read back the file `resolve_script` just picked, never `spec.body`: the two
+            // disagree the moment a script is edited on disk without the extension list
+            // being saved again, and then the host calls the hooks of the saved copy while
+            // the worker runs the file. A hook added in the editor would never be called,
+            // with nothing in the log to say why.
+            let src = std::fs::read_to_string(&script).unwrap_or_else(|_| spec.body.clone());
             self.loaded[i].defines = HookDefs::scan(&src);
             match spawn_worker(&python, &runner, &script, &spec.name, logs.clone()) {
                 Ok(worker) => {
@@ -784,8 +789,13 @@ impl Extensions {
     }
 
     /// Modify a message on the wire (`process_*` hooks); new bytes only when changed.
-    pub fn transform(&self, phase: Phase, raw: &[u8], surface: Surface) -> Option<Vec<u8>> {
-        self.run(Stage::Process, phase, raw, surface, &HookCtx::default())
+    ///
+    /// Takes a context like the other two stages so a `process_*` hook can read
+    /// `ctx.flow_id` and name, in its own log or its own notes, the exact row the
+    /// operator is looking at in History. Repeater and Intruder sends are not recorded
+    /// as flows, so there the id is legitimately absent rather than wrong.
+    pub fn transform(&self, phase: Phase, raw: &[u8], surface: Surface, ctx: &HookCtx) -> Option<Vec<u8>> {
+        self.run(Stage::Process, phase, raw, surface, ctx)
     }
 
     /// Readable (decoded) form for the UI (`decode_*` hooks); does not change the wire.
@@ -1026,7 +1036,7 @@ mod tests {
         // re-serializes to identical bytes and is correctly reported as "no change".
         let raw = b"POST /x HTTP/1.1\r\nHost: api.t\r\nContent-Length: 5\r\n\r\nhello";
         // Process stage: this extension defines no process_* hook -> no change.
-        assert!(ext.transform(Phase::Request, raw, Surface::Proxy).is_none(), "process must be a no-op");
+        assert!(ext.transform(Phase::Request, raw, Surface::Proxy, &HookCtx::default()).is_none(), "process must be a no-op");
         // Decode for the matching host uppercases the body for display.
         let ctx = HookCtx { host: "api.t".into(), ..Default::default() };
         let decoded = ext.decode(Phase::Request, raw, Surface::Proxy, &ctx).expect("decoded");

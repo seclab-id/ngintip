@@ -3,11 +3,12 @@
   import { highlightHttp } from '../lib/highlight.js';
   import { prettyBody, htmlBody, softWrapLong } from '../lib/message.js';
   import { matchRanges, markHtmlRanges } from '../lib/find.js';
-  import { autoDecode } from '../lib/codec.js';
+  import { decodeHint } from '../lib/codec.js';
   import { isolateSelection } from '../lib/dragselect.js';
   import { variantPref } from '../lib/viewprefs.svelte.js';
   import { fmtSize } from '../lib/format.js';
   import FindBar from './FindBar.svelte';
+  import SelectionAction from './SelectionAction.svelte';
 
   // The read-only viewer colours much larger bodies than the editable editor, so a
   // big pretty-printed JSON/XML response keeps its syntax colours.
@@ -42,7 +43,7 @@
   let showingFull = $state(false);
   let full = $state(null);
   let loadingFull = $state(false);
-  // A binary (non-printable) response body isn't rendered in Raw until asked — a
+  // A binary (non-printable) response body isn't rendered in Raw until asked - a
   // large image/blob would otherwise lag the viewer just by highlighting it.
   let bodyShown = $state(false);
   // Which captured version is shown: 'final' (the sent/stored message) or an earlier
@@ -153,7 +154,7 @@
   let view = $derived(
     softWrapLong(
       previewing
-        ? `${shown.slice(0, PREVIEW_CHARS)}\n\n[preview — showing the first ${Math.round(PREVIEW_CHARS / 1000)} KB for speed; use "Show all" for the full message]`
+        ? `${shown.slice(0, PREVIEW_CHARS)}\n\n[preview - showing the first ${Math.round(PREVIEW_CHARS / 1000)} KB for speed; use "Show all" for the full message]`
         : (shown ?? ''),
     ),
   );
@@ -284,14 +285,27 @@
     window.addEventListener('pointercancel', end);
   }
 
-  function onSelectUp() {
+  // Highlighting puts a small Decode chip next to the pointer and does nothing else.
+  // The dock used to open by itself whenever a selection looked decodable, which moved
+  // the panes under the operator's eyes mid-read and fired on text selected only to be
+  // copied. Opening is now a click. See SelectionAction.
+  let chip = $state(null); // { text, x, y, hint }
+
+  function onSelectUp(e) {
     if (!ondecode) return;
     const text = selectionText();
-    // Only open the decoder when the selection actually looks decodable (JWT,
-    // Base64, URL/percent, hex, HTML entities). Selecting ordinary text - e.g. to
-    // copy it - no longer pops the side bar and shifts the panes.
-    if (text.trim() && text.length <= 100_000 && autoDecode(text).length) ondecode(text);
+    if (!text.trim() || text.length > 100_000) {
+      chip = null;
+      return;
+    }
+    chip = { text, x: e.clientX + 8, y: e.clientY + 14, hint: decodeHint(text) };
   }
+
+  // Another message in this pane takes its selection with it.
+  $effect(() => {
+    void raw;
+    chip = null;
+  });
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -345,7 +359,7 @@
     <pre class="code" class:head-only={deferBinary} bind:this={pre} onpointerdown={onSelectDown} onmouseup={onSelectUp}>{@html body}</pre>
     {#if deferBinary}
       <div class="load-body">
-        <span class="dim">Binary body ({fmtSize(bodyBytes)}, not printable) — hidden to keep the viewer fast.</span>
+        <span class="dim">Binary body ({fmtSize(bodyBytes)}, not printable) - hidden to keep the viewer fast.</span>
         <div class="load-actions">
           {#if canPreviewImage}
             <button class="btn sm" onclick={() => pick('preview')}>Preview image</button>
@@ -361,6 +375,19 @@
       <FindBar bind:value={find} bind:opts={findOpts} error={searchResult?.error} count={searchResult?.count ?? 0} index={matchIdx} placeholder="Search body…"
         oninput={() => (matchIdx = 0)} onstep={step} onclose={closeFind} />
     {/if}
+  {/if}
+
+  {#if chip}
+    <SelectionAction
+      x={chip.x}
+      y={chip.y}
+      hint={chip.hint}
+      onpick={() => {
+        ondecode(chip.text);
+        chip = null;
+      }}
+      onclose={() => (chip = null)}
+    />
   {/if}
 </div>
 

@@ -317,6 +317,13 @@ kbd {
 .s-4xx { color: var(--amber); }
 .s-5xx,
 .s-err { color: var(--red); }
+/* A request still in flight: no news yet, and nothing has gone wrong. Grey, because
+   red is reserved for something that was actually observed to fail. */
+.s-wait { color: var(--text-dim); }
+/* Waiting longer than anyone expected, and a request whose answer was never filed.
+   Amber says the record is incomplete without naming a party at fault. */
+.s-late,
+.s-noresp { color: var(--amber); }
 
 .m-get { color: var(--green); }
 .m-post { color: var(--amber); }

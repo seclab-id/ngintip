@@ -49,3 +49,32 @@ describe('organizer', () => {
     expect(notePreview('')).toBe('');
   });
 });
+
+// Took / Resp size: the same two numbers History shows, kept on the record so a saved
+// request can be read after History is cleared. A record saved before they existed has
+// neither, and that has to stay tellable from a measured zero.
+describe('savedRows with response measurements', () => {
+  const items = [
+    { id: 'a', host: 'h', path: '/a', durationMs: 1200, length: 500 },
+    { id: 'b', host: 'h', path: '/b', durationMs: 30, length: 0 },
+    { id: 'c', host: 'h', path: '/c' }, // saved before Took / Resp size existed
+  ];
+  const order = (key, dir) => savedRows(items, '', key, dir).map((r) => r.it.id);
+
+  it('sorts by response time as a number, not as text', () => {
+    // 30 before 1200: as text, "1200" would sort first.
+    expect(order('durationMs', 1)).toEqual(['c', 'b', 'a']);
+    expect(order('durationMs', -1)).toEqual(['a', 'b', 'c']);
+  });
+
+  it('sorts by size as a number', () => {
+    expect(order('length', -1)).toEqual(['a', 'b', 'c']);
+  });
+
+  it('keeps an unmeasured record apart from a genuine zero', () => {
+    // b really did come back with an empty body; c was never measured at all. Ascending,
+    // the unmeasured one sorts below the real 0 rather than tying with it.
+    const asc = savedRows(items, '', 'length', 1).map((r) => r.it.id);
+    expect(asc.indexOf('c')).toBeLessThan(asc.indexOf('b'));
+  });
+});

@@ -36,6 +36,27 @@ describe('codec', () => {
     expect(() => c.jwtDecode('nope')).toThrow();
   });
 
+  it('jwt: shows the token as it was signed, not a re-serialized copy', () => {
+    // The reason anyone opens a token in a proxy: two `alg` keys to split two libraries
+    // apart, a claim spelled with an escape so a filter reads one thing and the backend
+    // another, an id past 2^53. Re-serializing the parsed value drops the first key,
+    // decodes the escape and rounds the id, so the view would show a token that was
+    // never issued. Proven against the old implementation, which printed
+    // `"alg": "HS256"` alone, `"adcmin"` and `12345678901234567000`.
+    const BS = '\\';
+    const b64u = (o) => btoa(o).replace(/[+]/g, '-').replace(/[/]/g, '_').replace(/=+$/, '');
+    const header = `{"alg":"none","alg":"HS256","typ":"J${BS}u0057T"}`;
+    const payload = `{"user":"ad${BS}u0063min","id":12345678901234567890,"role":"user","role":"admin"}`;
+    const out = c.jwtDecode(`${b64u(header)}.${b64u(payload)}.sig`);
+    expect(out).toContain('"alg": "none"');
+    expect(out).toContain('"alg": "HS256"');
+    expect(out).toContain(`"typ": "J${BS}u0057T"`);
+    expect(out).toContain(`"user": "ad${BS}u0063min"`);
+    expect(out).toContain('"id": 12345678901234567890');
+    expect(out).toContain('"role": "user"');
+    expect(out).toContain('"role": "admin"');
+  });
+
   it('hashes match known vectors', async () => {
     expect(c.md5('')).toBe('d41d8cd98f00b204e9800998ecf8427e');
     expect(c.md5('The quick brown fox jumps over the lazy dog')).toBe('9e107d9d372bb6826bd81d3542a419d6');
@@ -85,5 +106,63 @@ describe('codec', () => {
     // Plain text matches nothing.
     expect(c.autoDecode('just some words')).toEqual([]);
     expect(c.autoDecode('   ')).toEqual([]);
+  });
+
+  // Highlighting text in a message opens the mini decoder only when autoDecode claims a
+  // match, so a false match is not cosmetic: the panel appears over the request you were
+  // reading, showing nonsense. Reported from a real engagement, selecting `productType`
+  // in a Repeater request popped the decoder open on `a6 ba 1d b9 cb 53 ca 97`.
+  it('does not claim a match when the decoded BYTES are not text', () => {
+    // Shaped like Base64 (length >= 8, only Base64 characters) but the bytes are binary.
+    // The old guard was defeated by its own rendering: non-UTF-8 bytes are displayed as
+    // a hex dump, and a hex dump is always "printable".
+    expect(c.autoDecode('productType')).toEqual([]);
+    expect(c.autoDecode('Content-Length')).toEqual([]);
+    expect(c.autoDecode('gamesmax-booster')).toEqual([]);
+    expect(c.autoDecode('application/json')).toEqual([]);
+    expect(c.autoDecode('081235564795')).toEqual([]);
+    // Valid hex, but of bytes that are not text.
+    expect(c.autoDecode('a6ba1db9cb53ca97')).toEqual([]);
+
+    // The real ones still match, which is the whole point of the feature.
+    expect(c.autoDecode('SGVsbG8gZnJvbSBOZ2ludGlw')[0]).toMatchObject({ id: 'b64d', output: 'Hello from Ngintip' });
+    expect(c.autoDecode('48656c6c6f20776f726c64')[0]).toMatchObject({ id: 'hexd', output: 'Hello world' });
+    expect(c.autoDecode('%7B%22a%22%3A1%7D')[0]).toMatchObject({ id: 'urld', output: '{"a":1}' });
+    expect(c.autoDecode('&lt;script&gt;')[0]).toMatchObject({ id: 'htmld', output: '<script>' });
+  });
+
+  it('autoDecode still claims a blob whose plaintext is binary', () => {
+    // The point of the byte check above is that `productType` is not Base64 just because
+    // its shape fits. The point of this one is the opposite half: on an encrypted API the
+    // hex dump is exactly what the operator highlighted the blob to see, and judging on
+    // bytes alone made a 344-character AES body open nothing at all.
+    const aes = btoa(String.fromCharCode(...Array.from({ length: 64 }, (_, i) => (i * 37 + 11) % 256)));
+    expect(aes.length).toBeGreaterThan(24);
+    expect(c.autoDecode(aes)[0].id).toBe('b64d');
+    // Padded, and short enough that a plain length rule would have been tempting.
+    expect(c.autoDecode('q83vEjRWeJCrze8SNFZ4kA==')[0].id).toBe('b64d');
+    // 32+ hex characters of binary: a digest or an IV, not a word. A hex string of this
+    // length is valid Base64 by shape too, so both are offered and the test asks for
+    // membership rather than for an order the DECODERS list happens to give.
+    expect(c.autoDecode('a6ba1db9cb53ca97a6ba1db9cb53ca97').map((x) => x.id)).toContain('hexd');
+  });
+
+  it('autoDecode does not mistake a long identifier for a blob', () => {
+    // The shape rule has to survive the words an operator actually double-clicks in a
+    // JSON body. These are all >= 24 characters and valid Base64 by shape; none carries
+    // a digit or padding, so none of them opens a hex dump. Checked against the whole of
+    // /usr/share/dict/words as well, which yields no match either.
+    expect(c.autoDecode('transactionReferenceNumber')).toEqual([]);
+    expect(c.autoDecode('formaldehydesulphoxylate')).toEqual([]);
+    expect(c.autoDecode('scientificophilosophical')).toEqual([]);
+  });
+
+  it('still SHOWS binary when a decoder is chosen by hand', () => {
+    // Rejecting a guess is not the same as refusing to decode: picking Base64 explicitly
+    // in the decoder must still render the bytes, as a hex dump.
+    expect(c.base64Decode('productType')).toBe('a6 ba 1d b9 cb 53 ca 97');
+    expect(c.hexDecode('a6ba1db9cb53ca97')).toBe('a6 ba 1d b9 cb 53 ca 97');
+    expect(c.bytesAsText(c.base64DecodeBytes('productType'))).toBeNull();
+    expect(c.bytesAsText(c.base64DecodeBytes('SGVsbG8='))).toBe('Hello');
   });
 });

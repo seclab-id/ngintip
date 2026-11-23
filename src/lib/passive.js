@@ -1,5 +1,5 @@
 // Passive analysis of captured traffic (Burp-style): scan request/response text
-// for secrets, tokens and interesting response headers. Pure and testable — no
+// for secrets, tokens and interesting response headers. Pure and testable - no
 // requests are made, it only reads what was already captured.
 //
 // The regex detectors live in passive-rules.js (BUILTIN_RULES); custom rules
@@ -13,8 +13,8 @@ export const SEVERITIES = ['high', 'medium', 'low', 'info'];
 const MAX_PER_RULE = 20;
 
 // Which resources passive scan looks at, by file extension / content-type. The
-// default focuses on static & source assets and text/JSON APIs — where secrets,
-// tokens and emails actually live — so images, fonts, video and binaries don't
+// default focuses on static & source assets and text/JSON APIs - where secrets,
+// tokens and emails actually live - so images, fonts, video and binaries don't
 // add noise. Add more extensions in the UI, or use '*' to scan everything.
 export const DEFAULT_PASSIVE_SCOPE = [
   'js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'json', 'map', 'html', 'htm',

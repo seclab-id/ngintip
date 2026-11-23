@@ -1,4 +1,4 @@
-// Passive-scan regex rules — all in one place so they're easy to add or edit.
+// Passive-scan regex rules - all in one place so they're easy to add or edit.
 //
 // Each rule matches request/response TEXT. To add one, copy a line and change:
 //   id       unique key (also used to group findings)
@@ -91,6 +91,6 @@ export const BUILTIN_RULES = [
   // the domain's first label must start with a letter (kills asset refs like
   // logo@2x.png), a lookbehind skips URL userinfo (https://key@host), and a
   // negative lookahead drops code/asset extensions that look like a TLD
-  // (main@bundle.js, theme@dark.css — see EMAIL_TLD_DENYLIST).
+  // (main@bundle.js, theme@dark.css - see EMAIL_TLD_DENYLIST).
   { id: 'email', title: 'Email address', severity: 'info', flags: 'gi', pattern: `(?<![\\w./@-])[a-z0-9]+(?:[._%+-][a-z0-9]+)*@[a-z][a-z0-9-]*(?:\\.[a-z0-9-]+)*\\.(?!(?:${EMAIL_TLD_ALT})\\b)[a-z]{2,24}\\b` },
 ];

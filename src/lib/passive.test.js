@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { compileRules, ruleError, scanFlow, scanResponseHeaders, scanText, flowInScope, parseScope, DEFAULT_PASSIVE_SCOPE } from './passive.js';
 import { BUILTIN_RULES } from './passive-rules.js';
 
@@ -164,5 +166,36 @@ describe('passive scanner', () => {
     expect(found).toEqual([{ type: 'ticket', severity: 'low', title: 'Ticket', where: 'response', match: '1234' }]);
     // An invalid rule is skipped, not thrown.
     expect(compileRules([{ id: 'bad', pattern: '(' }]).length).toBe(0);
+  });
+});
+
+// The scan is manual. That is a property of the code rather than of a render: "no scan
+// started by itself" cannot be observed in a suite where earlier tests have scanned, so
+// the call sites themselves are the test.
+describe('passive scan runs only when it is asked to', () => {
+  const read = (p) => readFileSync(resolve(import.meta.dirname, p), 'utf8');
+
+  it('the store never starts a scan of its own', () => {
+    // It used to, on a timer in init(), which read the body of every captured flow
+    // before anyone had asked for a single one.
+    expect([...read('store.svelte.js').matchAll(/this\.scanPassive\(/g)]).toHaveLength(0);
+  });
+
+  it('every scan in the Passive view hangs off a click', () => {
+    const view = read('../components/PassiveView.svelte');
+    const calls = [...view.matchAll(/store\.scanPassive\(/g)];
+    expect(calls.length).toBeGreaterThan(0);
+    for (const c of calls) {
+      expect(view.slice(Math.max(0, c.index - 40), c.index), 'a scan must be started by a click').toMatch(/onclick=\{\(\) => $/);
+    }
+  });
+
+  it('the empty state carries a scan button, not just a sentence about one', () => {
+    // "No findings yet" has to mean "nothing has been asked for", and the way to ask
+    // has to be on the screen that says it.
+    const view = read('../components/PassiveView.svelte');
+    const empty = view.slice(view.indexOf('<div class="empty">'), view.indexOf('{:else}', view.indexOf('<div class="empty">')));
+    expect(empty).toMatch(/class="btn primary scan-cta"/);
+    expect(empty).toMatch(/store\.scanPassive\(\)/);
   });
 });

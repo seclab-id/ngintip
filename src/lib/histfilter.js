@@ -10,6 +10,30 @@ export const STATUS_CLASSES = [
   { key: 'err', label: 'Error' },
 ];
 
+/** The three things the History switch can show. */
+export const HISTORY_KINDS = [
+  { key: 'all', label: 'All' },
+  { key: 'http', label: 'HTTP' },
+  { key: 'ws', label: 'WS' },
+];
+
+/** Whether a flow is a WebSocket connection.
+ *
+ *  A socket is opened by an ordinary HTTP GET carrying `Upgrade: websocket`, and the
+ *  answer is `101 Switching Protocols`. After that line the exchange is frames, not
+ *  requests, so 101 is the honest marker: the path can be anything, the method is
+ *  always GET, and nothing else in HTTP answers 101. */
+export function isWebSocket(flow) {
+  return Number(flow?.status) === 101;
+}
+
+/** A flow list narrowed to one kind. `all` returns the list untouched. */
+export function filterKind(flows, kind) {
+  if (kind !== 'http' && kind !== 'ws') return flows;
+  const want = kind === 'ws';
+  return flows.filter((f) => isWebSocket(f) === want);
+}
+
 export function emptyAdvanced() {
   return {
     methods: [],

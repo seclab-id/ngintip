@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Extensions - Ngintip docs</title>
+    <meta name="description" content="Python hooks: change traffic on the wire, decode a body for reading, or re-encode it on send." />
+    <meta name="theme-color" id="tc" content="#f5f6f9" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="Extensions - Ngintip docs" />
+    <meta property="og:description" content="Python hooks: change traffic on the wire, decode a body for reading, or re-encode it on send." />
+    <meta property="og:url" content="https://seclab-id.github.io/ngintip/extensions.html" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="style.css" />
+    <script>
+      try {
+        var t = localStorage.getItem('ngintip.site.theme');
+        if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+      } catch (e) {}
+      try {
+        var dark =
+          document.documentElement.dataset.theme === 'dark' ||
+          (!document.documentElement.dataset.theme && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        if (dark) document.getElementById('tc').content = '#0d0f14';
+      } catch (e) {}
+    </script>
+  </head>
+  <body class="doc">
+    <div class="peek" aria-hidden="true">
+      <svg class="eye" viewBox="0 0 120 64" aria-hidden="true">
+        <path class="eye-shape" d="M5 32s19-25 55-25 55 25 55 25-19 25-55 25S5 32 5 32z" />
+        <circle class="eye-iris" cx="60" cy="32" r="12" />
+        <circle class="eye-spark" cx="64.5" cy="27.5" r="3.4" />
+      </svg>
+      <span class="lid top"></span>
+      <span class="lid bottom"></span>
+    </div>
+    <a class="skip" href="#main">Skip to content</a>
+
+    <header class="topbar">
+      <a class="brand" href="./" aria-label="Ngintip home">
+        <span class="badge" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" /><circle cx="12" cy="12" r="3" /></svg>
+        </span>
+        <span class="brand-name">Ngintip</span>
+      </a>
+      <nav aria-label="Sections">
+        <a href="./">Home</a>
+        <a href="https://github.com/seclab-id/ngintip/releases/latest">Download</a>
+        <a href="https://github.com/seclab-id/ngintip">GitHub</a>
+      </nav>
+      <button id="theme" class="icon-btn" type="button" aria-label="Switch theme" title="Switch theme">
+        <svg viewBox="0 0 24 24" aria-hidden="true" class="sun"><circle cx="12" cy="12" r="4.2" /><path d="M12 2.5v2M12 19.5v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M2.5 12h2M19.5 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4" /></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true" class="moon"><path d="M20 14.2A8 8 0 0 1 9.8 4 8.1 8.1 0 1 0 20 14.2z" /></svg>
+      </button>
+    </header>
+
+    <div class="doc-wrap">
+      <aside class="toc">
+        <nav aria-label="Documentation">
+          <p class="toc-title">Ngintip docs</p>
+          <a href="docs.html">Overview</a>
+          <a href="performance.html">Performance</a>
+          <p class="toc-title">Getting started</p>
+          <a href="install.html">Install</a>
+          <a href="start.html">First run and the CA</a>
+          <a href="browser.html">Built-in browser</a>
+          <p class="toc-title">Capture</p>
+          <a href="history.html">History</a>
+          <a href="intercept.html">Intercept</a>
+          <p class="toc-title">Replay</p>
+          <a href="repeater.html">Repeater</a>
+          <a href="intruder.html">Intruder</a>
+          <a href="organizer.html">Organizer</a>
+          <p class="toc-title">Automation</p>
+          <a href="automation.html">Rules and Passive Scan</a>
+          <a href="extensions.html" aria-current="page">Extensions</a>
+          <a href="mcp.html">MCP server</a>
+          <p class="toc-title">Reference</p>
+          <a href="tools.html">Decoder and Comparer</a>
+          <a href="projects.html">Projects and Footprint</a>
+          <a href="about.html">About</a>
+        </nav>
+      </aside>
+
+      <article class="prose" id="main">
+        <h1>Extensions</h1>
+        <p class="section-lead">
+  Python hooks, with a clear line between changing traffic and merely reading it. This page is long on purpose: most
+  extension bugs are a hook chosen in the wrong column.
+</p>
+
+<h2 id="hooks">The three kinds of hook</h2>
+<table class="specs wide">
+  <thead><tr><th scope="col">Hook</th><th scope="col">Runs</th><th scope="col">Use it to</th></tr></thead>
+  <tbody>
+    <tr>
+      <th scope="row"><code>process_request</code><br /><code>process_response</code></th>
+      <td>Once per flow, on the wire</td>
+      <td>Change live traffic: add a header, flip a parameter. What History shows is what crossed the wire.</td>
+    </tr>
+    <tr>
+      <th scope="row"><code>decode_request</code><br /><code>decode_response</code></th>
+      <td>On demand, when a message is displayed or read</td>
+      <td>Make an encrypted or packed body readable. Display only: the wire is never changed.</td>
+    </tr>
+    <tr>
+      <th scope="row"><code>encode_request</code><br /><code>encode_response</code></th>
+      <td>On send, for an edited message</td>
+      <td>Turn the readable form back into the wire form when you send from Repeater or forward an intercept.</td>
+    </tr>
+  </tbody>
+</table>
+<p>
+  A hook you do not define is skipped entirely, so an extension pays nothing for the stages it leaves out. For an
+  encrypted API the pattern is <code>decode_*</code> to read and <code>encode_*</code> to send, with no
+  <code>process_*</code> at all: the ciphertext on the wire stays exactly what the target sent and what you send back.
+</p>
+<p class="callout">
+  <strong>When each one fires.</strong> <code>process_*</code> runs as the message passes through the proxy, once.
+  <code>decode_*</code> runs when something asks for the readable form, which means opening the flow in History, an
+  agent reading it over MCP, or a message being held in Intercept, and it runs again each time. <code>encode_*</code>
+  runs only on a send. If your log line is not appearing, that is almost always the reason.
+</p>
+
+<h2 id="message">The message object</h2>
+<table class="specs wide">
+  <thead><tr><th scope="col">Member</th><th scope="col">What it is</th></tr></thead>
+  <tbody>
+    <tr><th scope="row"><code>req.method</code>, <code>req.path</code>, <code>req.version</code></th><td>Request line, readable and writable.</td></tr>
+    <tr><th scope="row"><code>res.status</code>, <code>res.reason</code>, <code>res.version</code></th><td>Status line, readable and writable.</td></tr>
+    <tr><th scope="row"><code>m.host</code></th><td>Shortcut for the Host header.</td></tr>
+    <tr><th scope="row"><code>m.header(name, default)</code></th><td>One header, case-insensitive.</td></tr>
+    <tr><th scope="row"><code>m.headers</code></th><td><code>get</code>, <code>set</code>, <code>add</code>, <code>remove</code>, <code>get_all</code>, <code>items()</code>, <code>dict()</code>. Order is preserved.</td></tr>
+    <tr><th scope="row"><code>m.body</code> / <code>m.text</code></th><td>Bytes, or the same thing decoded as text. Both assignable.</td></tr>
+    <tr><th scope="row"><code>m.json()</code> / <code>m.set_json(obj)</code></th><td>Parse or replace a JSON body; setting it fixes the Content-Type.</td></tr>
+    <tr><th scope="row"><code>m.form()</code> / <code>m.set_form(dict)</code></th><td>The same for <code>application/x-www-form-urlencoded</code>.</td></tr>
+    <tr><th scope="row"><code>m.query()</code> / <code>m.set_query(dict)</code></th><td>The query string of the request path, as a dict.</td></tr>
+    <tr><th scope="row"><code>m.raw</code></th><td>The whole message as bytes, assignable if you would rather rebuild it yourself.</td></tr>
+  </tbody>
+</table>
+<p>
+  Mutate in place and return nothing, which is the recommended shape, or return a new message, bytes or a string.
+  Content-Length is recomputed when the message is serialized, so you never count bytes by hand.
+</p>
+<p class="note">
+  A hook that only looks at a message costs it nothing. If it returns nothing and changed nothing, the original bytes
+  are passed through untouched, so a logging extension never makes History mark every flow as Modified, and a hook
+  hunting for a Content-Length that disagrees with the body still sees the one that came off the wire.
+</p>
+
+<h2 id="ctx">The context</h2>
+<p>Every hook can take a second argument. It is optional: a one-argument hook still works.</p>
+<table class="specs wide">
+  <thead><tr><th scope="col">Field</th><th scope="col">What it tells you</th></tr></thead>
+  <tbody>
+    <tr><th scope="row"><code>ctx.surface</code></th><td><code>proxy</code>, <code>interceptor</code>, <code>repeater</code>, <code>intruder</code> or <code>test</code>: where this message is being handled.</td></tr>
+    <tr><th scope="row"><code>ctx.host</code>, <code>ctx.path</code></th><td>Where it is going, without parsing the message yourself.</td></tr>
+    <tr><th scope="row"><code>ctx.flow_id</code></th><td>The History row this belongs to: proxied traffic, a message held in the interceptor, a stored flow being decoded for display, and a <code>repeater_send</code> over MCP. <code>None</code> for a send from the Repeater tab or from Intruder, which keep their own history and are not rows in History at all.</td></tr>
+    <tr><th scope="row"><code>ctx.edited</code></th><td>True when a human actually changed the message before this send. Useful in <code>encode_*</code> to leave an untouched message alone.</td></tr>
+    <tr><th scope="row"><code>ctx.state</code></th><td>A dict that survives between flows for as long as the worker lives. This is where a harvested key goes.</td></tr>
+    <tr><th scope="row"><code>ctx.log(*args)</code></th><td>Writes to the Debug console. <code>print()</code> goes there too; neither can corrupt the protocol.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="cases">Worked examples</h2>
+
+<h3>1. Read an encrypted body, leave the wire alone</h3>
+<p>The common case: an API whose bodies are AES-encrypted, so History shows base64 and nothing else.</p>
+<pre class="code"><code>import base64, json
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+
+KEY = bytes.fromhex("00112233445566778899aabbccddeeff")
+
+def _dec(blob):
+    raw = base64.b64decode(blob)
+    iv, body = raw[:16], raw[16:]
+    return unpad(AES.new(KEY, AES.MODE_CBC, iv).decrypt(body), 16)
+
+def decode_response(res, ctx=None):
+    if res.header("Content-Type", "").startswith("application/json"):
+        return                      <span class="c"># already readable</span>
+    res.body = _dec(res.text)       <span class="c"># display only; the wire keeps its ciphertext</span>
+    res.set_header("Content-Type", "application/json")
+
+def decode_request(req, ctx=None):
+    if req.body:
+        req.body = _dec(req.text)</code></pre>
+<p>
+  History now shows a <em>Wire</em> and an <em>Extension</em> version side by side. Search, passive rules and the MCP
+  server all see the readable one, which is the point: a finding you cannot grep for is a finding you will miss.
+</p>
+
+<h3>2. Send an edited body back encrypted</h3>
+<p>The other half. Without it, editing a decrypted body in Repeater would send plaintext to a target expecting AES.</p>
+<pre class="code"><code>import os
+def _enc(data):
+    iv = os.urandom(16)
+    ct = AES.new(KEY, AES.MODE_CBC, iv).encrypt(pad(data, 16))
+    return base64.b64encode(iv + ct)
+
+def encode_request(req, ctx=None):
+    if not req.body:
+        return
+    req.body = _enc(req.body)
+    req.set_header("Content-Type", "text/plain")</code></pre>
+<p>
+  Use <code>ctx.edited</code> if you want to re-encrypt only what a human actually touched, and let an untouched
+  replay go out byte for byte as it arrived.
+</p>
+
+<h3>3. Harvest a session key at login and use it later</h3>
+<p>
+  Many encrypted APIs hand you the key once, in the login response. <code>ctx.state</code> is a dict that outlives the
+  flow, so the key you catch at 09:00 decrypts the traffic at 11:00.
+</p>
+<pre class="code"><code>def decode_response(res, ctx=None):
+    if ctx and ctx.path.endswith("/api/login"):
+        ctx.state["key"] = bytes.fromhex(res.json()["sessionKey"])
+        ctx.log("session key captured for", ctx.host)
+        return
+    key = ctx.state.get("key") if ctx else None
+    if key and res.body:
+        res.body = decrypt_with(key, res.body)</code></pre>
+
+<h3>4. Add or rewrite a header on live traffic</h3>
+<pre class="code"><code>def process_request(req, ctx=None):
+    req.set_header("X-Forwarded-For", "127.0.0.1")
+    req.headers.remove("If-None-Match")     <span class="c"># stop 304s hiding bodies</span></code></pre>
+<p>This one does change the wire, so History will show the message as it was actually sent. That is the trade.</p>
+
+<h3>5. Re-sign a request after you edit it</h3>
+<p>
+  A body signed with an HMAC breaks the moment you touch it. Recompute the signature on the way out and the Repeater
+  becomes usable against a signed API.
+</p>
+<pre class="code"><code>import hashlib, hmac
+
+SECRET = b"shared-secret"
+
+def encode_request(req, ctx=None):
+    mac = hmac.new(SECRET, req.body, hashlib.sha256).hexdigest()
+    req.set_header("X-Signature", mac)</code></pre>
+
+<h3>6. Unwrap a packed body for reading</h3>
+<p>Base64 inside JSON, gzip inside base64, a protobuf blob: anything you can undo in Python, you can read in the UI.</p>
+<pre class="code"><code>import gzip, base64
+
+def decode_response(res, ctx=None):
+    data = res.json()
+    if "payload" in data:
+        res.body = gzip.decompress(base64.b64decode(data["payload"]))</code></pre>
+
+<h3>7. Do it only where it matters</h3>
+<p>
+  <code>ctx.surface</code> keeps an experiment out of your capture: transform what you send by hand, and leave the
+  browser's traffic exactly as it was.
+</p>
+<pre class="code"><code>def process_request(req, ctx=None):
+    if ctx and ctx.surface != "repeater":
+        return
+    req.set_header("X-Debug", "1")</code></pre>
+
+<h3>8. Strip a header that is in your way</h3>
+<pre class="code"><code>def process_response(res, ctx=None):
+    for h in ("Content-Security-Policy", "X-Frame-Options", "Strict-Transport-Security"):
+        res.headers.remove(h)</code></pre>
+<p class="note">
+  Useful while testing a UI, dishonest in a report: the target did send those headers. Turn the extension off before
+  you capture evidence, or do it with a match and replace rule, which keeps the original beside the rewritten version.
+</p>
+
+<h2 id="scope">Choosing where it runs</h2>
+<p>
+  Each extension carries its own surface scope, which is how you keep an experiment out of your capture. The value is
+  a list, and the names are the surfaces a message can arrive from:
+</p>
+<table class="specs wide">
+  <thead><tr><th scope="col">Scope</th><th scope="col">The extension runs on</th></tr></thead>
+  <tbody>
+    <tr><th scope="row"><code>all</code></th><td>Everything. This is the default, and <code>both</code> or an empty value mean the same.</td></tr>
+    <tr><th scope="row"><code>proxy</code></th><td>Traffic flowing through the proxy from a browser or client.</td></tr>
+    <tr><th scope="row"><code>interceptor</code></th><td>Messages held in Intercept, before you forward them.</td></tr>
+    <tr><th scope="row"><code>repeater</code></th><td>Only what you send by hand. The browser's traffic is untouched.</td></tr>
+    <tr><th scope="row"><code>intruder</code></th><td>Only the requests an attack generates.</td></tr>
+    <tr><th scope="row"><code>repeater, intruder</code></th><td>Any combination, separated by a comma, space, <code>|</code> or <code>+</code>.</td></tr>
+  </tbody>
+</table>
+<p>
+  So an extension that re-signs a body can be scoped to <code>repeater</code> alone: it fixes the requests you craft,
+  and the recorded browser traffic stays exactly as the application sent it. The same value is readable at runtime as
+  <code>ctx.surface</code>, so a single extension can also branch on it instead of being scoped.
+</p>
+<p class="callout">
+  The host scope applies first and independently. A host outside your target scope never reaches any extension, no
+  matter what surface scope it has.
+</p>
+
+<h2 id="howitworks">How it actually runs</h2>
+<p>Worth knowing, because it explains both the speed and the limits:</p>
+<ul>
+  <li>
+    Each enabled extension is a <strong>long-lived Python process</strong>, started when you enable it. It is not
+    restarted per request, which is why <code>ctx.state</code> can hold a key between flows and why an import cost is
+    paid once.
+  </li>
+  <li>
+    The app talks to it over <strong>newline-delimited JSON on stdin and stdout</strong>, with the message passed as
+    base64, so a body full of raw bytes survives the trip unchanged. Your <code>print</code> goes to stderr, which is
+    why it can never corrupt that channel.
+  </li>
+  <li>
+    The app <strong>scans your file for the hooks it defines</strong> and only calls those. Define
+    <code>decode_response</code> alone and nothing else costs you anything.
+  </li>
+  <li>
+    Calls are <strong>serialized per extension</strong>: one message in, one reply out. A hook that blocks for a
+    second makes every message behind it wait a second, so do slow work once and cache it in <code>ctx.state</code>.
+  </li>
+  <li>
+    If the worker dies or an exception escapes your hook, the message <strong>passes through unchanged</strong> and
+    the error is reported against that extension in the Debug console. Traffic is never dropped because a script
+    broke.
+  </li>
+</ul>
+
+<h2 id="running">Running and debugging</h2>
+<ul>
+  <li><strong>Debug console.</strong> <code>print()</code> and <code>ctx.log()</code> both land there. Nothing you print can corrupt the protocol between the app and your script.</li>
+  <li><strong>Test tab.</strong> Dry-run one hook against a sample message and see the output and the log without touching a target.</li>
+  <li><strong>Scope.</strong> Each extension has its own surface scope, and the host scope still applies: an out-of-scope host never reaches your code.</li>
+  <li><strong>Virtualenv.</strong> Each extension gets its own, managed in the app, so <code>pycryptodome</code> for one target does not collide with another.</li>
+  <li><strong>Failure.</strong> An exception is reported against that extension and the message passes through unchanged, rather than dropping traffic on the floor.</li>
+</ul>
+        <nav class="pager" aria-label="Page">
+          <a class="prev" href="automation.html"><span>Previous</span>Rules and Passive Scan</a>
+          <a class="next" href="mcp.html"><span>Next</span>MCP server</a>
+        </nav>
+      </article>
+    </div>
+
+    <footer>
+      <div class="foot-row">
+        <a class="brand small" href="./">
+          <span class="badge" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" /><circle cx="12" cy="12" r="3" /></svg>
+          </span>
+          <span class="brand-name">Ngintip</span>
+        </a>
+        <nav aria-label="Links">
+          <a href="docs.html">Docs</a>
+          <a href="https://github.com/seclab-id/ngintip">Repository</a>
+          <a href="https://github.com/seclab-id/ngintip/releases">Releases</a>
+          <a href="https://github.com/seclab-id/ngintip/issues">Issues</a>
+        </nav>
+      </div>
+    </footer>
+
+    <script src="app.js" defer></script>
+  </body>
+</html>

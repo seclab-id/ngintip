@@ -75,7 +75,7 @@
         <button class="btn ghost sm" onclick={clearRecipe} disabled={!dec.recipe.length}>Clear recipe</button>
       </div>
       {#if !dec.recipe.length}
-        <div class="recipe-empty dim">No steps — the input passes through unchanged. Chain e.g. <span class="mono">URL → Base64 → Hex</span>.</div>
+        <div class="recipe-empty dim">No steps - the input passes through unchanged. Chain e.g. <span class="mono">URL → Base64 → Hex</span>.</div>
       {:else}
         <ol class="steps">
           {#each dec.recipe as id, i (i + ':' + id)}

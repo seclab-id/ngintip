@@ -1,12 +1,18 @@
 [package]
 name = "ngintip"
-version = "0.3.0"
+version = "0.4.0"
 description = "Intercepting HTTP(S) proxy"
 edition = "2021"
 
 [lib]
 name = "ngintip_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# macOS only, and only for one call: handing the browser we just launched the
+# foreground (see browser::activate_when_ready). Already in the tree via Tauri, and
+# narrowed to the one class so it adds nothing to compile.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "libc", "NSRunningApplication"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

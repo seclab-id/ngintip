@@ -618,6 +618,31 @@ pub fn set_flow_meta(state: State<AppState>, id: u64, note: String, color: Strin
         .map_err(|e| e.to_string())
 }
 
+/// Set the highlight colour on many flows at once, leaving their notes alone.
+///
+/// `async` for the same reason as `delete_flows`, and it exists at all because the window
+/// used to send one `set_flow_meta` per selected flow: select-all on a 39K project meant
+/// 39,662 commands in flight, each taking the store mutex on the IPC thread, on top of
+/// an O(selection x history) lookup in the frontend to find each note. One command, one
+/// transaction per chunk, notes untouched.
+#[tauri::command]
+pub async fn set_flow_colors(state: State<'_, AppState>, ids: Vec<u64>, color: String) -> CmdResult<usize> {
+    let ctx = state.ctx.clone();
+    let gen = ctx.store.generation();
+    let total = ids.len();
+    let done = tauri::async_runtime::spawn_blocking(move || ctx.store.set_color(&ids, &color, gen))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    if done < total {
+        state.ctx.log_warn(
+            "history",
+            format!("highlighted {done} of {total} request(s); the project changed before the rest were updated"),
+        );
+    }
+    Ok(done)
+}
+
 /// Delete flows by id.
 ///
 /// `async` on purpose: a non-async command compiles to `ExecutionContext::Blocking` and
@@ -864,6 +889,10 @@ fn human_size(n: usize) -> String {
     if i == 0 { format!("{n} B") } else { format!("{v:.1} {}", U[i]) }
 }
 
+// Production reads a project through `decompress_file_to`, which only ever looks at the
+// header, so these two in-memory helpers are now the reference/round-trip counterparts
+// exercised by the tests, exactly like `compress_bytes`.
+#[cfg(test)]
 pub fn is_compressed(bytes: &[u8]) -> bool {
     project_magic(bytes).is_some()
 }
@@ -899,7 +928,7 @@ pub fn compress_bytes(raw: &[u8]) -> Result<Vec<u8>, String> {
 /// instead of reading the whole SQLite file into a Vec and compressing it in RAM: a
 /// multi-GB project no longer needs multi-GB of peak memory to save. The on-disk format
 /// is byte-compatible with `compress_bytes` (same header + zstd stream), so
-/// `decompress_bytes` reads either. Returns (uncompressed size, compressed size).
+/// `decompress_file_to` reads either. Returns (uncompressed size, compressed size).
 fn compress_file_to(src: &Path, dest: &Path) -> Result<(u64, u64), String> {
     use std::io::Write;
     let raw_len = std::fs::metadata(src).map_err(|e| format!("Failed to read project: {e}"))?.len();
@@ -920,6 +949,80 @@ fn compress_file_to(src: &Path, dest: &Path) -> Result<(u64, u64), String> {
     Ok((raw_len, comp_len))
 }
 
+/// Expand a project document at `src` into an uncompressed SQLite file at `dest`, with a
+/// fixed buffer regardless of how big either one is. The counterpart of
+/// [`compress_file_to`], and the reason it exists is the same: opening a project used to
+/// `fs::read` the whole document, decompress it into a second `Vec`, then write that out,
+/// so a 426 MB document holding a 1.6 GB project needed about 2 GB of peak memory just to
+/// be opened. Streaming it costs a few MB. Returns the uncompressed size.
+///
+/// `io::copy` is deliberately not used on its own: its default path copies through an
+/// 8 KiB stack buffer, which for 1.6 GB is roughly 200,000 write syscalls. A `BufWriter`
+/// is what gets std to use a large buffer, and it is also why `flush` must be explicit.
+///
+/// Every format the old path accepted still works: current zstd, legacy gzip, and a plain
+/// SQLite file from before projects were compressed at all.
+fn decompress_file_to(src: &Path, dest: &Path) -> Result<u64, String> {
+    use std::io::{BufWriter, Write};
+
+    let mut file = std::fs::File::open(src).map_err(|e| format!("Failed to read {}: {e}", src.display()))?;
+    // Only the header is read up front, so nothing here depends on the file's size.
+    let mut head = vec![0u8; brand::MAGIC.len() + 1];
+    let read = read_header(&mut file, &mut head).map_err(|e| format!("Failed to read {}: {e}", src.display()))?;
+    let head = &head[..read];
+
+    let Some(magic) = project_magic(head) else {
+        // A plain SQLite project (or anything else): copy it as-is. `fs::copy` rather
+        // than a stream, because on APFS that is a copy-on-write clone instead of moving
+        // the bytes, and it preserves the previous behaviour of writing the file through
+        // unchanged.
+        return std::fs::copy(src, dest).map_err(|e| format!("Failed to open project: {e}"));
+    };
+    let version = head[magic.len()];
+
+    // Rewind past nothing: the header has been consumed, so the reader is already
+    // positioned at the compressed body.
+    use std::io::Seek;
+    file.seek(std::io::SeekFrom::Start((magic.len() + 1) as u64))
+        .map_err(|e| format!("Failed to read {}: {e}", src.display()))?;
+
+    let out = std::fs::File::create(dest).map_err(|e| format!("Failed to write {}: {e}", dest.display()))?;
+    let mut out = BufWriter::with_capacity(1 << 20, out);
+    let written = match version {
+        PROJECT_VERSION => {
+            let mut dec = zstd::stream::read::Decoder::new(file).map_err(|e| format!("Failed to decompress: {e}"))?;
+            std::io::copy(&mut dec, &mut out).map_err(|e| format!("Failed to decompress: {e}"))?
+        }
+        PROJECT_VERSION_GZIP => {
+            // Projects saved by older versions use gzip.
+            let mut dec = flate2::read::GzDecoder::new(file);
+            std::io::copy(&mut dec, &mut out).map_err(|e| format!("Failed to decompress: {e}"))?
+        }
+        v => return Err(format!("Unsupported .{} format version {v}", brand::PROJECT_EXT)),
+    };
+    // Both of these have to be checked: a BufWriter dropped unflushed swallows the error
+    // and leaves a short file that SQLite would then be handed.
+    out.flush().map_err(|e| format!("Failed to write {}: {e}", dest.display()))?;
+    out.into_inner()
+        .map_err(|e| format!("Failed to write {}: {e}", dest.display()))?
+        .sync_all()
+        .map_err(|e| format!("Failed to write {}: {e}", dest.display()))?;
+    Ok(written)
+}
+
+/// Fill `buf` from `r`, tolerating a file shorter than the header. Returns how much was read.
+fn read_header(r: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..])? {
+            0 => break,
+            k => n += k,
+        }
+    }
+    Ok(n)
+}
+
+#[cfg(test)]
 pub fn decompress_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let Some(magic) = project_magic(bytes) else {
@@ -1179,13 +1282,10 @@ pub fn open_startup(dir: &Path) -> anyhow::Result<(store::Store, Option<PathBuf>
 
     let wp = fresh_working_path(dir);
     if let Some(doc) = &document {
-        let bytes = std::fs::read(doc)?;
-        let raw = if is_compressed(&bytes) {
-            decompress_bytes(&bytes).map_err(|e| anyhow::anyhow!("{e}"))?
-        } else {
-            bytes
-        };
-        std::fs::write(&wp, &raw)?;
+        // Streamed for the same reason as `open_project`: a 1.6 GB project no longer
+        // needs ~2 GB of memory to be loaded. No window exists yet at this point, so
+        // here it is purely about memory, not responsiveness.
+        decompress_file_to(doc, &wp).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     let store = store::Store::open(&wp)?;
     write_ptr(dir, WORKING_PTR, &wp);
@@ -1197,6 +1297,10 @@ pub fn open_startup(dir: &Path) -> anyhow::Result<(store::Store, Option<PathBuf>
 #[tauri::command]
 pub fn blank_project(app: tauri::AppHandle, state: State<AppState>) -> CmdResult<ProjectInfo> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    // Takes the same guard as `open_project`, because the hazard is two swaps overlapping,
+    // not two opens. This one stays synchronous: it writes no file, so there is nothing to
+    // keep the window waiting for.
+    let _swap = SwapGuard::acquire(&state.swapping)?;
     release_project(&state);
     let wp = fresh_working_path(&dir);
     switch_working(&dir, &state, &wp)?;
@@ -1214,19 +1318,74 @@ pub fn blank_project(app: tauri::AppHandle, state: State<AppState>) -> CmdResult
     Ok(project_info_of(&state))
 }
 
+/// Held for the whole of a project swap; see [`AppState::swapping`]. Releases on drop, so
+/// an early return or a panic cannot leave the app refusing to open anything again.
+struct SwapGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> SwapGuard<'a> {
+    fn acquire(flag: &'a std::sync::atomic::AtomicBool) -> Result<Self, String> {
+        use std::sync::atomic::Ordering;
+        flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| SwapGuard(flag))
+            .map_err(|_| "A project is already being opened".to_string())
+    }
+}
+
+impl Drop for SwapGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Open a project file (compressed `.ngintip` or a legacy plain SQLite one) by
 /// loading it into a fresh working copy.
+///
+/// `async` on purpose, and this is the whole reason the swap guard exists. A non-async
+/// command compiles to `ExecutionContext::Blocking` and runs on the thread that dispatches
+/// IPC, which on macOS is the main thread: expanding a 1.6 GB project there froze the
+/// entire window, animation and all, for as long as it took. The file work now happens on
+/// the blocking pool, so the window keeps painting and the overlay keeps moving.
+///
+/// What that buys has to be paid for once: with the main thread free, a second open can
+/// start while this one is still expanding its file. See [`AppState::swapping`] for what
+/// two overlapping swaps do to each other.
 #[tauri::command]
-pub fn open_project(app: tauri::AppHandle, state: State<AppState>, path: String) -> CmdResult<ProjectInfo> {
+pub async fn open_project(app: tauri::AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<ProjectInfo> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let bytes = std::fs::read(&path).map_err(|e| format!("Failed to read {path}: {e}"))?;
-    let raw = if is_compressed(&bytes) { decompress_bytes(&bytes)? } else { bytes };
-
-    // After the file has been read and decompressed, so an unreadable project fails
-    // without having torn down the one that is still open.
-    release_project(&state);
+    let _swap = SwapGuard::acquire(&state.swapping)?;
     let wp = fresh_working_path(&dir);
-    std::fs::write(&wp, &raw).map_err(|e| format!("Failed to open project: {e}"))?;
+
+    // Streamed on the blocking pool: the whole point of being async. Nothing can adopt
+    // `wp` yet, because WORKING_PTR is only rewritten inside `switch_working` after the
+    // store has actually been switched to it, and `open_startup` follows only the pointer.
+    let src = PathBuf::from(&path);
+    let target = wp.clone();
+    let expanded = tauri::async_runtime::spawn_blocking(move || {
+        decompress_file_to(&src, &target).and_then(|_| {
+            // Opened and queried before anything is torn down, so a truncated or corrupt
+            // file is caught HERE. Without the probe, streaming straight to the working
+            // path would have weakened the guarantee below: a half-written file would be
+            // handed to `switch_working` with the previous project already released.
+            let probe = store::Store::open(&target).map_err(|e| format!("Failed to open project: {e:#}"))?;
+            // `stats` counts without materialising a row, so this stays cheap on a
+            // 39K-flow project while still reading the flows table rather than only the
+            // database header.
+            probe.stats().map(|_| ()).map_err(|e| format!("Not a readable project: {e}"))
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // After the file has been read and expanded, so an unreadable project fails
+    // without having torn down the one that is still open.
+    if let Err(e) = expanded {
+        remove_working_file(&wp);
+        return Err(e);
+    }
+
+    // One straight-line block from here down, with no `await` in it: the swap must not be
+    // interleaved, and nothing holding a `std::sync::MutexGuard` may cross an await.
+    release_project(&state);
     switch_working(&dir, &state, &wp)?;
     // Point the manager at the project folder + its saved interpreter/venv FIRST, so the
     // extension set that `adopt` loads starts its workers with the right interpreter.
@@ -1834,6 +1993,63 @@ pub fn save_binary(path: String, data: String) -> CmdResult<()> {
     std::fs::write(&path, bytes).map_err(|e| format!("Failed to write {path}: {e}"))
 }
 
+/// The window's answer to a `render-flow` event: the PNG it drew (base64), or why it
+/// could not. See render.rs; the MCP tool `history_image` is what is waiting.
+///
+/// An id nobody is waiting on is not an error: the caller may have timed out, in which
+/// case the drawing was simply wasted. Saying so lets the window stop retrying rather
+/// than treat it as a failure to report.
+/// Open a WebSocket from the Repeater. Recorded as a flow, so the rest of the app sees
+/// it without knowing the Repeater exists; see wsrepeater.rs for why that is the design.
+#[tauri::command]
+pub async fn ws_repeater_open(state: State<'_, AppState>, url: String) -> CmdResult<crate::wsrepeater::Opened> {
+    let ctx = state.ctx.clone();
+    let sockets = ctx.ws_repeater.clone();
+    sockets.open(&ctx, &url).await.map_err(|e| format!("{e:#}"))
+}
+
+/// Send one frame into an open socket. `kind` is text, binary, ping or pong.
+#[tauri::command]
+pub fn ws_repeater_send(state: State<AppState>, conn_id: u64, kind: String, text: Option<String>, base64: Option<String>) -> CmdResult<u64> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let payload = match (&text, &base64) {
+        (_, Some(b64)) => STANDARD.decode(b64).map_err(|e| format!("bad base64 payload: {e}"))?,
+        (Some(t), None) => t.as_bytes().to_vec(),
+        (None, None) => Vec::new(),
+    };
+    let ctx = state.ctx.clone();
+    ctx.ws_repeater.clone().send(&ctx, conn_id, &kind, &payload).map_err(|e| format!("{e:#}"))
+}
+
+/// Close a socket with a code (1000 = normal) and an optional reason.
+#[tauri::command]
+pub fn ws_repeater_close(state: State<AppState>, conn_id: u64, code: Option<u16>, reason: Option<String>) -> CmdResult<()> {
+    let ctx = state.ctx.clone();
+    ctx.ws_repeater
+        .clone()
+        .close(&ctx, conn_id, code.unwrap_or(1000), reason.as_deref().unwrap_or(""))
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// The sockets still open, as `[connId, flowId]`, so a reopened view can find its tabs.
+#[tauri::command]
+pub fn ws_repeater_open_list(state: State<AppState>) -> CmdResult<Vec<(u64, u64)>> {
+    Ok(state.ctx.ws_repeater.list())
+}
+
+#[tauri::command]
+pub fn render_result(state: State<AppState>, req_id: u64, data: Option<String>, error: Option<String>) -> CmdResult<bool> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let answer = match (data, error) {
+        (Some(d), _) => STANDARD
+            .decode(d.as_bytes())
+            .map_err(|e| format!("the window sent image data that is not base64: {e}")),
+        (None, Some(e)) => Err(e),
+        (None, None) => Err("the window returned neither an image nor a reason".to_string()),
+    };
+    Ok(state.ctx.render.finish(req_id, answer))
+}
+
 /// Put an image on the system clipboard from raw RGBA canvas pixels (base64). The
 /// webview's async clipboard image API is unreliable, so the capture editor sends
 /// `canvas.getImageData()` here and we copy it natively via arboard.
@@ -1940,6 +2156,25 @@ pub fn mcp_status(state: State<AppState>) -> McpStatus {
         port: if c.mcp_port == 0 { 8082 } else { c.mcp_port },
         docs_path: if c.mcp_docs_path.is_empty() { "/docs".into() } else { c.mcp_docs_path.clone() },
     }
+}
+
+/// Seconds to wait for a response before giving up on it; 0 = wait as long as it takes.
+///
+/// Not saved here. How patient to be is a judgement about the system under test, so it
+/// belongs to the open project (settings key `giveUp`) and the window applies it on
+/// every project load. This only moves the live value, which is what the proxy reads.
+#[tauri::command]
+pub fn set_give_up_after(state: State<AppState>, seconds: u64) -> CmdResult<()> {
+    let seconds = seconds.min(86_400);
+    state.ctx.set_give_up_after(seconds);
+    state.ctx.log_info(
+        "proxy",
+        match seconds {
+            0 => "response wait: no deadline".to_string(),
+            n => format!("response wait: giving up after {n}s"),
+        },
+    );
+    Ok(())
 }
 
 /// Toggle invisible proxying (non-proxy-aware clients routed by SNI/Host).
@@ -2327,13 +2562,16 @@ pub fn clear_repeater_history(state: State<AppState>, tab: u64) -> CmdResult<()>
 /// Python round-trip (programmatic one-offs that opted out).
 async fn send_with_fallback(ctx: &std::sync::Arc<proxy::Ctx>, target: &str, raw: &str, auto_length: bool, ext: Option<crate::extensions::Surface>) -> CmdResult<RepeaterResponse> {
     let host = host_of_target(target);
-    let sent = if let Some(s) = ext { ext_request(ctx, raw, &host, s).await } else { None };
+    let path = start_line_path(raw);
+    // No flow id: these sends keep their own tab/run history and are not rows in
+    // History at all, so there is no row for an extension to name.
+    let sent = if let Some(s) = ext { ext_request(ctx, raw, &host, &path, s, None).await } else { None };
     let sent_raw = sent.as_deref().unwrap_or(raw);
     let (request, proto) = repeater_request(target, sent_raw, auto_length, None)?;
-    let mut result = repeater_exchange(ctx, request, proto, ext, &host).await;
+    let mut result = repeater_exchange(ctx, request, proto, ext, &host, &path).await;
     if result.is_err() && proto == proxy::Proto::PreferHttp2 {
         if let Ok((request, _)) = repeater_request(target, sent_raw, auto_length, Some(proxy::Proto::Http1)) {
-            let retry = repeater_exchange(ctx, request, proxy::Proto::Http1, ext, &host).await;
+            let retry = repeater_exchange(ctx, request, proxy::Proto::Http1, ext, &host, &path).await;
             if retry.is_ok() {
                 result = retry;
             }
@@ -2437,7 +2675,24 @@ fn resolve_uri(target: &str, req_target: &str) -> Result<Uri, String> {
 
 /// Build the request-side Flow (method/uri/version/headers/body) from a raw
 /// request, so a tool-driven send can be recorded in History.
+/// The request target exactly as the start line writes it, without parsing the whole
+/// message. `ctx.path` is then populated on every surface, so an extension's scope
+/// checks and its log lines read the same wherever it runs.
+fn start_line_path(raw: &str) -> String {
+    raw.lines().next().unwrap_or("").split_whitespace().nth(1).unwrap_or("").to_string()
+}
+
 fn request_flow(ctx: &proxy::Ctx, target: &str, raw: &str) -> CmdResult<store::Flow> {
+    let (id, gen) = ctx.store.next_id_at();
+    request_flow_as(target, raw, id, gen)
+}
+
+/// The same row, built from an id that has already been minted.
+///
+/// `send_recorded` needs this. It has to name the row BEFORE the extension hooks run,
+/// so a hook can be told which History row it is about to rewrite, and then rebuild the
+/// row from whatever those hooks produced. Those two have to be one row, not two.
+fn request_flow_as(target: &str, raw: &str, id: u64, gen: u64) -> CmdResult<store::Flow> {
     let parsed = raw::parse_request(raw).map_err(|e| e.to_string())?;
     let uri = resolve_uri(target, &parsed.target)?;
     let method = Method::from_bytes(parsed.method.as_bytes()).map_err(|e| e.to_string())?;
@@ -2449,7 +2704,6 @@ fn request_flow(ctx: &proxy::Ctx, target: &str, raw: &str) -> CmdResult<store::F
         }
     }
     let body = raw::restore_crlf(&parsed.body, None, &parsed.headers);
-    let (id, gen) = ctx.store.next_id_at();
     Ok(store::Flow::request(id, &method, &uri, version, &headers, body).at(gen))
 }
 
@@ -2461,15 +2715,27 @@ pub async fn send_recorded(ctx: &std::sync::Arc<proxy::Ctx>, tab: Option<u64>, t
     // Repeater-scope extensions transform the request before it is sent; History
     // then shows the sent (transformed) request with the typed one under "Original".
     let host = host_of_target(target);
-    let sent = ext_request(ctx, raw, &host, crate::extensions::Surface::Repeater).await;
+    // Built from the typed request first. That mints the id and proves the request
+    // parses before any hook is told an id for it, so a hook is never handed the number
+    // of a row that then fails to exist.
+    let typed = request_flow(ctx, target, raw)?;
+    let (flow_id, gen, ts) = (typed.summary.id, typed.gen, typed.summary.ts);
+    let path = typed.summary.path.clone();
+    let sent = ext_request(ctx, raw, &host, &path, crate::extensions::Surface::Repeater, Some(flow_id)).await;
     let sent_raw = sent.as_deref().unwrap_or(raw);
-    let mut flow = request_flow(ctx, target, sent_raw)?;
-    if sent.is_some() {
-        flow.variants.req_original = Some(raw.to_string());
-    }
-    // Captured before `flow` is moved into the recorder below. The id exists from here
-    // on, so the caller can be handed it and read the exchange back instead of guessing
-    // which History row was its own.
+    let mut flow = match &sent {
+        // The hooks rewrote it, so the row has to be the version that goes on the wire.
+        // Same id, same generation, same timestamp: this is one send, not two.
+        Some(_) => {
+            let mut f = request_flow_as(target, sent_raw, flow_id, gen)?;
+            f.summary.ts = ts;
+            f.variants.req_original = Some(raw.to_string());
+            f
+        }
+        None => typed,
+    };
+    // Captured before `flow` is moved into the recorder below, so the caller can be
+    // handed the id and read the exchange back instead of guessing which row was its own.
     let (recorded_id, recorded_ts) = (flow.summary.id, flow.summary.ts);
     let (request, proto) = repeater_request(target, sent_raw, auto_length, None)?;
 
@@ -2487,7 +2753,8 @@ pub async fn send_recorded(ctx: &std::sync::Arc<proxy::Ctx>, tab: Option<u64>, t
     let result = match outcome {
         Ok((parts, bytes, truncated)) => {
             // Repeater-scope response extensions (e.g. decrypt) before display/record.
-            let (parts, bytes, res_original) = match ext_response(ctx, &parts, &bytes, &host, crate::extensions::Surface::Repeater).await {
+            let (parts, bytes, res_original) =
+                match ext_response(ctx, &parts, &bytes, &host, &path, crate::extensions::Surface::Repeater, Some(flow_id)).await {
                 Some((p, b, original)) => {
                     flow.variants.res_original = Some(original.clone());
                     (p, b, Some(original))
@@ -2663,23 +2930,40 @@ fn host_of_target(target: &str) -> String {
 
 /// Repeater-scope extensions applied to the request text before it is sent. Returns
 /// the transformed raw when an extension changed it.
-async fn ext_request(ctx: &std::sync::Arc<proxy::Ctx>, raw: &str, host: &str, surface: crate::extensions::Surface) -> Option<String> {
+async fn ext_request(
+    ctx: &std::sync::Arc<proxy::Ctx>,
+    raw: &str,
+    host: &str,
+    path: &str,
+    surface: crate::extensions::Surface,
+    flow_id: Option<u64>,
+) -> Option<String> {
     if !ctx.extensions.active() {
         return None;
     }
     let ext = ctx.clone();
     let cur = raw.as_bytes().to_vec();
     let host = host.to_string();
+    let path = path.to_string();
     let out = tauri::async_runtime::spawn_blocking(move || {
         // Outgoing request: process (wire edits) then encode (e.g. encrypt the body you
         // typed as plaintext). A Repeater / Intruder send is always treated as edited.
         let mut buf = cur;
         let mut changed = false;
-        if let Some(p) = ext.extensions.transform(crate::extensions::Phase::Request, &buf, surface) {
+        // `flow_id` is Some only where this send really becomes a History row, which
+        // today is `send_recorded` (repeater_send over MCP). The UI Repeater and
+        // Intruder keep their own history and are not rows in History at all, so they
+        // pass None rather than point an extension at somebody else's row.
+        if let Some(p) = ext.extensions.transform(
+            crate::extensions::Phase::Request,
+            &buf,
+            surface,
+            &crate::extensions::HookCtx { host: host.clone(), path: path.clone(), flow_id, ..Default::default() },
+        ) {
             buf = p;
             changed = true;
         }
-        let hc = crate::extensions::HookCtx { host, edited: true, ..Default::default() };
+        let hc = crate::extensions::HookCtx { host, path, flow_id, edited: true, ..Default::default() };
         if let Some(e) = ext.extensions.encode(crate::extensions::Phase::Request, &buf, surface, &hc) {
             buf = e;
             changed = true;
@@ -2699,7 +2983,9 @@ async fn ext_response(
     parts: &http::response::Parts,
     bytes: &bytes::Bytes,
     host: &str,
+    path: &str,
     surface: crate::extensions::Surface,
+    flow_id: Option<u64>,
 ) -> Option<(http::response::Parts, bytes::Bytes, String)> {
     if !ctx.extensions.active() {
         return None;
@@ -2715,17 +3001,24 @@ async fn ext_response(
     let ext = ctx.clone();
     let cur = original.clone().into_bytes();
     let host = host.to_string();
+    let path = path.to_string();
     let out = tauri::async_runtime::spawn_blocking(move || {
         // Arrived response: process (wire edits) then decode (e.g. decrypt) for display.
         // The pre-transform text is kept as Original by the caller. A response has no
-        // Host header, so the request's host is passed in ctx for the extension's scope.
+        // Host header or path of its own, so the request's are passed in ctx: for the
+        // extension's scope, and so both halves of one exchange name the same flow.
         let mut buf = cur;
         let mut changed = false;
-        if let Some(p) = ext.extensions.transform(crate::extensions::Phase::Response, &buf, surface) {
+        if let Some(p) = ext.extensions.transform(
+            crate::extensions::Phase::Response,
+            &buf,
+            surface,
+            &crate::extensions::HookCtx { host: host.clone(), path: path.clone(), flow_id, ..Default::default() },
+        ) {
             buf = p;
             changed = true;
         }
-        let hc = crate::extensions::HookCtx { host, ..Default::default() };
+        let hc = crate::extensions::HookCtx { host, path, flow_id, ..Default::default() };
         if let Some(d) = ext.extensions.decode(crate::extensions::Phase::Response, &buf, surface, &hc) {
             buf = d;
             changed = true;
@@ -2743,14 +3036,21 @@ async fn ext_response(
     Some((new_parts, parsed.body, original))
 }
 
-async fn repeater_exchange(ctx: &std::sync::Arc<proxy::Ctx>, request: Request<body::Body>, proto: proxy::Proto, ext: Option<crate::extensions::Surface>, host: &str) -> CmdResult<RepeaterResponse> {
+async fn repeater_exchange(
+    ctx: &std::sync::Arc<proxy::Ctx>,
+    request: Request<body::Body>,
+    proto: proxy::Proto,
+    ext: Option<crate::extensions::Surface>,
+    host: &str,
+    path: &str,
+) -> CmdResult<RepeaterResponse> {
     let started = Instant::now();
     let (parts, bytes, truncated) = exchange_parts(ctx, request, proto).await?;
     let dur = started.elapsed().as_millis() as u64;
     // Surface-scoped response extensions (e.g. decrypt) before display; the arrived
     // response is kept as `response_original` so the UI can show Original vs Final.
     if let Some(s) = ext {
-        if let Some((p, b, original)) = ext_response(ctx, &parts, &bytes, host, s).await {
+        if let Some((p, b, original)) = ext_response(ctx, &parts, &bytes, host, path, s, None).await {
             let mut res = build_response(&p, &b, truncated, dur);
             res.response_original = Some(original);
             return Ok(res);
@@ -3008,6 +3308,135 @@ mod tests {
         assert_eq!(decompress_bytes(&packed).unwrap(), raw, "streamed output round-trips");
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_file(&dst);
+    }
+
+    /// Unique temp path per call, so these tests can run in parallel.
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let stamp = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0),
+        );
+        std::env::temp_dir().join(format!("ngintip-test-{tag}-{stamp}"))
+    }
+
+    #[test]
+    fn stream_decompress_round_trips_without_loading_the_file() {
+        // The open path must read back exactly what the Save path wrote, byte for byte.
+        let raw: Vec<u8> = b"SQLite format 3\0".iter().copied().cycle().take(900_000).collect();
+        let src = tmp("dec-src");
+        let doc = tmp("dec-doc");
+        let out = tmp("dec-out");
+        std::fs::write(&src, &raw).unwrap();
+        compress_file_to(&src, &doc).unwrap();
+        let n = decompress_file_to(&doc, &out).unwrap();
+        assert_eq!(n as usize, raw.len(), "reports the uncompressed size");
+        assert_eq!(std::fs::read(&out).unwrap(), raw, "round-trips through the streaming path");
+        // And the in-memory helper agrees with it, so the two cannot drift apart.
+        assert_eq!(decompress_bytes(&std::fs::read(&doc).unwrap()).unwrap(), raw);
+        for p in [&src, &doc, &out] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn stream_decompress_still_reads_legacy_gzip() {
+        use std::io::Write;
+        // A project saved before zstd (version 1) must still open through the new path.
+        let raw = b"SQLite format 3\0 legacy project bytes".repeat(400);
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+        enc.write_all(&raw).unwrap();
+        let gz = enc.finish().unwrap();
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(brand::MAGIC);
+        legacy.push(PROJECT_VERSION_GZIP);
+        legacy.extend_from_slice(&gz);
+        let doc = tmp("gz-doc");
+        let out = tmp("gz-out");
+        std::fs::write(&doc, &legacy).unwrap();
+        assert_eq!(decompress_file_to(&doc, &out).unwrap() as usize, raw.len());
+        assert_eq!(std::fs::read(&out).unwrap(), raw);
+        let _ = std::fs::remove_file(&doc);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn stream_decompress_passes_through_a_plain_sqlite_project() {
+        // Projects from before compression existed are plain SQLite and are copied as-is.
+        let raw = b"SQLite format 3\0 an uncompressed project".to_vec();
+        let doc = tmp("plain-doc");
+        let out = tmp("plain-out");
+        std::fs::write(&doc, &raw).unwrap();
+        assert_eq!(decompress_file_to(&doc, &out).unwrap() as usize, raw.len());
+        assert_eq!(std::fs::read(&out).unwrap(), raw);
+        let _ = std::fs::remove_file(&doc);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn stream_decompress_refuses_a_truncated_or_unknown_project() {
+        // A document cut off mid-stream must be reported, not handed to SQLite as if it
+        // were whole. This is what the probe in `open_project` exists to catch.
+        let raw: Vec<u8> = b"SQLite format 3\0".iter().copied().cycle().take(500_000).collect();
+        let src = tmp("bad-src");
+        let doc = tmp("bad-doc");
+        let out = tmp("bad-out");
+        std::fs::write(&src, &raw).unwrap();
+        compress_file_to(&src, &doc).unwrap();
+        let packed = std::fs::read(&doc).unwrap();
+        std::fs::write(&doc, &packed[..packed.len() / 2]).unwrap();
+        assert!(decompress_file_to(&doc, &out).is_err(), "a half document is not a project");
+
+        // An unknown format version is refused rather than guessed at.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(brand::MAGIC);
+        bad.push(99);
+        bad.extend_from_slice(b"whatever follows");
+        std::fs::write(&doc, &bad).unwrap();
+        assert!(decompress_file_to(&doc, &out).is_err(), "unknown version");
+
+        // A file too short to even hold the header is refused, not panicked on.
+        std::fs::write(&doc, b"NG").unwrap();
+        let short = decompress_file_to(&doc, &out);
+        // Two bytes are not the magic, so this takes the plain-SQLite passthrough and
+        // copies them. What matters is that it does not panic and does not claim to have
+        // decompressed anything.
+        assert_eq!(short.unwrap(), 2);
+
+        for p in [&src, &doc, &out] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn stream_decompress_does_not_touch_the_destination_of_a_failed_read() {
+        // The source does not exist, so the destination must be left exactly as it was:
+        // `open_project` streams into a fresh working path and only then releases the
+        // project that is still open.
+        let doc = tmp("missing-doc");
+        let out = tmp("missing-out");
+        std::fs::write(&out, b"previous contents").unwrap();
+        assert!(decompress_file_to(&doc, &out).is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), b"previous contents", "left alone");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn one_project_swap_at_a_time() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = AtomicBool::new(false);
+        {
+            let first = SwapGuard::acquire(&flag).expect("the first swap starts");
+            assert!(flag.load(Ordering::SeqCst), "marked as in progress");
+            // A second swap starting while the first is still expanding its file is the
+            // case that could leave the store on one project and the document name on
+            // another. It is refused, not queued.
+            assert!(SwapGuard::acquire(&flag).is_err(), "a second swap is refused");
+            drop(first);
+        }
+        assert!(!flag.load(Ordering::SeqCst), "released on drop");
+        // And the next swap can proceed, so a refusal is not permanent.
+        assert!(SwapGuard::acquire(&flag).is_ok(), "the guard is reusable");
     }
 
     #[test]

@@ -162,12 +162,12 @@ async fn handle_one(ctx: &Arc<Ctx>, msg: Value) -> Option<Value> {
     })
 }
 
-/// A tools/call result: wrap tool output as MCP text content (JSON as text).
+/// A tools/call result: wrap tool output as MCP content blocks.
 async fn call_tool_rpc(ctx: &Arc<Ctx>, params: &Value) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     match call_tool(ctx, name, &args).await {
-        Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": false })),
+        Ok(out) => Ok(json!({ "content": out.blocks(), "isError": false })),
         Err(e) => Ok(json!({ "content": [{ "type": "text", "text": e }], "isError": true })),
     }
 }
@@ -235,7 +235,50 @@ fn clip(s: &str, max: usize) -> (String, bool) {
     (s[..end].to_string(), true)
 }
 
-async fn call_tool(ctx: &Arc<Ctx>, name: &str, a: &Value) -> Result<String, String> {
+/// What a tool answers with.
+///
+/// Almost every tool here answers with JSON as text, so that stayed the plain case.
+/// `history_image` cannot: an image has to travel as its own content block or the caller
+/// receives base64 it has no reason to look at.
+pub enum ToolOut {
+    Text(String),
+    Blocks(Vec<Value>),
+}
+
+impl ToolOut {
+    fn blocks(self) -> Vec<Value> {
+        match self {
+            ToolOut::Text(t) => vec![json!({ "type": "text", "text": t })],
+            ToolOut::Blocks(b) => b,
+        }
+    }
+
+}
+
+/// Shape, not payload. An image block holds megabytes of base64, and a test that fails
+/// on `unwrap_err` would otherwise print all of it.
+impl std::fmt::Debug for ToolOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolOut::Text(t) => write!(f, "Text({} bytes)", t.len()),
+            ToolOut::Blocks(b) => {
+                let kinds: Vec<&str> = b.iter().map(|x| x["type"].as_str().unwrap_or("?")).collect();
+                write!(f, "Blocks({})", kinds.join(" + "))
+            }
+        }
+    }
+}
+
+async fn call_tool(ctx: &Arc<Ctx>, name: &str, a: &Value) -> Result<ToolOut, String> {
+    match name {
+        // The one tool whose answer is not text. Kept out of the match below so that
+        // match stays exactly as it was, one arm per tool, all returning JSON.
+        "history_image" => history_image(ctx, a).await,
+        other => call_text_tool(ctx, other, a).await.map(ToolOut::Text),
+    }
+}
+
+async fn call_text_tool(ctx: &Arc<Ctx>, name: &str, a: &Value) -> Result<String, String> {
     match name {
         "history_list" => history_list(ctx, a),
         "history_get" => history_get(ctx, a),
@@ -288,6 +331,120 @@ async fn call_tool(ctx: &Arc<Ctx>, name: &str, a: &Value) -> Result<String, Stri
 /// listing and no reader of this API needs it.
 fn ok_json(v: Value) -> Result<String, String> {
     Ok(serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()))
+}
+
+/// The same compaction as `ok_json`, for a value that travels beside another block
+/// rather than as the whole answer.
+fn ok_text(v: &Value) -> String {
+    serde_json::to_string(v).unwrap_or_else(|_| "{}".into())
+}
+
+// ---- history image ----------------------------------------------------------
+
+/// Event the window listens for: "draw this flow and send the PNG back".
+pub const RENDER_EVENT: &str = "render-flow";
+
+/// Refuse to inline a PNG larger than this. A card is capped by the renderer already
+/// (400 visual lines per message, 400 chars per body line, head+tail trim), so passing
+/// this means an unusually large card, and a caller is better told which knob to turn
+/// than handed a payload its client may drop without saying why.
+const MAX_INLINE_PNG: usize = 4 * 1024 * 1024;
+
+/// Render one flow as the same evidence card the operator gets from Capture image.
+///
+/// The drawing happens in the window (see render.rs for why), so this checks what it can
+/// check here first: the flow has to exist, and the arguments have to be ones the
+/// renderer accepts. Only then is the window bothered.
+async fn history_image(ctx: &Arc<Ctx>, a: &Value) -> Result<ToolOut, String> {
+    let id = arg_int(a, "id", 0)?;
+    if id == 0 {
+        return Err("id is required".into());
+    }
+    // Fail fast and in the same words as every other tool, without waking the window.
+    let flow = ctx.store.get(id).map_err(|e| e.to_string())?.ok_or_else(|| format!("no flow {id}"))?;
+
+    let view = arg_enum(a, "view", &["wire", "extension"], "wire")?;
+    let theme = arg_enum(a, "theme", &["dark", "light"], "dark")?;
+    let layout = arg_enum(a, "layout", &["side", "stacked"], "side")?;
+    let scale = arg_int(a, "scale", 1)?;
+    if !(1..=3).contains(&scale) {
+        return Err("scale must be 1, 2 or 3".into());
+    }
+    let redact = a.get("redact").and_then(|v| v.as_bool()).unwrap_or(true);
+    let trim = a.get("trim").and_then(|v| v.as_bool()).unwrap_or(true);
+    let inline = a.get("inline").and_then(|v| v.as_bool()).unwrap_or(true);
+    let title = a.get("title").and_then(|v| v.as_str()).map(|t| t.to_string());
+    let save_path = arg_str(a, "savePath");
+
+    // Every project mints flow ids from 1, so a card drawn after a project swap would be
+    // another engagement's request under this one's id. The generation is checked again
+    // once the image is back, and a swap in between fails the call.
+    let gen = ctx.store.generation();
+    let (req_id, rx) = ctx.render.begin();
+    ctx.events.emit_json(
+        RENDER_EVENT,
+        json!({
+            "reqId": req_id, "flowId": id, "view": view, "theme": theme, "layout": layout,
+            "scale": scale, "redact": redact, "trim": trim, "title": title,
+        }),
+    );
+    let png = match tokio::time::timeout(ctx.render.timeout(), rx).await {
+        Ok(Ok(answer)) => answer?,
+        // Either the window never answered, or it went away mid-render. Both leave the
+        // caller with nothing, so both say where the drawing happens.
+        Ok(Err(_)) | Err(_) => {
+            ctx.render.cancel(req_id);
+            return Err(format!(
+                "the window did not return an image within {}s. history_image is drawn by the open \
+                 {} window, so the app has to be running and responsive; everything else about this \
+                 flow is readable with history_get, which needs no window.",
+                ctx.render.timeout().as_secs(),
+                crate::brand::NAME
+            ));
+        }
+    };
+
+    if ctx.store.generation() != gen {
+        return Err("another project was opened while this image was being drawn, so it may not be \
+                    this flow; ask again"
+            .into());
+    }
+
+    let mut saved_to = Value::Null;
+    if !save_path.is_empty() {
+        std::fs::write(&save_path, &png).map_err(|e| format!("could not write {save_path}: {e}"))?;
+        saved_to = json!(save_path);
+    }
+
+    let s = &flow.summary;
+    let mut receipt = json!({
+        "id": id, "method": s.method, "url": format!("{}://{}{}", s.scheme, s.host, s.path),
+        "status": s.status, "durationMs": s.duration_ms, "view": view, "bytes": png.len(),
+        "scale": scale, "theme": theme, "layout": layout, "redacted": redact, "trimmed": trim,
+        "savedTo": saved_to, "inline": inline,
+    });
+    // A picture cannot state anything about itself, so the receipt has to: a reader must
+    // be able to tell that secrets were covered and that a body was cut without
+    // inferring it from how the card looks.
+    if redact {
+        receipt["note"] = json!("secrets are covered in the image; history_get returns the uncut text");
+    }
+
+    if !inline {
+        return Ok(ToolOut::Text(ok_text(&receipt)));
+    }
+    if png.len() > MAX_INLINE_PNG {
+        return Err(format!(
+            "the image is {} KB, over the {} KB inline limit. Draw a smaller one with scale=1, \
+             trim=true or layout=side, or pass savePath to write it to a file and inline=false.",
+            png.len() / 1024,
+            MAX_INLINE_PNG / 1024
+        ));
+    }
+    Ok(ToolOut::Blocks(vec![
+        json!({ "type": "image", "data": STANDARD.encode(&png), "mimeType": "image/png" }),
+        json!({ "type": "text", "text": ok_text(&receipt) }),
+    ]))
 }
 
 // ---- history ----------------------------------------------------------------
@@ -1448,7 +1605,7 @@ fn plausible_email(text: &str, start: usize, m: &str) -> bool {
 fn has_version(v: &str) -> bool {
     let b = v.as_bytes();
     for i in 0..b.len() {
-        // `product/1` — a slash then (optional spaces then) a digit.
+        // `product/1` - a slash then (optional spaces then) a digit.
         if b[i] == b'/' {
             let mut j = i + 1;
             while j < b.len() && b[j] == b' ' {
@@ -1747,6 +1904,38 @@ fn organizer_get(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
             v["target"] = json!(it.target);
             v["request"] = json!(it.request);
             v["response"] = json!(it.response);
+            // A saved socket's frames. The record may hold thousands; a reply may not,
+            // so this is a window onto them with both counts stated, rather than a
+            // silent truncation an agent would read as the whole socket.
+            if let Some(ms) = it.messages.as_ref() {
+                const REPLY_FRAMES: usize = 50;
+                const REPLY_TEXT: usize = 2048;
+                let items = ms.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+                let shown: Vec<Value> = items
+                    .iter()
+                    .take(REPLY_FRAMES)
+                    .map(|m| {
+                        let mut m = m.clone();
+                        if let Some(t) = m.get("text").and_then(Value::as_str) {
+                            if t.len() > REPLY_TEXT {
+                                let mut cut = REPLY_TEXT;
+                                while cut > 0 && !t.is_char_boundary(cut) {
+                                    cut -= 1;
+                                }
+                                m["text"] = json!(t[..cut]);
+                                m["cut"] = json!(true);
+                            }
+                        }
+                        m
+                    })
+                    .collect();
+                v["messages"] = json!({
+                    "total": ms.get("total").cloned().unwrap_or(json!(items.len())),
+                    "kept": items.len(),
+                    "shown": shown.len(),
+                    "items": shown,
+                });
+            }
             v["collection"] = collection_ref(&org, c);
             return ok_json(v);
         }
@@ -1755,6 +1944,52 @@ fn organizer_get(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
 }
 
 /// Save a captured flow (`flowId`) or a raw request into a collection; see the docs.
+/// One flow's WebSocket frames shaped for an Organizer record, or None when the flow is
+/// not a socket. 101 is the marker: it is the only status a handshake answers.
+///
+/// Capped on both axes, mirroring what the window saves: a socket can hold hundreds of
+/// thousands of frames and one frame can be megabytes, and a record is meant to be
+/// evidence rather than a second copy of the project. `total` keeps the cut honest.
+fn saved_ws_frames(ctx: &Arc<Ctx>, flow_id: u64, status: u16) -> Option<Value> {
+    if status != 101 {
+        return None;
+    }
+    let all = ctx.store.ws_messages(flow_id).ok()?;
+    if all.is_empty() {
+        return None;
+    }
+    // A plain loop rather than an iterator chain: the byte budget has to be read and
+    // written as each frame is measured, which a `take_while` + `map` pair cannot do
+    // without borrowing it twice.
+    let mut budget = crate::organizer::WS_SAVE_BYTES;
+    let mut items: Vec<Value> = Vec::new();
+    for m in all.iter().take(crate::organizer::WS_SAVE_FRAMES) {
+        if budget == 0 {
+            break;
+        }
+        let mut text = m.text.clone();
+        let room = crate::organizer::WS_SAVE_TEXT.min(budget);
+        if text.len() > room {
+            // Cut on a character boundary; `length` below still reports the real size.
+            let mut cut = room;
+            while cut > 0 && !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+        }
+        budget = budget.saturating_sub(text.len());
+        items.push(json!({
+            "id": m.id,
+            "ts": m.ts,
+            "direction": m.direction,
+            "opcode": m.opcode,
+            "length": m.length,
+            "text": text,
+        }));
+    }
+    Some(json!({ "total": all.len(), "items": items }))
+}
+
 fn organizer_save(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
     let opt = |k: &str| a.get(k).and_then(Value::as_str).map(str::to_string);
     let mut item = match a.get("flowId").and_then(Value::as_u64) {
@@ -1767,6 +2002,16 @@ fn organizer_save(ctx: &Arc<Ctx>, a: &Value) -> Result<String, String> {
                 request: raw::request_text(&flow),
                 response: raw::response_text(&flow),
                 status: (s.status != 0).then_some(s.status),
+                // Carried over so a saved record answers "how slow, how big" without
+                // going back to History, which may since have been cleared. Gated on a
+                // status, because a flow with no response yet holds 0 for both and
+                // saving that would record a measurement nobody took.
+                duration_ms: (s.status != 0).then_some(s.duration_ms),
+                length: (s.status != 0).then_some(s.length),
+                // A socket's content is its frames, not its handshake. Without this an
+                // agent saving a WebSocket keeps a GET and a 101 and nothing else, and
+                // the frames go with the flow the moment History is cleared.
+                messages: saved_ws_frames(ctx, id, s.status),
                 note: s.note.clone(),
                 color: s.color.clone(),
                 // Not "history": that is what the window writes when the operator saves
@@ -2007,6 +2252,10 @@ fn proxy_status(ctx: &Arc<Ctx>) -> Result<String, String> {
             "websocketPending": ctx.ws_intercept.pending().len(),
         },
         "invisible": ctx.invisible(),
+        // 0 = Ngintip waits as long as the client does. Any other value is a deadline it
+        // will enforce itself, after which a flow is recorded as Ngintip having stopped
+        // waiting rather than as the target failing.
+        "giveUpAfterSeconds": ctx.give_up_after(),
         "scopePatterns": ctx.scope.get().len(),
         "extensions": {
             "enabled": ext.enabled,
@@ -2055,6 +2304,8 @@ fn tool_defs() -> Value {
           "inputSchema": obj(json!({ "method": {"type":"string"}, "host": {"type":"string"}, "status": {"type":"integer"}, "contains": {"type":"string"}, "inScope": {"type":"boolean"}, "limit": {"type":"integer"}, "beforeId": {"type":"integer"} }), json!([])) },
         { "name": "history_get", "description": "One flow's request and response. `request`/`response` are the bytes on the wire. Read only what you need: side=request|response halves the reply, part=headers answers a header question for a few hundred bytes, and part=body pages a large body with offset plus the returned nextOffset. A body comes back capped (maxBytes, 32 KB by default); the `requestSlice`/`responseSlice` receipt says what you got, whether it is `complete`, and whether capture itself had already truncated it. A binary body is not returned as text; ask part=body with encoding=base64 for its bytes. When an extension or an intercept edit gives the flow another version - most usefully a decode_* extension that makes an encrypted body readable - those come back under `versions` too (view=auto, the default), cut the same way. view=wire returns the wire alone; view=extension puts the readable form in `request`/`response`.",
           "inputSchema": obj(json!({ "id": {"type":"integer"}, "view": {"type":"string", "enum": ["auto","wire","extension"]}, "side": {"type":"string", "enum": ["both","request","response"]}, "part": {"type":"string", "enum": ["all","headers","body"]}, "offset": {"type":"integer"}, "maxBytes": {"type":"integer"}, "encoding": {"type":"string", "enum": ["text","base64"]} }), json!(["id"])) },
+        { "name": "history_image", "description": "Render one flow as a presentable evidence card (PNG) and return it as an image, the same card the operator gets from Capture image in the window: method pill, URL, status, timing, line-numbered request and response with coloured bodies, and secrets covered. Use it when a human will look at the result (a report, a ticket, a message) or when seeing the exchange laid out answers the question faster than reading 32 KB of text; use history_get when you need the bytes. Drawn by the open window, so the app must be running: this is the one tool here that cannot answer headless. `redact` is on by default and covers tokens, cookies and passwords in the image, so cite history_get for the uncut text. The accompanying text block is a receipt (size, scale, whether it was redacted and trimmed) because the picture cannot state those about itself.",
+          "inputSchema": obj(json!({ "id": {"type":"integer"}, "view": {"type":"string", "enum": ["wire","extension"]}, "theme": {"type":"string", "enum": ["dark","light"]}, "layout": {"type":"string", "enum": ["side","stacked"]}, "scale": {"type":"integer"}, "title": {"type":"string"}, "redact": {"type":"boolean"}, "trim": {"type":"boolean"}, "savePath": {"type":"string"}, "inline": {"type":"boolean"} }), json!(["id"])) },
         { "name": "history_search", "description": "Full-text search across request/response bodies and WebSocket messages; returns matching flow summaries. Pages like history_list (nextBeforeId -> beforeId). Flows listed in `wsMatches` matched inside a WebSocket message, so read those with ws_messages rather than history_get. The index covers only the first 256 KB of each decoded body and skips binary bodies, so no match is not proof of absence; an empty result says so.",
           "inputSchema": obj(json!({ "query": {"type":"string"}, "limit": {"type":"integer"}, "beforeId": {"type":"integer"} }), json!(["query"])) },
         { "name": "ws_messages", "description": "Read one flow's WebSocket messages, oldest first. A WebSocket flow's history_get shows only the handshake, so this is the only way to see what the socket carried. Pages with a cursor (nextAfterId -> afterId) because a live socket keeps growing; filter with direction=client|server and `contains`. `payload` is a rendering: binary comes back as a hex dump of its first 256 bytes and a close message as its code and reason, so cite `length` and check `complete` rather than measuring the text.",
@@ -2176,6 +2427,13 @@ The result wraps the tool output as text:
 The `text` field is itself a JSON string. Parse it to get the structured result
 documented for each tool below. When a tool fails, `isError` is true and `text`
 is the error message.
+
+One tool answers differently: `history_image` returns an image block followed by a
+text receipt, because an image belongs in an image block rather than as base64 inside
+a string nobody can read.
+
+    { "content": [ { "type": "image", "data": "<base64 PNG>", "mimeType": "image/png" },
+                   { "type": "text",  "text": "<JSON string>" } ], "isError": false }
 
 ## Quickstart
 
@@ -2453,6 +2711,37 @@ normal case. See Message versions below.
 `view=wire` returns the wire alone, never a `versions` key. `view=extension` puts the
 readable form in `request` / `response` and adds `requestDecoded` / `responseDecoded`
 booleans; when no decode applies it falls back to the wire and the flag is false.
+
+### history_image
+
+Render one flow as an evidence card and return it as a PNG image, the same card the
+operator gets from "Capture image" in the window: method pill, URL, status, timing, and
+the request and response line-numbered side by side with their bodies coloured per token.
+
+Reach for it when a person is going to look at the result, or when seeing the exchange
+laid out answers the question faster than reading the bytes. For the bytes themselves,
+use `history_get`.
+
+Arguments: `id` (required), `view` (`wire`, the default, or `extension` for the readable
+form a decode extension produced), `theme` (`dark` or `light`), `layout` (`side` or
+`stacked`), `scale` (1, 2 or 3), `title` (defaults to the flow's note), `redact` (default
+true), `trim` (default true), `savePath` (also write the PNG to this file) and `inline`
+(default true; false returns the receipt alone, for when only the file is wanted).
+
+Two things to know before using it:
+
+- **It is drawn by the open window.** This is the only tool here that cannot answer
+  headless: the renderer is a Canvas 2D one, so the app has to be running and responsive.
+  A window that does not answer within 20 seconds fails the call rather than hanging it.
+- **`redact` is on by default**, which covers tokens, cookies and passwords in the image.
+  That is the same default the window uses. Quote `history_get` when you need the
+  uncovered text; do not turn redaction off just to read a value.
+
+The reply is an image block plus a text receipt: `bytes`, `scale`, `view`, `redacted`,
+`trimmed` and `savedTo`, beside the flow's own method, url, status and `durationMs`. The receipt exists because an image cannot
+say anything about itself, and a reader has to be able to tell that a body was cut or a
+secret covered without inferring it from how the card looks. A card over 4 MB is refused
+inline, naming the arguments that make it smaller.
 
 ### history_search
 
@@ -2869,6 +3158,14 @@ in the JSON-RPC `error` field with a numeric code.
 mod tests {
     use super::*;
     use crate::e2e::{test_ctx, test_ctx_with_log};
+
+    /// Every tool but `history_image` answers with JSON as text, and these tests read
+    /// that text. This shadows the dispatcher of the same name so they say what they
+    /// mean; `history_image` is called through `super::call_tool`, where its content
+    /// blocks are the point.
+    async fn call_tool(ctx: &Arc<Ctx>, name: &str, a: &Value) -> Result<String, String> {
+        super::call_text_tool(ctx, name, a).await
+    }
 
     fn ctx() -> Arc<Ctx> {
         let dir = std::env::temp_dir().join(format!("mcp-test-{}-{}", std::process::id(), rand_suffix()));
@@ -3301,6 +3598,34 @@ mod tests {
         // The UI was told about the new revision.
         assert!(log.lock().unwrap().iter().any(|(e, p)| e == "organizer" && p["rev"] == 1));
 
+        // A WebSocket flow: the handshake is a 101 and the content is the frames, so a
+        // record that stops at the handshake is empty evidence. Saved with it, and the
+        // declared total stays honest about anything the cap left behind.
+        let ws_uri: Uri = "wss://shop.test/ws/orders".parse().unwrap();
+        let mut socket = Flow::request(c.store.next_id(), &M::GET, &ws_uri, Version::HTTP_11, &HeaderMap::new(), bytes::Bytes::new());
+        socket.set_response(StatusCode::SWITCHING_PROTOCOLS, Version::HTTP_11, &HeaderMap::new(), bytes::Bytes::new());
+        let wid = c.store.push(socket).unwrap().id;
+        c.store.push_ws(wid, 1, "client", 1, 11, br#"{"sub":"all"}"#).unwrap();
+        c.store.push_ws(wid, 2, "server", 9, 0, b"").unwrap(); // an empty keepalive ping
+        c.store.push_ws(wid, 3, "server", 1, 9, b"{\"ok\":1}").unwrap();
+
+        let ws_out = parse(call("organizer_save", json!({"flowId": wid})).await.unwrap());
+        let ws_id = ws_out["item"]["id"].as_str().unwrap().to_string();
+        // Read it back the way an agent would: the save reply is a summary, the record
+        // itself is what has to carry the socket.
+        let ws_got = parse(call("organizer_get", json!({"id": ws_id})).await.unwrap());
+        let frames = &ws_got["messages"];
+        assert_eq!(frames["total"].as_u64(), Some(3), "every frame is counted");
+        assert_eq!(frames["items"].as_array().map(Vec::len), Some(3));
+        assert_eq!(frames["items"][0]["direction"].as_str(), Some("client"));
+        assert_eq!(frames["items"][1]["opcode"].as_u64(), Some(9), "control frames are kept too");
+        assert_eq!(frames["items"][1]["length"].as_u64(), Some(0), "an empty ping is a frame, not a gap");
+        assert!(ws_got["request"].as_str().unwrap().starts_with("GET /ws/orders"), "the handshake is still there");
+
+        // And an ordinary flow grows no such field: no socket, no empty structure.
+        let plain_got = parse(call("organizer_get", json!({"id": id})).await.unwrap());
+        assert!(plain_got.get("messages").is_none_or(Value::is_null));
+
         // A raw request into a named collection, created on the fly (not made active).
         let raw = call("organizer_save", json!({"request": "POST /login HTTP/1.1\r\nHost: shop.test\r\n\r\nu=a", "target": "https://shop.test", "collection": "Auth", "color": "blue"})).await.unwrap();
         let rawv = jparse(&raw);
@@ -3341,6 +3666,174 @@ mod tests {
     }
 
     /// A few flows with bodies, for the paging and slicing tests.
+    // ---- history_image ------------------------------------------------------
+    //
+    // The card itself cannot be tested here: it is drawn on a Canvas 2D context, which
+    // exists only in the window. What IS tested is everything around the drawing, which
+    // is where this tool can go wrong without anyone noticing: what the window is asked
+    // for, what happens when it does not answer, and whether the answer is passed on
+    // unchanged.
+
+    fn ctx_with_log() -> (Arc<Ctx>, crate::e2e::EventLog) {
+        let dir = std::env::temp_dir().join(format!("mcp-img-{}-{}", std::process::id(), rand_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (c, log) = test_ctx_with_log(&dir);
+        (Arc::new(c), log)
+    }
+
+    /// Stand in for the window: wait for the `render-flow` event, then answer it exactly
+    /// as the `render_result` command does. Returns what the window was asked for, so a
+    /// test can check the request and not just the reply.
+    async fn play_window(c: Arc<Ctx>, log: crate::e2e::EventLog, answer: crate::render::Answer) -> Value {
+        let mut answer = Some(answer);
+        for _ in 0..400 {
+            let asked = log.lock().unwrap().iter().find(|(e, _)| e == RENDER_EVENT).map(|(_, p)| p.clone());
+            if let Some(p) = asked {
+                c.render.finish(p["reqId"].as_u64().expect("the event carries a ticket"), answer.take().unwrap());
+                return p;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the tool never asked the window to draw anything");
+    }
+
+    #[tokio::test]
+    async fn an_image_request_asks_the_window_and_returns_what_it_drew() {
+        let (c, log) = ctx_with_log();
+        let id = seed_flows(&c, 1, b"{\"ok\":true}")[0];
+        let png = b"\x89PNG\r\n\x1a\nnot really a png, but these bytes are what the window sent".to_vec();
+
+        let window = tokio::spawn(play_window(c.clone(), log.clone(), Ok(png.clone())));
+        let out = super::call_tool(&c, "history_image", &json!({"id": id})).await.unwrap();
+        let asked = window.await.unwrap();
+
+        // The window is asked for the operator's own defaults, so a card requested with
+        // no options is the card Capture image would have taken.
+        assert_eq!(asked["flowId"].as_u64(), Some(id));
+        assert_eq!(asked["view"], "wire");
+        assert_eq!(asked["theme"], "dark");
+        assert_eq!(asked["layout"], "side");
+        assert_eq!(asked["scale"], 1);
+        assert_eq!(asked["redact"], true);
+        assert_eq!(asked["trim"], true);
+
+        // An image travels as an image block, not as base64 in a wall of text.
+        let blocks = out.blocks();
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["mimeType"], "image/png");
+        assert_eq!(blocks[0]["data"].as_str().unwrap(), STANDARD.encode(&png));
+
+        // ... and the receipt says what the picture cannot say about itself.
+        let r = jparse(blocks[1]["text"].as_str().unwrap());
+        assert_eq!(r["id"].as_u64(), Some(id));
+        assert_eq!(r["bytes"].as_u64(), Some(png.len() as u64));
+        assert_eq!(r["view"], "wire");
+        assert_eq!(r["redacted"], true);
+        assert_eq!(r["trimmed"], true);
+        assert_eq!(r["savedTo"], Value::Null);
+        assert!(r["note"].as_str().unwrap().contains("history_get"), "{r}");
+        assert_eq!(c.render.pending(), 0, "nothing may be left waiting after a reply");
+    }
+
+    #[tokio::test]
+    async fn an_image_of_a_flow_that_does_not_exist_never_wakes_the_window() {
+        let (c, log) = ctx_with_log();
+        seed_flows(&c, 1, b"{}");
+        let err = super::call_tool(&c, "history_image", &json!({"id": 999_999})).await.unwrap_err();
+        assert_eq!(err, "no flow 999999");
+        // Checked here, not in the window: a bad id must not cost a render or a 20 second
+        // wait, and the wording must match every other tool's.
+        assert!(!log.lock().unwrap().iter().any(|(e, _)| e == RENDER_EVENT), "the window was asked anyway");
+        assert_eq!(c.render.pending(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_window_that_never_answers_fails_with_a_reason_and_leaves_nothing_waiting() {
+        let (c, _log) = ctx_with_log();
+        let id = seed_flows(&c, 1, b"{}")[0];
+        c.render.set_timeout_ms(60);
+        let err = super::call_tool(&c, "history_image", &json!({"id": id})).await.unwrap_err();
+        // The message has to name where the drawing happens, because that is the one
+        // thing the caller cannot work out from here, and point at the tool that needs
+        // no window.
+        assert!(err.contains("did not return an image"), "{err}");
+        assert!(err.contains("history_get"), "{err}");
+        // A late answer must have nowhere to pile up.
+        assert_eq!(c.render.pending(), 0, "the timed-out request is still in the waiting room");
+    }
+
+    #[tokio::test]
+    async fn the_windows_own_failure_is_passed_on_rather_than_renamed() {
+        let (c, log) = ctx_with_log();
+        let id = seed_flows(&c, 1, b"{}")[0];
+        let window = tokio::spawn(play_window(c.clone(), log.clone(), Err("this window has no 2D canvas".into())));
+        let err = super::call_tool(&c, "history_image", &json!({"id": id})).await.unwrap_err();
+        window.await.unwrap();
+        assert_eq!(err, "this window has no 2D canvas");
+    }
+
+    #[tokio::test]
+    async fn a_card_too_big_to_inline_is_refused_with_the_arguments_that_shrink_it() {
+        let (c, log) = ctx_with_log();
+        let id = seed_flows(&c, 1, b"{}")[0];
+        let huge = vec![0u8; MAX_INLINE_PNG + 1];
+        let window = tokio::spawn(play_window(c.clone(), log.clone(), Ok(huge)));
+        let err = super::call_tool(&c, "history_image", &json!({"id": id})).await.unwrap_err();
+        window.await.unwrap();
+        for knob in ["scale", "trim", "layout", "savePath"] {
+            assert!(err.contains(knob), "the refusal never mentions {knob}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_card_can_be_written_to_a_file_instead_of_inlined() {
+        let (c, log) = ctx_with_log();
+        let id = seed_flows(&c, 1, b"{}")[0];
+        let dir = std::env::temp_dir().join(format!("mcp-img-save-{}-{}", std::process::id(), rand_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("card.png");
+        let png = vec![7u8; 1024];
+
+        let window = tokio::spawn(play_window(c.clone(), log.clone(), Ok(png.clone())));
+        let out = super::call_tool(
+            &c,
+            "history_image",
+            &json!({"id": id, "savePath": path.to_string_lossy(), "inline": false}),
+        )
+        .await
+        .unwrap();
+        window.await.unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), png);
+        // inline=false means the receipt alone: a caller that only wants the file should
+        // not be charged for the base64 of it.
+        let blocks = out.blocks();
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert_eq!(blocks[0]["type"], "text");
+        let r = jparse(blocks[0]["text"].as_str().unwrap());
+        assert_eq!(r["savedTo"].as_str(), Some(path.to_string_lossy().as_ref()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn image_arguments_are_refused_rather_than_quietly_replaced() {
+        let (c, log) = ctx_with_log();
+        let id = seed_flows(&c, 1, b"{}")[0];
+        for (args, want) in [
+            (json!({"id": id, "scale": 4}), "scale must be 1, 2 or 3"),
+            (json!({"id": id, "theme": "sepia"}), "invalid theme"),
+            (json!({"id": id, "layout": "grid"}), "invalid layout"),
+            (json!({"id": id, "view": "auto"}), "invalid view"),
+        ] {
+            let err = super::call_tool(&c, "history_image", &args).await.unwrap_err();
+            assert!(err.contains(want), "{args} gave {err}");
+        }
+        // `view=auto` is history_get's default and is deliberately NOT accepted here:
+        // one card holds one version of the bytes, so "either" is not an answer.
+        assert!(!log.lock().unwrap().iter().any(|(e, _)| e == RENDER_EVENT), "a refused argument still drew");
+    }
+
     fn seed_flows(c: &Arc<Ctx>, n: usize, body: &'static [u8]) -> Vec<u64> {
         use crate::store::Flow;
         use http::{HeaderMap, HeaderValue, Method as M, StatusCode, Uri, Version};

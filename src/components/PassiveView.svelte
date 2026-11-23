@@ -12,6 +12,10 @@
     return c;
   });
   let p = $derived(store.passive);
+  // What a Scan would read now, after the resource scope and "In scope only". Read only
+  // by the empty state, and a derived is pull-based, so the walk over every flow does
+  // not happen while findings are on screen.
+  let pending = $derived(store.passivePending);
   const sevName = (rank) => SEVERITIES[rank] ?? 'info';
 
   // Group findings by their source resource, so e.g. main.js shows once with all
@@ -104,9 +108,22 @@
     store.deletePassiveFindings(selected);
     selected = new Set();
   }
-  async function clearAll() {
+  // Delete all scan history: the findings AND the record of which flows were scanned.
+  // Dropping only the findings would leave every flow marked done, so the next Scan
+  // would read nothing and the screen would stay empty with no way to explain itself.
+  async function deleteAll() {
     const n = store.passiveFindings.length;
-    if (!(await store.confirm({ title: `Clear all ${n.toLocaleString('en-US')} findings?`, message: 'Every passive finding in this project is removed (run Scan history again to rebuild them).', yes: 'Yes, clear' }))) return;
+    const scanned = store.passiveScannedCount;
+    const ok = await store.confirm({
+      title: `Delete all ${n.toLocaleString('en-US')} finding${n === 1 ? '' : 's'}?`,
+      message:
+        `The findings go, and so does the record of ${scanned.toLocaleString('en-US')} ` +
+        `scanned flow${scanned === 1 ? '' : 's'}. The captured traffic in History is NOT touched, ` +
+        'so Scan traffic reads it again and the same findings come back. ' +
+        'To make one finding stay gone, delete it with Select instead, or delete its flow from History.',
+      yes: 'Yes, delete',
+    });
+    if (!ok) return;
     store.clearPassive();
     selected = new Set();
   }
@@ -124,15 +141,34 @@
 
 <div class="passive">
   <header class="bar">
-    <button class="btn" onclick={() => store.scanPassive()} disabled={p.scanning || !store.flows.length}>
-      {p.scanning ? `Scanning ${p.done}/${p.total}…` : 'Scan history'}
+    <button
+      class="btn"
+      title="Read the traffic captured in History and list what the rules find. Flows already read are skipped."
+      onclick={() => store.scanPassive()}
+      disabled={p.scanning || !store.flows.length}
+    >
+      {p.scanning ? `Scanning ${p.done}/${p.total}…` : 'Scan traffic'}
     </button>
-    <button class="btn ghost sm" onclick={() => store.scanPassive({ rescan: true })} disabled={p.scanning || !store.flows.length}>Rescan all</button>
-    <label class="inscope" title="Only scan flows whose host is in the project Scope (Settings > Scope). Empty scope = everything.">
+    <button
+      class="btn ghost sm"
+      title="Forget what has been read and scan every captured flow again"
+      onclick={() => store.scanPassive({ rescan: true })}
+      disabled={p.scanning || !store.flows.length}
+    >
+      Rescan all
+    </button>
+    <label class="inscope" title="Only scan flows whose host is in the project Scope (Settings > Scope). On by default; with no scope set, everything is in scope.">
       <input type="checkbox" checked={store.passiveInScopeOnly} onchange={(e) => store.setPassiveInScopeOnly(e.currentTarget.checked)} />
       In scope only
     </label>
-    <button class="btn ghost sm" onclick={clearAll} disabled={p.scanning || !store.passiveFindings.length}>Clear</button>
+    <button
+      class="btn ghost sm"
+      title="Delete every finding and the record of which flows were read. The traffic stays, so a later scan finds them again."
+      onclick={deleteAll}
+      disabled={p.scanning || (!store.passiveFindings.length && !store.passiveScannedCount)}
+    >
+      Delete all
+    </button>
     <button class="btn ghost sm" class:on={rulesOpen} onclick={() => (rulesOpen = !rulesOpen)}>
       Rules{store.passiveRules.length ? ` (+${store.passiveRules.length})` : ''}
     </button>
@@ -143,7 +179,14 @@
       <button class="btn ghost sm" onclick={() => (selected = new Set(visibleKeys))} disabled={!findings.length}>All</button>
       <button class="btn ghost sm" onclick={() => (selected = new Set())} disabled={!selected.size}>None</button>
       <button class="btn ghost sm" onclick={copySelected} disabled={!selected.size}>Copy ({selected.size})</button>
-      <button class="btn ghost sm danger" onclick={deleteSelected} disabled={!selected.size}>Delete ({selected.size})</button>
+      <button
+        class="btn ghost sm danger"
+        title="Delete these findings for good. The flows stay marked as read, so a later scan does not bring them back."
+        onclick={deleteSelected}
+        disabled={!selected.size}
+      >
+        Delete ({selected.size})
+      </button>
     {/if}
     <button class="btn ghost sm" onclick={toggleAll} disabled={!grouped.length} title="Expand or collapse all finding groups">
       {allCollapsed ? 'Expand all' : 'Collapse all'}
@@ -175,7 +218,7 @@
               <span class="chip">{ext}<button class="chipx" title="Remove" aria-label="Remove {ext}" onclick={() => removeScopeExt(ext)}>×</button></span>
             {/each}
           {:else}
-            <span class="dim">nothing selected — nothing will be scanned</span>
+            <span class="dim">nothing selected - nothing will be scanned</span>
           {/if}
         </div>
         <div class="scope-add">
@@ -232,9 +275,37 @@
   {/if}
 
   {#if !store.passiveFindings.length}
+    <!-- Nothing scans by itself, so the empty state carries the button rather than
+         pointing at one: this is the screen you land on, and "No findings yet" has to
+         mean "nothing has been asked for yet", not "you are clean". -->
     <div class="empty">
-      <p>No findings yet.</p>
-      <p class="dim">Click <b>Scan history</b> to passively analyze captured traffic for secrets, tokens, and risky response headers.</p>
+      <p class="empty-title">No findings yet</p>
+      <p class="dim">
+        Passive scan reads captured traffic for secrets, tokens and risky response headers.
+        It runs when you ask it to, never on its own.
+      </p>
+      <button class="btn primary scan-cta" onclick={() => store.scanPassive()} disabled={p.scanning || !pending}>
+        {#if p.scanning}
+          Scanning {p.done}/{p.total}…
+        {:else if pending}
+          Scan {pending.toLocaleString('en-US')} flow{pending === 1 ? '' : 's'}
+        {:else if store.flows.length}
+          Nothing left to scan
+        {:else}
+          Nothing captured yet
+        {/if}
+      </button>
+      {#if !store.flows.length}
+        <p class="dim">Capture some traffic first, then come back and press Scan.</p>
+      {:else if !pending}
+        <p class="dim">
+          All {store.flows.length.toLocaleString('en-US')} captured flows have been scanned{store.passiveInScopeOnly
+            ? ', or sit outside the project Scope'
+            : ''}, and nothing was found. <b>Delete all</b> forgets the scan and lets you run it again.
+        </p>
+      {:else if p.done && !p.scanning}
+        <p class="dim">Last scan read {p.done.toLocaleString('en-US')} flow{p.done === 1 ? '' : 's'} and found nothing. Scanning again only reads what has arrived since.</p>
+      {/if}
     </div>
   {:else}
     <div class="list">
@@ -739,6 +810,18 @@
   .empty p {
     margin: 0;
     max-width: 380px;
+  }
+  .empty-title {
+    color: var(--text);
+    font: 600 14px var(--sans);
+  }
+  /* The one thing to press on this screen, sized so it is found without reading. */
+  .scan-cta {
+    justify-self: center;
+    margin-top: 10px;
+    padding: 0 22px;
+    height: 36px;
+    font-size: 13px;
   }
 
   /* Finding detail modal */

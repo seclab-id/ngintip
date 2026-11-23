@@ -1,6 +1,6 @@
 <script>
   import { onMount, untrack } from 'svelte';
-  import { store, DETAIL_CACHE_MAX } from '../lib/store.svelte.js';
+  import { store, DETAIL_CACHE_MAX, LATE_AFTER_SEC, GIVE_UP_AFTER_SEC } from '../lib/store.svelte.js';
   import * as api from '../lib/api.js';
   import { pollVisible } from '../lib/poll.js';
   import { BRAND } from '../lib/brand.js';
@@ -9,6 +9,17 @@
 
   // Sitemap under Scope: browse discovered hosts and click one to add it to scope.
   let sitemapSel = $state(null);
+  // Snapshotted, not bound to `store.flows` live. `buildSitemap` is a 36 ms rebuild on a
+  // 39K project (measured), and `store.flows` gets a new array identity on every captured
+  // flow, so a live binding rebuilt the whole tree up to 60x a second for as long as
+  // Settings stayed open during capture. The sitemap is a discovery aid, not a monitor:
+  // take it when the section opens, and offer a refresh once History has moved on.
+  let sitemapFlows = $state([]);
+  $effect(() => {
+    if (section !== 'scope') return;
+    untrack(() => (sitemapFlows = store.flows));
+  });
+  let sitemapStale = $derived(store.flows.length - sitemapFlows.length);
   function addHostFromNode(key) {
     const host = String(key || '').replace(/^https?:\/\//, '').split('/')[0].replace(/:\d+$/, '');
     if (!host) return;
@@ -121,9 +132,21 @@
   // Performance knobs (Settings > Project).
   let threadsInput = $state(store.config.threads ?? 0);
   let cacheInput = $state(store.detailCacheMax);
+  let lateInput = $state(store.lateAfterSec);
+  // Both patience knobs belong to the open project, so they change under us on a
+  // project switch exactly as the thread count does.
+  $effect(() => {
+    const n = store.lateAfterSec;
+    untrack(() => (lateInput = n));
+  });
+  let giveUpInput = $state(store.giveUpAfterSec);
   $effect(() => {
     const n = store.config.threads ?? 0;
     untrack(() => (threadsInput = n));
+  });
+  $effect(() => {
+    const n = store.giveUpAfterSec;
+    untrack(() => (giveUpInput = n));
   });
 
   const TARGETS = [
@@ -408,22 +431,30 @@
 
   <section class="card">
     <h2>Performance</h2>
-    <p class="dim">Tuning for this machine, saved locally.</p>
+    <p class="dim">Threads and cache are tuned for this machine; the two waits are saved in the open project.</p>
+    <!-- The explanations hang off the labels. Three knobs with a paragraph each turned
+         the card into a wall of text nobody reads; the one time you want the detail is
+         when you are about to touch that field.
+         Drawn here rather than left to the native `title` tooltip, which this webview
+         does not reliably show. tabindex makes it reachable without a mouse. -->
     <div class="form">
       <label>
-        <span>Worker threads</span>
+        <span class="hint" tabindex="0" data-hint="Async runtime threads for the proxy. 0 = Auto (one per CPU core, recommended). Takes effect after an app restart.">Worker threads</span>
         <input class="input mono" type="number" min="0" max="256" bind:value={threadsInput} onchange={() => store.setThreads(threadsInput)} />
       </label>
       <label>
-        <span>Detail cache (flows)</span>
+        <span class="hint" tabindex="0" data-hint="How many opened requests stay in memory for instant re-open (default {DETAIL_CACHE_MAX}). Higher = snappier revisits but more RAM. Applies right away.">Detail cache (flows)</span>
         <input class="input mono" type="number" min="5" max="2000" bind:value={cacheInput} onchange={() => store.setDetailCacheMax(cacheInput)} />
       </label>
+      <label>
+        <span class="hint" tabindex="0" data-hint="Seconds, default {LATE_AFTER_SEC}. A request still out at the target is badged WAIT; past this it is badged LATE. 0 = never escalate. Changes the badge only: nothing is cancelled or rewritten, and a response arriving later still lands normally with its real duration. Saved in this project.">Call a wait late after</span>
+        <input class="input mono" type="number" min="0" max="86400" step="10" bind:value={lateInput} onchange={() => store.setLateAfterSec(lateInput)} />
+      </label>
+      <label>
+        <span class="hint" tabindex="0" data-hint="Seconds, default {GIVE_UP_AFTER_SEC} (3 minutes); 0 = never give up. Unlike the badge above this is a real deadline: at that point the request is actually dropped and the row records that Ngintip stopped waiting, not that the target failed. Set 0 while measuring an endpoint you already know is slow. Saved in this project.">Give up waiting after</span>
+        <input class="input mono" type="number" min="0" max="86400" step="30" bind:value={giveUpInput} onchange={() => store.setGiveUpAfter(giveUpInput)} />
+      </label>
     </div>
-    <p class="dim hint-line">
-      <strong>Worker threads:</strong> async runtime threads for the proxy. <span class="mono">0</span> = Auto (one per CPU core, recommended). Takes effect after an app restart.
-      <br />
-      <strong>Detail cache:</strong> how many opened requests stay in memory for instant re-open (default {DETAIL_CACHE_MAX}). Higher = snappier revisits but more RAM. Applies right away.
-    </p>
   </section>
   {/if}
 
@@ -501,9 +532,13 @@
     <div class="sitemap-head">
       <span class="cap">Sitemap</span>
       <span class="dim">Discovered hosts and paths. Click a host to add it to the scope above, then Save.</span>
+      {#if sitemapStale > 0}
+        <button class="btn ghost sm" onclick={() => (sitemapFlows = store.flows)}
+          >Refresh ({sitemapStale} new)</button>
+      {/if}
     </div>
-    {#if store.flows.length}
-      <div class="sitemap-box"><SitemapTree flows={store.flows} bind:selected={sitemapSel} oncontext={() => {}} /></div>
+    {#if sitemapFlows.length}
+      <div class="sitemap-box"><SitemapTree flows={sitemapFlows} bind:selected={sitemapSel} oncontext={() => {}} /></div>
     {:else}
       <p class="dim">No requests captured yet.</p>
     {/if}
@@ -1116,6 +1151,7 @@
   .form {
     display: flex;
     align-items: flex-end;
+    flex-wrap: wrap;
     gap: 10px;
   }
   .bform {
@@ -1200,6 +1236,45 @@
   }
   label .input {
     width: 150px;
+  }
+  /* A label that carries its own explanation. The dotted underline is the only thing
+     that says one is there, so it has to stay visible without shouting. */
+  .hint {
+    position: relative;
+    justify-self: start;
+    cursor: help;
+    text-decoration: underline dotted var(--border-strong, var(--border));
+    text-underline-offset: 3px;
+  }
+  .hint::after {
+    content: attr(data-hint);
+    position: absolute;
+    bottom: calc(100% + 7px);
+    left: -6px;
+    z-index: 40;
+    width: max-content;
+    max-width: 330px;
+    padding: 7px 9px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--bg-elev);
+    color: var(--text);
+    font-size: 11.5px;
+    line-height: 1.45;
+    text-decoration: none;
+    white-space: normal;
+    box-shadow: 0 6px 18px rgb(0 0 0 / 0.22);
+    /* Hidden rather than absent, so it can fade and so it never eats the pointer. */
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition: opacity 0.12s ease 0.25s, visibility 0s linear 0.37s;
+  }
+  .hint:hover::after,
+  .hint:focus-visible::after {
+    opacity: 1;
+    visibility: visible;
+    transition: opacity 0.12s ease 0.25s, visibility 0s linear 0.25s;
   }
   .select {
     width: 250px !important;

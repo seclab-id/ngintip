@@ -2,18 +2,20 @@
   import { tick } from 'svelte';
   import { highlightHttp } from '../lib/highlight.js';
   import { matchRanges, markHtmlRanges } from '../lib/find.js';
-  import { autoDecode } from '../lib/codec.js';
+  import { decodeHint } from '../lib/codec.js';
   import FindBar from './FindBar.svelte';
+  import SelectionAction from './SelectionAction.svelte';
 
   // Always-editable HTTP editor with syntax colours. A transparent textarea sits on
   // top of a highlighted <pre> that mirrors it exactly, so the whole message stays
   // freely editable while method, header names, status and JSON/markup are coloured
   // underneath. Both layers live inside ONE scroll container (`.scroll`) and are the
   // same size, so they wrap identically (the scrollbar narrows both equally) and
-  // there is a single scroll position — no JS scroll-syncing, so the caret always
+  // there is a single scroll position - no JS scroll-syncing, so the caret always
   // lands exactly where the coloured text shows it.
-  // `onselect(text)` fires with the current selection (Burp-style) so a parent can
-  // open a decoder side bar for it.
+  // `onselect(text)` fires when the operator clicks the Decode chip that a selection
+  // puts next to the pointer, so a parent can open the decoder dock for that text. It
+  // deliberately does NOT fire on the selection itself: see SelectionAction.
   let { value = $bindable(''), onselect = null } = $props();
 
   let ta = $state();
@@ -52,12 +54,24 @@
     });
   });
 
-  // Report the current selection to the parent, but only when it actually looks
-  // decodable, so selecting ordinary text does not pop the decoder side bar.
-  function reportSelection() {
+  // Offer the selection to the parent, behind a click. The chip is placed at the
+  // pointer; a keyboard selection (shift+arrows) has no pointer, so it is anchored to
+  // the editor's top-right corner instead, which is at least always in the same place.
+  let chip = $state(null); // { text, x, y, hint }
+
+  function reportSelection(e) {
     if (!onselect || !ta) return;
-    const s = ta.value.slice(ta.selectionStart, ta.selectionEnd);
-    if (s.trim() && s.length <= 100_000 && autoDecode(s).length) onselect(s);
+    const text = ta.value.slice(ta.selectionStart, ta.selectionEnd);
+    if (!text.trim() || text.length > 100_000) {
+      chip = null;
+      return;
+    }
+    const r = root?.getBoundingClientRect();
+    const at =
+      e?.clientX != null && e.clientX !== 0
+        ? { x: e.clientX + 8, y: e.clientY + 14 }
+        : { x: Math.max(8, (r?.right ?? 120) - 110), y: (r?.top ?? 0) + 8 };
+    chip = { text, ...at, hint: decodeHint(text) };
   }
 
   // The shared `.scroll` container is the only scroller; the transparent textarea
@@ -123,6 +137,18 @@
   {#if findOpen}
     <FindBar bind:value={query} {count} index={matchIdx} oninput={() => (matchIdx = 0)} onstep={step} onclose={closeFind} />
   {/if}
+  {#if chip}
+    <SelectionAction
+      x={chip.x}
+      y={chip.y}
+      hint={chip.hint}
+      onpick={() => {
+        onselect(chip.text);
+        chip = null;
+      }}
+      onclose={() => (chip = null)}
+    />
+  {/if}
 </div>
 
 <style>
@@ -181,7 +207,7 @@
   .editor {
     /* Stretched over `.grow` (top+bottom+left+right:0), so it is exactly the same
        size as the <pre> even though `.grow` has an auto (content) height. It never
-       scrolls itself — the shared `.scroll` container does. */
+       scrolls itself - the shared `.scroll` container does. */
     position: absolute;
     inset: 0;
     resize: none;

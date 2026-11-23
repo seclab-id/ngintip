@@ -39,15 +39,37 @@
   // been running (0.0s and climbing) rather than a static spinner.
   let busy = $derived(store.decompressing || store.saving);
   let elapsed = $state(0);
+  // Shortest time the overlay stays on screen once it has appeared. Opening a project no
+  // longer freezes the window, so a small project can finish fast enough that the overlay
+  // is a flash. This holds the ELEMENT only: it never delays the work, never touches
+  // `store.decompressing`, and the timer is set to the true duration at completion rather
+  // than counting on through the padding. A failed open still clears the flag in its
+  // `finally` and still raises its notification; this only keeps the card on screen a
+  // fraction of a second longer.
+  const MIN_OVERLAY_MS = 350;
+  let overlay = $state(false);
+  // Which operation the card is describing, captured when it appears. The flags are
+  // already false during the hold below, so reading them live would flip the wording
+  // from "Saving project" to "Opening project" on the way out.
+  let overlaySaving = $state(false);
+  let shownAt = 0;
   $effect(() => {
-    if (!busy) {
+    if (busy) {
+      overlay = true;
+      overlaySaving = store.saving;
+      shownAt = performance.now();
       elapsed = 0;
-      return;
+      const id = setInterval(() => (elapsed = (performance.now() - shownAt) / 1000), 100);
+      return () => clearInterval(id);
     }
-    const start = performance.now();
-    elapsed = 0;
-    const id = setInterval(() => (elapsed = (performance.now() - start) / 1000), 100);
-    return () => clearInterval(id);
+    if (!overlay) return;
+    // The work just finished. Show the real duration, then hold for what is left of the
+    // minimum (which is usually nothing at all).
+    elapsed = (performance.now() - shownAt) / 1000;
+    const left = MIN_OVERLAY_MS - (performance.now() - shownAt);
+    if (left <= 0) return void (overlay = false);
+    const id = setTimeout(() => (overlay = false), left);
+    return () => clearTimeout(id);
   });
 </script>
 
@@ -105,14 +127,14 @@
   <UpdateDialog />
 {/if}
 
-{#if store.decompressing || store.saving}
+{#if overlay}
   <div class="decompress-overlay" role="status" aria-live="polite">
     <div class="decompress-card">
       <div class="decompress-anim" aria-hidden="true">
         <span></span><span></span><span></span><span></span><span></span>
       </div>
-      <div class="decompress-text">{store.saving ? 'Saving project…' : 'Opening project…'}</div>
-      <div class="decompress-sub">{store.saving ? `Compressing to the .${BRAND.ext} file` : `Decompressing the .${BRAND.ext} file`}</div>
+      <div class="decompress-text">{overlaySaving ? 'Saving project…' : 'Opening project…'}</div>
+      <div class="decompress-sub">{overlaySaving ? `Compressing to the .${BRAND.ext} file` : `Decompressing the .${BRAND.ext} file`}</div>
       <div class="decompress-timer" aria-live="off">{elapsed.toFixed(1)}<span class="unit">s</span></div>
     </div>
   </div>
@@ -166,12 +188,16 @@
     height: 100%;
     border-radius: 3px;
     background: var(--accent, #e8722c);
-    animation: decompress-bounce 1s ease-in-out infinite;
+    animation: decompress-bounce 0.6s ease-in-out infinite;
   }
-  .decompress-anim span:nth-child(2) { animation-delay: 0.12s; }
-  .decompress-anim span:nth-child(3) { animation-delay: 0.24s; }
-  .decompress-anim span:nth-child(4) { animation-delay: 0.36s; }
-  .decompress-anim span:nth-child(5) { animation-delay: 0.48s; }
+  /* NEGATIVE delays, so every bar is already mid-bounce on the first frame and the wave
+     reads immediately. Positive delays up to 0.48s on a 1s cycle meant the last bar sat
+     still for half a second, which is most of a fast open: the whole group looked like a
+     flash rather than an animation. */
+  .decompress-anim span:nth-child(2) { animation-delay: -0.08s; }
+  .decompress-anim span:nth-child(3) { animation-delay: -0.16s; }
+  .decompress-anim span:nth-child(4) { animation-delay: -0.24s; }
+  .decompress-anim span:nth-child(5) { animation-delay: -0.32s; }
   @keyframes decompress-bounce {
     0%, 100% { transform: scaleY(0.35); opacity: 0.5; }
     50% { transform: scaleY(1); opacity: 1; }

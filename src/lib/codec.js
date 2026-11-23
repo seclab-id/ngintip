@@ -1,5 +1,6 @@
 // Encoders/decoders/hashes for the Decoder view. Each operation takes a
 // string and returns a string (hashes are async); invalid input throws.
+import { prettyJsonText } from './message.js';
 
 const utf8 = new TextEncoder();
 const strictUtf8 = new TextDecoder('utf-8', { fatal: true });
@@ -10,13 +11,18 @@ export function toHex(bytes, sep = '') {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join(sep);
 }
 
-/** Text when the bytes are valid UTF-8, otherwise a hex string. */
-export function bytesToDisplay(bytes) {
+/** The bytes as text when they are valid UTF-8, otherwise null. */
+export function bytesAsText(bytes) {
   try {
     return strictUtf8.decode(bytes);
   } catch {
-    return toHex(bytes, ' ');
+    return null;
   }
+}
+
+/** Text when the bytes are valid UTF-8, otherwise a hex string. */
+export function bytesToDisplay(bytes) {
+  return bytesAsText(bytes) ?? toHex(bytes, ' ');
 }
 
 export function base64Encode(text, { url = false } = {}) {
@@ -77,31 +83,43 @@ export function htmlDecode(text) {
 export const hexEncode = (text) => toHex(toBytes(text));
 
 /** Accepts spaces, colons and a 0x prefix. */
-export function hexDecode(text) {
+export function hexDecodeBytes(text) {
   const s = text.replace(/0x/gi, '').replace(/[\s:,-]/g, '');
   if (!/^([0-9a-f]{2})*$/i.test(s)) throw new Error('Not valid hex');
-  return bytesToDisplay(Uint8Array.from(s.match(/../g) ?? [], (h) => parseInt(h, 16)));
+  return Uint8Array.from(s.match(/../g) ?? [], (h) => parseInt(h, 16));
 }
 
-/** Header and payload pretty-printed; exp/iat/nbf shown as dates. The signature isn't verified. */
+export const hexDecode = (text) => bytesToDisplay(hexDecodeBytes(text));
+
+/** Header and payload re-indented; exp/iat/nbf shown as dates. The signature isn't verified.
+ *
+ *  Each segment is shown with its own bytes (`prettyJsonText`), never re-serialized. A
+ *  header that carries two `alg` keys, or a claim spelled with an escape so one parser
+ *  reads it and another does not, is the whole reason to open a token here; a view built
+ *  by re-serializing the parsed value drops the first and silently decodes the second. */
 export function jwtDecode(token) {
   const parts = token.trim().split('.');
   if (parts.length < 2) throw new Error('A JWT must look like header.payload.signature');
-  const json = (part, what) => {
+  const segment = (part, what) => {
     try {
-      return JSON.parse(strictUtf8.decode(base64DecodeBytes(part)));
+      // The text is kept: it is what gets shown. The parsed value is only used to read
+      // the timestamps below, where a Date is wanted rather than the bytes.
+      const text = strictUtf8.decode(base64DecodeBytes(part));
+      return { text, value: JSON.parse(text) };
     } catch {
       throw new Error(`JWT ${what} is not valid Base64URL JSON`);
     }
   };
-  const header = json(parts[0], 'Header');
-  const payload = json(parts[1], 'Payload');
-  const out = ['// Header', JSON.stringify(header, null, 2), '', '// Payload', JSON.stringify(payload, null, 2)];
-  const times = ['iat', 'nbf', 'exp'].filter((k) => typeof payload[k] === 'number');
+  const header = segment(parts[0], 'Header');
+  const payload = segment(parts[1], 'Payload');
+  const show = (s) => prettyJsonText(s.text) ?? s.text;
+  const out = ['// Header', show(header), '', '// Payload', show(payload)];
+  const claims = payload.value ?? {};
+  const times = ['iat', 'nbf', 'exp'].filter((k) => typeof claims[k] === 'number');
   if (times.length) {
     out.push('');
     for (const k of times) {
-      const date = new Date(payload[k] * 1000);
+      const date = new Date(claims[k] * 1000);
       const note = k === 'exp' ? (date < new Date() ? ' (expired)' : ' (not yet expired)') : '';
       out.push(`// ${k}: ${date.toISOString()}${note}`);
     }
@@ -178,6 +196,30 @@ function printable(s) {
  * first. Each result is `{ id, label, output }`. Used by the highlight-to-decode
  * mini decoder in the History/Repeater viewers.
  */
+// Decoders that produce BYTES. Their displayed output is a hex dump whenever those
+// bytes are not valid UTF-8, and a hex dump is always "printable" - so judging the
+// rendering lets binary garbage through. These are judged on their bytes instead.
+const BYTE_DECODERS = { b64d: base64DecodeBytes, hexd: hexDecodeBytes };
+
+// ...but "the bytes are not text" is not the same as "this is not encoded". On an API
+// whose bodies are encrypted, the hex dump IS the answer: the operator highlights a blob
+// precisely to see that it is 256 bytes of ciphertext and not a token. Judging on bytes
+// alone threw that away, so a 344-character AES body opened nothing at all.
+//
+// A blob is told apart from a word by shape, since the bytes have already said "not
+// text": long enough that no word reaches it, and carrying a character a word does not.
+// Measured, not guessed: 0 false positives over the 235.976 words of /usr/share/dict/words
+// and over the long camelCase identifiers in this engagement's traffic
+// (`transactionReferenceNumber`, which a plain length rule did claim), and 0 missed over
+// 1.000 random bodies of 16..512 bytes, base64 and hex alike.
+const BLOB_LIKE = {
+  b64d: (s) => {
+    const c = s.replace(/\s+/g, '');
+    return c.length >= 24 && /[0-9+/=_]/.test(c);
+  },
+  hexd: (s) => s.replace(/0x/gi, '').replace(/[\s:,-]/g, '').length >= 32,
+};
+
 export function autoDecode(text) {
   const input = (text ?? '').trim();
   const out = [];
@@ -189,6 +231,13 @@ export function autoDecode(text) {
     if (d.id === 'htmld' && !/&(#x?[0-9a-f]+|[a-z]+);/i.test(input)) continue;
     if (d.id === 'b64d' && (input.length < 8 || !/^[A-Za-z0-9+/\-_=\s]+$/.test(input))) continue;
     try {
+      // Selecting an ordinary word like `productType` used to open the decoder on
+      // `a6 ba 1d b9 cb 53 ca 97`: the word is valid Base64 by shape, the bytes are
+      // nonsense, and `printable()` was looking at the hex dump of that nonsense rather
+      // than at the nonsense itself. Auto-detection must only claim a match when the
+      // bytes really are text.
+      const bytes = BYTE_DECODERS[d.id];
+      if (bytes && bytesAsText(bytes(input)) === null && !BLOB_LIKE[d.id](input)) continue;
       const output = d.run(input);
       if (output && output !== input && printable(output)) out.push({ id: d.id, label: d.label, output });
     } catch {
@@ -196,6 +245,17 @@ export function autoDecode(text) {
     }
   }
   return out;
+}
+
+/** Label of the likeliest decoding, for the Decode chip, or '' when nothing matches.
+ *
+ *  Capped on purpose: the chip now appears on every selection, and running five decoders
+ *  over a 100 KB selection on each mouseup would be felt in the hand. The hint is a
+ *  nicety; the decoder itself still works on the whole selection once it is opened. */
+export function decodeHint(text, max = 4096) {
+  const s = text ?? '';
+  if (!s.trim() || s.length > max) return '';
+  return autoDecode(s)[0]?.label ?? '';
 }
 
 /** Look up an operation (decode/encode/hash) by id. */

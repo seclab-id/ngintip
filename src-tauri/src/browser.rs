@@ -211,7 +211,41 @@ pub fn launch(
     // still handled by the app's window-close handler.
     #[cfg(unix)]
     spawn_death_watchdog(std::process::id(), child.id());
+    #[cfg(target_os = "macos")]
+    activate_when_ready(child.id());
     Ok(child)
+}
+
+/// Hand the browser we just launched the foreground.
+///
+/// macOS does not pass activation to a process started with fork/exec the way it does
+/// to one launched through LaunchServices. The window appears, but the browser is not
+/// the active application and its window is not key, so clicks in it do nothing until
+/// the operator switches apps by hand and the activation state resets. Pressing "Open
+/// browser" and finding the browser dead to the touch is that, and it looks like a bug
+/// in the browser rather than in how it was started.
+///
+/// `open -a` would activate it correctly, but it hands back no pid, and the pid is what
+/// lets the app shut the browser and its helpers down on exit and what the watchdog
+/// above is built on. So the browser is still spawned directly and asked to come
+/// forward here instead.
+///
+/// Done on a thread with a retry because the process needs a moment to register with
+/// the window server; before that it cannot be found, let alone activated.
+#[cfg(target_os = "macos")]
+fn activate_when_ready(pid: u32) {
+    std::thread::spawn(move || {
+        use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+        for _ in 0..40 {
+            if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid as i32) {
+                // All windows, so the one it just opened comes forward with the app.
+                if app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows) {
+                    return;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
 }
 
 /// Spawn a tiny detached shell that waits until `app_pid` is gone, then kills the
@@ -495,7 +529,7 @@ mod tests {
     }
 
     // Real test: a process launched with process_group(0) that forks a grandchild
-    // (like a browser forks helpers) is fully taken down by terminate() — proving
+    // (like a browser forks helpers) is fully taken down by terminate() - proving
     // the group-kill closes the whole browser tree, not just the launched PID.
     #[cfg(unix)]
     #[test]
@@ -628,7 +662,7 @@ mod tests {
             if leader_dead && grand_dead {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         // Best-effort cleanup before asserting.
         let _ = browser.kill();

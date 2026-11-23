@@ -304,6 +304,13 @@ async fn origin(req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
                 .body(body::full(e2e_xor_b64_encode(reply.as_bytes())))
                 .unwrap());
         }
+        // Silence for `ms`, then a normal reply: a server that is merely slow. The
+        // response HEAD is what is late here, unlike /slow where only the body is, so
+        // the proxy handler waits inside its upstream call.
+        "/stall" => {
+            tokio::time::sleep(Duration::from_millis(param("ms") as u64)).await;
+            return Ok(Response::new(body::full("late")));
+        }
         // Size of the request body (read in chunks, never buffered whole).
         "/len" => {
             let mut body = req.into_body();
@@ -595,6 +602,327 @@ async fn slow_response_reaches_client_before_it_ends() {
     assert_eq!(&flow_by_id(&h, &events[1]).res_body[..], b"first second");
 }
 
+/// With no deadline set, Ngintip waits. That is the default and the thing an operator
+/// testing a slow endpoint depends on, so it is pinned rather than assumed.
+#[tokio::test]
+async fn without_a_deadline_a_slow_response_is_still_waited_for() {
+    let h = Harness::start("no-deadline").await;
+    let res = h.get(&h.url("/stall?ms=300")).await;
+    assert!(res.starts_with("HTTP/1.1 200"), "the proxy sets no deadline of its own: {res}");
+    assert!(res.ends_with("late"), "{res}");
+}
+
+/// With one set, Ngintip stops waiting and says so. The row has to name Ngintip, not
+/// the target: the target was never observed to fail, it was still being waited for
+/// when the operator's own patience ran out.
+#[tokio::test]
+async fn a_deadline_the_operator_set_ends_the_wait_and_is_recorded_as_ngintips_doing() {
+    let h = Harness::start("deadline").await;
+    h.ctx.set_give_up_ms(150);
+
+    let res = h.get(&h.url("/stall?ms=10000")).await;
+    assert!(res.starts_with("HTTP/1.1 502"), "the client is told, rather than left hanging: {res}");
+
+    let events = h.wait_events(proxy::FLOW_EVENT, 1).await;
+    let flow = flow_by_id(&h, &events[0]);
+    assert_eq!(flow.summary.status, 0);
+    let err = flow.summary.error.as_deref().unwrap_or_default();
+    assert!(err.contains("Ngintip stopped waiting"), "the row names who gave up: {err:?}");
+    assert!(err.contains("not shown to have failed"), "and clears the target: {err:?}");
+    // Not the "no answer on file" state: this one has a reason, and the reason is ours.
+    assert_ne!(flow.summary.error.as_deref(), Some(proxy::NO_RESPONSE));
+    assert!(!flow.summary.pending, "nothing is waiting any more");
+}
+
+/// A request that is already on the wire must be in History even if no response for it
+/// ever is.
+///
+/// The flow is written after the upstream round trip, and the handler future belongs to
+/// the client's connection: when the client hits its own read timeout and hangs up, that
+/// future is dropped at the upstream await and the write below it never runs. The request
+/// was really sent, so losing the record of it is losing evidence, not losing a request.
+#[tokio::test]
+async fn a_request_outliving_its_client_is_still_recorded() {
+    let h = Harness::start("abandoned").await;
+    let url = h.url("/stall?ms=10000");
+    let mut tcp = TcpStream::connect(h.proxy).await.unwrap();
+    tcp.write_all(format!("GET {url} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", h.origin).as_bytes())
+        .await
+        .unwrap();
+    // Long enough to be out at the origin, far short of the interim write: the row can
+    // only appear if the writer does not belong to the connection that just died.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let hung_up = std::time::Instant::now();
+    drop(tcp);
+
+    let events = h.wait_events(proxy::FLOW_EVENT, 1).await;
+    assert_eq!(events[0]["path"], "/stall?ms=10000");
+    assert_eq!(events[0]["status"], 0, "no response was ever recorded");
+    // The guard writes the moment the handler future dies, not when the one second
+    // interim timer comes round. Beating that timer is the proof of which one ran: the
+    // origin is still sitting on this request for another ten seconds.
+    assert!(
+        hung_up.elapsed() < proxy::PENDING_ROW,
+        "the hang-up itself produced the row, not the interim timer: {:?}",
+        hung_up.elapsed()
+    );
+    // And it stops claiming to be waiting straight away. A row that kept `pending` here
+    // would count upward in History for as long as the window stayed open, for an
+    // exchange that ended before the operator could even look at it.
+    assert_eq!(events[0]["pending"], false, "nothing is waiting for this any more");
+    // The other half of that distinction: this one DID go upstream, so the row must not
+    // read as a request that never left. The origin is still holding it right now.
+    assert_eq!(events[0]["unsent"], false, "the target has this request");
+    let flow = flow_by_id(&h, &events[0]);
+    assert_eq!(flow.summary.error, None, "the target was not observed to fail, so it is not accused");
+    assert_eq!(flow.summary.duration_ms, 0, "no round trip happened, so no duration is claimed");
+    assert_eq!(flow.summary.method, "GET");
+    assert!(!flow.summary.pending, "a stored row is never in flight");
+}
+
+#[tokio::test]
+async fn a_recorded_repeater_send_tells_its_hooks_which_row_it_becomes() {
+    // `repeater_send` over MCP is the one replay surface that DOES write a History row,
+    // but its id used to be minted from the already-transformed request, which is after
+    // the hooks have run. So the one surface where an extension could have said which
+    // row it rewrote was the one that handed it None. The id is now minted from the
+    // typed request, before the hooks, and the row is rebuilt under that same id.
+    if crate::extensions::detect_python().is_none() {
+        eprintln!("skipping: no python interpreter");
+        return;
+    }
+    let sdir = temp_dir("mcp-repeater-flowid");
+    let script = sdir.join("flowid.py");
+    std::fs::write(&script, FLOWID_EXT).unwrap();
+
+    let h = Arc::new(Harness::start("mcp-repeater-flowid").await);
+    h.ctx.extensions.configure(sdir.clone(), None, None);
+    h.ctx.extensions.set_extensions(vec![crate::extensions::ExtensionSpec {
+        id: "fid".into(),
+        name: "flowid".into(),
+        path: script.to_string_lossy().into_owned(),
+        enabled: true,
+        scope: "repeater".into(),
+        requirements: vec![],
+        body: String::new(),
+    }]);
+    h.ctx.extensions.set_enabled(true);
+    assert!(h.ctx.extensions.active(), "extension worker should be running");
+
+    let target = format!("http://{}", h.origin);
+    let raw = "GET /echo HTTP/1.1\nHost: replaced\nConnection: close\n\n";
+    let res = crate::commands::send_recorded(&h.ctx, None, &target, raw, true).await.unwrap();
+    let flow_id = res.flow_id.expect("a recorded send hands back its row id");
+
+    // The row really is in History under that id, which is what makes the number the
+    // hook was given worth anything. Writes are batched, so this waits for the commit.
+    let mut stored = None;
+    for _ in 0..300 {
+        if let Ok(Some(f)) = h.ctx.store.get(flow_id) {
+            stored = Some(f);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(stored.expect("the id names a real row").summary.path, "/echo");
+
+    // Both halves of the exchange name the same row, the request hooks and the response
+    // ones, so an extension's log can be lined up with the capture it is talking about.
+    for needle in ["saw flow", "encode-req flow", "decode-res flow"] {
+        let want = format!("{needle} {flow_id} on repeater");
+        let mut seen = false;
+        for _ in 0..300 {
+            if h.ctx.extensions.logs().iter().any(|l| l.contains(&want)) {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(seen, "looked for {want:?} in {:?}", h.ctx.extensions.logs());
+    }
+    // And `ctx.path` is filled here like it is on the proxy surface, so a hook that
+    // branches on the path does not have to re-parse the request to find it.
+    assert!(
+        h.ctx.extensions.logs().iter().any(|l| l.contains("path /echo")),
+        "the hook was told the path too: {:?}",
+        h.ctx.extensions.logs()
+    );
+
+    let _ = std::fs::remove_dir_all(&sdir);
+}
+
+/// A hook slow enough that a client can lose patience inside it. 600 ms is far longer
+/// than a real one takes and far shorter than any test waits for.
+const SLOW_HOOK_EXT: &str = r#"
+import time
+
+def process_request(req, ctx=None):
+    time.sleep(0.6)
+    req.set_header("X-Slow-Hook", "ran")
+"#;
+
+#[tokio::test]
+async fn a_request_abandoned_inside_an_extension_hook_says_it_never_left() {
+    // The guard that files an abandoned row used to be armed after the extension
+    // transform, so a client that hung up during that subprocess round trip took the
+    // whole handler with it and the request appeared nowhere at all.
+    //
+    // Recording it is only half the fix. The row an abandoned request gets says the
+    // target was asked and the answer arrived with nobody holding the question, and here
+    // that would be false twice over: the request never left Ngintip, so the target has
+    // nothing to do with this row. `unsent` is what keeps the two apart, and it is the
+    // one fact about such a row that cannot be worked out again from anything else.
+    if crate::extensions::detect_python().is_none() {
+        eprintln!("skipping: no python interpreter");
+        return;
+    }
+    let sdir = temp_dir("ext-slow-hook");
+    let script = sdir.join("slow.py");
+    std::fs::write(&script, SLOW_HOOK_EXT).unwrap();
+
+    let h = Arc::new(Harness::start("ext-slow-hook").await);
+    h.ctx.extensions.configure(sdir.clone(), None, None);
+    h.ctx.extensions.set_extensions(vec![crate::extensions::ExtensionSpec {
+        id: "slow".into(),
+        name: "slow".into(),
+        path: script.to_string_lossy().into_owned(),
+        enabled: true,
+        scope: "both".into(),
+        requirements: vec![],
+        body: String::new(),
+    }]);
+    h.ctx.extensions.set_enabled(true);
+    assert!(h.ctx.extensions.active(), "extension worker should be running");
+
+    let mut tcp = TcpStream::connect(h.proxy).await.unwrap();
+    tcp.write_all(
+        format!(
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+            h.url("/echo"),
+            h.origin
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    // Inside the hook (it sleeps 600 ms) and well short of the one second interim
+    // timer, so only the guard can produce this row.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let hung_up = std::time::Instant::now();
+    drop(tcp);
+
+    let events = h.wait_events(proxy::FLOW_EVENT, 1).await;
+    assert_eq!(events[0]["path"], "/echo", "the request is in History at all");
+    assert_eq!(events[0]["status"], 0, "no response was ever recorded");
+    assert!(
+        hung_up.elapsed() < proxy::PENDING_ROW,
+        "the hang-up produced the row, not the interim timer: {:?}",
+        hung_up.elapsed()
+    );
+    assert_eq!(events[0]["pending"], false, "nothing is waiting for this any more");
+    assert_eq!(events[0]["unsent"], true, "and the target never saw it");
+
+    let flow = flow_by_id(&h, &events[0]);
+    assert_eq!(flow.summary.error, None, "nothing was observed to fail, so nothing is accused");
+    assert!(flow.summary.unsent, "stored as never sent");
+    // The row is the request as the client wrote it. The hook's header is deliberately
+    // absent: it never finished, and a row claiming an edit that never reached anyone
+    // would be inventing evidence.
+    assert!(
+        !flow.req_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-slow-hook")),
+        "the unfinished edit is not claimed: {:?}",
+        flow.req_headers
+    );
+
+    // The pane says so in words, and does not reach for the target.
+    let shown = crate::raw::response_text(&flow);
+    assert!(shown.starts_with("-- the request never left Ngintip --"), "{shown}");
+    assert!(!shown.contains("upstream error"), "{shown}");
+
+    let _ = std::fs::remove_dir_all(&sdir);
+}
+
+/// A held request whose edit cannot be parsed is recorded too.
+///
+/// The operator pressed Forward, so as far as they are concerned the request left. It did
+/// not: Ngintip answered 400 itself. Returning that without recording anything is the
+/// same silence as the case above, with the operator's own edit as the cause.
+#[tokio::test]
+async fn an_unparsable_intercept_edit_is_recorded_rather_than_dropped_silently() {
+    use crate::intercept::{Decision, Phase};
+
+    let h = Arc::new(Harness::start("intercept-bad-edit").await);
+    h.ctx.intercept.set_enabled(true);
+
+    let client = tokio::spawn({
+        let h = h.clone();
+        async move {
+            h.raw(&format!(
+                "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                h.url("/echo"),
+                h.origin
+            ))
+            .await
+        }
+    });
+
+    let req = next_held(&h, Phase::Request).await;
+    h.ctx
+        .intercept
+        .resolve(req.key, Decision::Forward { raw: Some("not a request line at all\r\n\r\n".into()), hold_response: false });
+
+    let out = client.await.unwrap();
+    assert!(out.starts_with("HTTP/1.1 400"), "the operator is told the edit was rejected:\n{out}");
+
+    let flows = h.wait_events(proxy::FLOW_EVENT, 1).await;
+    let flow = flow_by_id(&h, &flows[0]);
+    assert_eq!(flow.summary.status, 0);
+    assert!(
+        flow.summary.error.as_deref().is_some_and(|e| e.contains("edited request invalid")),
+        "the reason is on the row: {:?}",
+        flow.summary.error
+    );
+    // What is kept is the request as it arrived, which is the only version that exists.
+    assert!(String::from_utf8_lossy(&flow.req_body).contains("hello"));
+}
+
+/// The same loss on the path that buffers the response instead of streaming it.
+///
+/// A response is read in full when an extension is active or a body rule is set, which is
+/// how a project against an encrypted API is always configured. That path never had an
+/// interim row: the streaming preview does not run for it, so the only write was the one
+/// after the buffering await. A slow endpoint plus a client that gives up left nothing at
+/// all, which is the shape this was first reported in.
+#[tokio::test]
+async fn a_buffered_response_abandoned_mid_body_still_leaves_the_request_in_history() {
+    use crate::rules::{Rule, Target};
+
+    let h = Harness::start("abandoned-buffered").await;
+    // Matches nothing, and is enough to put the response on the buffering path.
+    h.ctx
+        .rules
+        .set(&[Rule { target: Target::ResponseBody, pattern: "zzz-no-match".into(), ..Rule::default() }])
+        .unwrap();
+
+    let url = h.url("/slow?ms=10000");
+    let mut tcp = TcpStream::connect(h.proxy).await.unwrap();
+    tcp.write_all(format!("GET {url} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", h.origin).as_bytes())
+        .await
+        .unwrap();
+    // The head and the first chunk are through; the proxy is inside the buffering await.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(tcp);
+
+    let events = h.wait_events(proxy::FLOW_EVENT, 1).await;
+    assert_eq!(events[0]["path"], "/slow?ms=10000");
+    // Dropped while the proxy was parked inside the buffering await, which is a
+    // different await from the one above and gets the same treatment.
+    assert_eq!(events[0]["pending"], false, "nothing is waiting for this any more");
+    let flow = flow_by_id(&h, &events[0]);
+    assert_eq!(flow.summary.error, None, "a request with no answer on file is not a failure");
+    assert_eq!(flow.summary.duration_ms, 0);
+}
+
 #[tokio::test]
 async fn large_upload_streams_to_upstream() {
     let h = Harness::start("upload").await;
@@ -773,6 +1101,286 @@ def decode_response(res, ctx):
         except Exception:
             pass
 "#;
+
+/// An extension that writes the flow id it was given into the header it adds, so the
+/// test can check that a `process_*` hook knows which row in History it is editing.
+const FLOWID_EXT: &str = r#"
+def process_request(req, ctx=None):
+    # Written to the Debug console rather than into the message: what is under test is
+    # what the hook was TOLD, not what the proxy does with an edit.
+    ctx.log("saw flow", ctx.flow_id, "on", ctx.surface, "path", ctx.path)
+
+def decode_request(req, ctx=None):
+    ctx.log("decode-req flow", ctx.flow_id, "on", ctx.surface)
+
+def encode_request(req, ctx=None):
+    ctx.log("encode-req flow", ctx.flow_id, "on", ctx.surface)
+
+def decode_response(res, ctx=None):
+    ctx.log("decode-res flow", ctx.flow_id, "on", ctx.surface)
+
+def encode_response(res, ctx=None):
+    ctx.log("encode-res flow", ctx.flow_id, "on", ctx.surface)
+"#;
+
+#[tokio::test]
+async fn a_process_hook_is_told_which_flow_it_is_editing() {
+    // An extension that changes traffic could not say which row in History it had
+    // changed: decode_* was given the flow id, process_* was not. Without it an
+    // extension's own log cannot be lined up with the capture, which is the first thing
+    // anyone wants when a rewrite does something unexpected.
+    if crate::extensions::detect_python().is_none() {
+        eprintln!("skipping: no python interpreter");
+        return;
+    }
+    let sdir = temp_dir("ext-flowid");
+    let script = sdir.join("flowid.py");
+    std::fs::write(&script, FLOWID_EXT).unwrap();
+
+    let h = Arc::new(Harness::start("ext-flowid").await);
+    h.ctx.extensions.configure(sdir.clone(), None, None);
+    h.ctx.extensions.set_extensions(vec![crate::extensions::ExtensionSpec {
+        id: "fid".into(),
+        name: "flowid".into(),
+        path: script.to_string_lossy().into_owned(),
+        enabled: true,
+        scope: "both".into(),
+        requirements: vec![],
+        body: String::new(),
+    }]);
+    h.ctx.extensions.set_enabled(true);
+    assert!(h.ctx.extensions.active(), "extension worker should be running");
+
+    let _ = h.get(&h.url("/hello")).await;
+    let flows = h.wait_events(proxy::FLOW_EVENT, 1).await;
+    let id = flows[0]["id"].as_u64().unwrap();
+
+    // What the hook wrote to the Debug console is what it was handed.
+    let mut line = String::new();
+    for _ in 0..200 {
+        if let Some(found) = h.ctx.extensions.logs().into_iter().find(|l| l.contains("saw flow")) {
+            line = found;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(line.contains(&format!("saw flow {id}")), "the hook was told the flow it is editing: {line:?}");
+    assert!(line.contains("on proxy"), "and which surface it arrived from: {line:?}");
+    assert!(line.contains("path /hello"), "and which path: {line:?}");
+
+    // Held in the interceptor, every hook on the message names the same flow: the
+    // decode that makes it readable and the encode of the edit, not only process. Those
+    // two were handed an empty context, so an extension could say which row it rewrote
+    // but not which row it had just decoded - the same bytes, one step earlier.
+    h.ctx.intercept.set_enabled(true);
+    let client = tokio::spawn({
+        let h = h.clone();
+        async move { h.get(&h.url("/hello")).await }
+    });
+    let req = next_held(&h, crate::intercept::Phase::Request).await;
+    let held_id = req.id;
+    h.ctx
+        .intercept
+        .resolve(req.key, crate::intercept::Decision::Forward { raw: Some(req.raw.clone()), hold_response: true });
+    let res = next_held(&h, crate::intercept::Phase::Response).await;
+    assert_eq!(res.id, held_id, "a request and its response are one flow");
+    h.ctx
+        .intercept
+        .resolve(res.key, crate::intercept::Decision::Forward { raw: Some(res.raw.clone()), hold_response: false });
+    let _ = client.await.unwrap();
+
+    for needle in ["decode-req flow", "encode-req flow", "decode-res flow", "encode-res flow"] {
+        let want = format!("{needle} {held_id} on interceptor");
+        let mut seen = false;
+        for _ in 0..300 {
+            if h.ctx.extensions.logs().iter().any(|l| l.contains(&want)) {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(seen, "looked for {want:?} in {:?}", h.ctx.extensions.logs());
+    }
+
+    let _ = std::fs::remove_dir_all(&sdir);
+}
+
+/// An extension that rewrites the request line and the headers on the wire. It logs
+/// nothing: what is under test is whether the record names the bytes that went out.
+const REWRITE_EXT: &str = r#"
+def process_request(req, ctx=None):
+    req.path = req.path + ("&" if "?" in req.path else "?") + "rewritten=1"
+    req.set_header("X-Added-By", "extension")
+    req.remove_header("X-Dropped-By")
+"#;
+
+#[tokio::test]
+async fn history_records_the_request_a_process_hook_actually_sent() {
+    // `apply_edit` rewrites the outgoing request in place, but the row used to be built
+    // from the message as it arrived, before the hook ran. The header the extension
+    // added crossed the wire and then appeared nowhere in the record, while Original
+    // (which did get written) held that same arrived text. The row showed two identical
+    // tabs and no version at all of what the origin was really sent.
+    if crate::extensions::detect_python().is_none() {
+        eprintln!("skipping: no python interpreter");
+        return;
+    }
+    let sdir = temp_dir("ext-rewrite");
+    let script = sdir.join("rewrite.py");
+    std::fs::write(&script, REWRITE_EXT).unwrap();
+
+    let h = Arc::new(Harness::start("ext-rewrite").await);
+    h.ctx.extensions.configure(sdir.clone(), None, None);
+    h.ctx.extensions.set_extensions(vec![crate::extensions::ExtensionSpec {
+        id: "rw".into(),
+        name: "rewrite".into(),
+        path: script.to_string_lossy().into_owned(),
+        enabled: true,
+        scope: "both".into(),
+        requirements: vec![],
+        body: String::new(),
+    }]);
+    h.ctx.extensions.set_enabled(true);
+    assert!(h.ctx.extensions.active(), "extension worker should be running");
+
+    let echoed = h
+        .raw(&format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nX-Dropped-By: client\r\nConnection: close\r\n\r\n",
+            h.url("/echo"),
+            h.origin
+        ))
+        .await;
+    // What the origin saw: all three edits crossed the wire.
+    assert!(echoed.contains("GET /echo?rewritten=1"), "origin got the rewritten request line:\n{echoed}");
+    assert!(echoed.to_lowercase().contains("x-added-by: extension"), "origin got the added header:\n{echoed}");
+    assert!(!echoed.to_lowercase().contains("x-dropped-by"), "origin did not get the removed header:\n{echoed}");
+
+    let flows = h.wait_events(proxy::FLOW_EVENT, 1).await;
+    let id = flows[0]["id"].as_u64().unwrap();
+    let flow = h.ctx.store.get(id).unwrap().unwrap();
+
+    // The row is the request that went upstream, down to the same three edits.
+    assert_eq!(flow.summary.path, "/echo?rewritten=1", "recorded path is the rewritten one");
+    let names: Vec<String> = flow.req_headers.iter().map(|(k, _)| k.to_lowercase()).collect();
+    assert!(
+        flow.req_headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-added-by") && v == "extension"),
+        "recorded request carries the added header: {:?}",
+        flow.req_headers
+    );
+    assert!(!names.iter().any(|k| k == "x-dropped-by"), "and not the removed one: {:?}", flow.req_headers);
+
+    // Original is the other version, the one the client typed, so the two tabs differ.
+    let original = flow.variants.req_original.expect("Original request variant captured");
+    assert!(original.contains("GET /echo HTTP/1.1"), "Original keeps the arrived request line: {original:?}");
+    assert!(original.contains("X-Dropped-By: client"), "Original keeps the header the hook removed: {original:?}");
+    assert!(!original.contains("X-Added-By"), "Original predates the header the hook added: {original:?}");
+
+    let _ = std::fs::remove_dir_all(&sdir);
+}
+
+#[tokio::test]
+async fn an_extension_that_only_watches_does_not_mark_the_flow_edited() {
+    // The runner answered a hook that returned None by re-serializing the message, which
+    // turns the host's \n into \r\n and recomputes Content-Length. The host decides
+    // "edited" by comparing bytes, so an extension that only logged made every single
+    // flow show Original vs Final, and the Modified column stopped meaning anything.
+    if crate::extensions::detect_python().is_none() {
+        eprintln!("skipping: no python interpreter");
+        return;
+    }
+    let sdir = temp_dir("ext-watch");
+    let script = sdir.join("watch.py");
+    // FLOWID_EXT defines every hook and each one only writes to the console.
+    std::fs::write(&script, FLOWID_EXT).unwrap();
+
+    let h = Arc::new(Harness::start("ext-watch").await);
+    h.ctx.extensions.configure(sdir.clone(), None, None);
+    h.ctx.extensions.set_extensions(vec![crate::extensions::ExtensionSpec {
+        id: "watch".into(),
+        name: "watch".into(),
+        path: script.to_string_lossy().into_owned(),
+        enabled: true,
+        scope: "both".into(),
+        requirements: vec![],
+        body: String::new(),
+    }]);
+    h.ctx.extensions.set_enabled(true);
+    assert!(h.ctx.extensions.active(), "extension worker should be running");
+
+    // A body and a Content-Length, the two things re-serialization touches.
+    let sent = h
+        .raw(&format!(
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: 9\r\nConnection: close\r\n\r\n{{\"a\":123}}",
+            h.url("/echo"),
+            h.origin
+        ))
+        .await;
+    assert!(sent.starts_with("HTTP/1.1 200"), "request went through: {sent}");
+
+    let flows = h.wait_events(proxy::FLOW_EVENT, 1).await;
+    let id = flows[0]["id"].as_u64().unwrap();
+    let flow = h.ctx.store.get(id).unwrap().unwrap();
+
+    assert!(flow.variants.req_original.is_none(), "a hook that only looks writes no Original: {:?}", flow.variants.req_original);
+    assert!(flow.variants.res_original.is_none(), "neither on the response: {:?}", flow.variants.res_original);
+    assert!(flow.variants.is_empty(), "so the row is not marked Modified");
+
+    let _ = std::fs::remove_dir_all(&sdir);
+}
+
+/// Two hooks, of which a stale saved copy knows only one. Used to prove the host scans
+/// the file it is about to run and not the copy stored beside it.
+const TWO_HOOK_EXT: &str = r#"
+def process_request(req, ctx=None):
+    req.set_header("X-From-Disk", "yes")
+
+def decode_request(req, ctx=None):
+    ctx.log("decode ran")
+"#;
+
+const STALE_SAVED_COPY: &str = r#"
+def decode_request(req, ctx=None):
+    ctx.log("decode ran")
+"#;
+
+#[tokio::test]
+async fn hooks_are_scanned_from_the_file_the_worker_runs() {
+    // The worker runs the file on disk when there is one, but the scan that decides
+    // which hooks exist preferred the saved copy. Edit a script without saving the
+    // extension list again (or toggle it over MCP, which never refreshes that copy) and
+    // the host calls the hooks of the old text while running the new file: a hook you
+    // just added is never called, and nothing in the log says why.
+    if crate::extensions::detect_python().is_none() {
+        eprintln!("skipping: no python interpreter");
+        return;
+    }
+    let sdir = temp_dir("ext-stale");
+    let script = sdir.join("stale.py");
+    std::fs::write(&script, TWO_HOOK_EXT).unwrap();
+
+    let h = Arc::new(Harness::start("ext-stale").await);
+    h.ctx.extensions.configure(sdir.clone(), None, None);
+    h.ctx.extensions.set_extensions(vec![crate::extensions::ExtensionSpec {
+        id: "stale".into(),
+        name: "stale".into(),
+        path: script.to_string_lossy().into_owned(),
+        // The copy saved with the extension list, left behind by an edit on disk.
+        body: STALE_SAVED_COPY.into(),
+        enabled: true,
+        scope: "both".into(),
+        requirements: vec![],
+    }]);
+    h.ctx.extensions.set_enabled(true);
+    assert!(h.ctx.extensions.active(), "extension worker should be running");
+
+    let echoed = h.get(&h.url("/echo")).await;
+    assert!(
+        echoed.to_lowercase().contains("x-from-disk: yes"),
+        "the hook that only the file on disk defines was called:\n{echoed}"
+    );
+
+    let _ = std::fs::remove_dir_all(&sdir);
+}
 
 #[tokio::test]
 async fn decode_hook_shows_plaintext_without_changing_the_wire() {
@@ -1429,6 +2037,122 @@ async fn ws_log(h: &Harness, flow_id: u64, n: usize) -> Vec<(String, u8, String)
 }
 
 #[tokio::test]
+async fn repeater_opens_a_socket_and_records_it_as_a_flow() {
+    // The mechanism in one test: the Repeater opens a socket of its own, and what comes
+    // back is an ordinary 101 flow carrying ws messages. That is the whole design, and
+    // it is why History, the WebSocket viewer, the Organizer and the MCP server need to
+    // know nothing about the Repeater to show its traffic.
+    let h = Harness::start("wsrep").await;
+    let (origin, _seen) = spawn_ws_origin(None).await;
+
+    let opened = h
+        .ctx
+        .ws_repeater
+        .clone()
+        .open(&h.ctx, &format!("ws://{origin}/replay"))
+        .await
+        .expect("the socket opens");
+    assert_eq!(opened.status, 101);
+    assert!(opened.handshake.contains("101"), "the handshake is kept for the viewer");
+
+    // The flow exists, and it is a socket as far as every other view is concerned.
+    let flow = h.ctx.store.get(opened.flow_id).unwrap().expect("a flow was recorded");
+    assert_eq!(flow.summary.status, 101);
+    assert_eq!(flow.summary.method, "GET");
+    assert_eq!(flow.summary.path, "/replay");
+
+    // A frame out, its echo back, both recorded in the right direction.
+    h.ctx
+        .ws_repeater
+        .clone()
+        .send(&h.ctx, opened.conn_id, "text", br#"{"from":"repeater"}"#)
+        .expect("send");
+    let log = ws_log(&h, opened.flow_id, 2).await;
+    assert_eq!(log[0], ("client".into(), 1, r#"{"from":"repeater"}"#.to_string()));
+    assert_eq!(log[1], ("server".into(), 1, r#"{"from":"repeater"}"#.to_string()));
+
+    // A binary frame keeps its opcode, so the viewer hex-dumps it instead of guessing.
+    h.ctx.ws_repeater.clone().send(&h.ctx, opened.conn_id, "binary", &[0x89, 0x50, 0x4e, 0x47]).expect("send binary");
+    let log = ws_log(&h, opened.flow_id, 4).await;
+    assert_eq!(log[2].1, 2, "binary stays binary");
+
+    // Closing is polite and recorded: a close frame with a code, from the client side.
+    h.ctx.ws_repeater.clone().close(&h.ctx, opened.conn_id, 4001, "done").expect("close");
+    let log = ws_log(&h, opened.flow_id, 5).await;
+    let close = log.iter().find(|(dir, op, _)| dir == "client" && *op == 8).expect("a close frame was recorded");
+    assert!(close.2.contains("4001"), "the code is kept, not just the fact: {}", close.2);
+    assert!(!h.ctx.ws_repeater.is_open(opened.conn_id), "a closed socket is forgotten");
+}
+
+/// A server that pushes frames and never stops, which is the shape a Repeater socket
+/// has to be able to walk away from.
+async fn spawn_ws_firehose() -> SocketAddr {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else { return };
+                for i in 0u64.. {
+                    if ws.send(Message::Text(format!(r#"{{"tick":{i}}}"#).into())).await.is_err() {
+                        return; // the client is gone: that is the point of the test
+                    }
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn a_streaming_socket_stops_the_moment_the_repeater_closes_it() {
+    // The case that matters for a push channel: frames keep coming whether or not you
+    // asked for them, so closing has to actually stop them. Not "stop showing them" -
+    // stop them: the connection goes, the task ends, and nothing more is recorded under
+    // that flow.
+    let h = Harness::start("wsrep-stream").await;
+    let origin = spawn_ws_firehose().await;
+
+    let open = h.ctx.ws_repeater.clone().open(&h.ctx, &format!("ws://{origin}/firehose")).await.expect("opens");
+    // Let it run long enough that it is unmistakably streaming.
+    let streamed = ws_log(&h, open.flow_id, 5).await;
+    assert!(streamed.len() >= 5, "the server is pushing");
+
+    h.ctx.ws_repeater.clone().close(&h.ctx, open.conn_id, 1000, "enough").expect("close");
+    assert!(!h.ctx.ws_repeater.is_open(open.conn_id), "the socket is forgotten immediately");
+
+    // Settle, then take the count and prove it stays put while the server would have
+    // sent dozens more.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let after_close = h.ctx.store.ws_messages(open.flow_id).unwrap().len();
+    tokio::time::sleep(Duration::from_millis(400)).await; // ~26 more ticks, had it lived
+    let later = h.ctx.store.ws_messages(open.flow_id).unwrap().len();
+    assert_eq!(later, after_close, "frames kept arriving after close: the socket outlived the Repeater");
+
+    // And sending into it is refused in words rather than silently doing nothing.
+    let err = h.ctx.ws_repeater.clone().send(&h.ctx, open.conn_id, "text", b"hello").unwrap_err().to_string();
+    assert!(err.contains("not open"), "{err}");
+}
+
+#[tokio::test]
+async fn repeater_refuses_an_address_that_is_not_a_socket() {
+    // The failure has to name what was wrong, because the two ways this goes wrong look
+    // identical from the UI: a typo in the address, and a server that answers the
+    // handshake with an ordinary page.
+    let h = Harness::start("wsrep-bad").await;
+    let err = h.ctx.ws_repeater.clone().open(&h.ctx, "http-ish://nope/x").await.unwrap_err().to_string();
+    assert!(err.contains("ws://"), "says what an address looks like: {err}");
+
+    let origin = spawn_origin().await; // a plain HTTP origin, no upgrade
+    let err = h.ctx.ws_repeater.clone().open(&h.ctx, &format!("ws://{origin}/")).await.unwrap_err().to_string();
+    assert!(err.contains("not 101"), "says the server declined the upgrade: {err}");
+}
+
+#[tokio::test]
 async fn websocket_through_connect_tunnel_is_bridged_and_logged() {
     let h = Harness::start("ws").await;
     let (origin, seen) = spawn_ws_origin(None).await;
@@ -2042,7 +2766,7 @@ async fn live_mcp_against_vuln_app() {
     let names: Vec<String> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
     eprintln!("[tools/list]   {} tools: {}", names.len(), names.join(", "));
 
-    // 3) history_list — flows recorded via the proxy are visible over MCP.
+    // 3) history_list - flows recorded via the proxy are visible over MCP.
     let hist = mcp_tool(mcp, "history_list", serde_json::json!({})).await;
     let total = hist["total"].as_u64().unwrap_or(0);
     eprintln!("[history_list] total={total}");

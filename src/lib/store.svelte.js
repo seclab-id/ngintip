@@ -2,7 +2,7 @@ import { listen } from '@tauri-apps/api/event';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import * as api from './api.js';
 import { DEFAULT_COLUMN_KEYS, normalizeColumns } from './columns.js';
-import { emptyAdvanced, advActive, newFilter, BASIC_EXCLUDE_FILTERS } from './histfilter.js';
+import { emptyAdvanced, advActive, newFilter, isWebSocket, BASIC_EXCLUDE_FILTERS } from './histfilter.js';
 import { emptyHide } from './hidefilter.js';
 import { scanFlow, compileRules, ruleError, SEVERITY_ORDER, flowInScope, DEFAULT_PASSIVE_SCOPE } from './passive.js';
 import { inScope } from './scope.js';
@@ -15,6 +15,9 @@ import { newInterceptRule, normalizeInterceptRule } from './interceptfilter.js';
 import { prettyBody } from './message.js';
 import { normalizeEntry, templateFields, newField, kindInfo, cloneFields } from './vault.js';
 import { dirOf } from './projectName.js';
+import { renderPng } from './flowimage.js';
+import { SAVED_COLUMNS } from './organizer.js';
+import { isHandshakeRequest, isSocketUrl, requestPath, socketAddress } from './wsframe.js';
 
 // Extension scope surfaces (must match Rust's Surface tokens), in canonical order.
 export const EXT_SURFACES = ['proxy', 'interceptor', 'repeater', 'intruder'];
@@ -110,9 +113,21 @@ const MCP_SETTING = 'mcp';
 const BROWSER_PROFILES_SETTING = 'browserProfiles';
 // Organizer: collections of saved requests, per project.
 const ORGANIZER_SETTING = 'organizer';
+// How much of a socket a saved Organizer record carries. A live socket can hold
+// hundreds of thousands of frames and one frame can be megabytes, so both axes are
+// capped: the record is evidence of what the socket did, not a second copy of the
+// project. Frames are kept oldest first, and the record remembers the real total.
+// Mirrors src-tauri/src/organizer.rs, so a record saved from the window and one saved
+// by an agent mean the same thing. Three limits, whichever runs out first.
+const WS_SAVE_FRAMES = 2000;
+const WS_SAVE_TEXT = 16 * 1024;
+const WS_SAVE_BYTES = 2 * 1024 * 1024;
 // Organizer > Notes, kept under their own key so typing a note never rewrites the
 // (possibly large) saved request/response bodies.
 const ORGANIZER_NOTES_SETTING = 'organizerNotes';
+// Organizer > saved-requests table sort, per project. Kept here rather than in the
+// view so leaving the Organizer and coming back does not throw the order away.
+const ORGANIZER_SORT_SETTING = 'organizerSort';
 // Vault: credentials stored (plaintext) with the project; its UI lives in Settings.
 const VAULT_SETTING = 'vault';
 // Where tabs were kept before they moved into the project (webview-wide).
@@ -145,6 +160,22 @@ function makeTab(id, fields = {}) {
     // per session: deliberately not persisted, so a forgotten bypass cannot outlive
     // the app and silently change what you send next time.
     rawMode: false,
+    // A socket tab ('ws') replaces the request editor with a frame sender. Only `url`
+    // and `payload` are worth keeping with the project: a connection is not a thing you
+    // can save and reopen, so `connId`/`flowId` live for the session only.
+    kind: 'http',
+    url: '',
+    payload: '',
+    frameKind: 'text',
+    connId: null,
+    flowId: null,
+    handshake: '',
+    // How the toolbar describes the socket: idle -> connecting -> open -> closed.
+    // `connId` alone cannot say it, because "never connected" and "the server hung up"
+    // are both a missing connection and the operator needs to be told which one it is.
+    wsState: 'idle',
+    closedBy: '',
+    closeCode: 1000,
     ...fields,
   };
 }
@@ -215,6 +246,10 @@ function repeaterSaveFields(tab) {
     response: resWire,
     responseExtension: resDecoded,
     status: tab.response?.status ?? null,
+    // What the send cost. Null rather than 0 when the tab has never been sent, so the
+    // table can say "not recorded" instead of inventing an instant, empty response.
+    durationMs: tab.response?.durationMs ?? null,
+    length: tab.response?.length ?? null,
   };
 }
 
@@ -235,6 +270,9 @@ function intruderResultSaveFields(tab, r) {
     response: resWire,
     responseExtension: resDecoded,
     status: r.status || null,
+    // Intruder names the same two numbers timeMs / length in its results table.
+    durationMs: r.error ? null : r.timeMs ?? null,
+    length: r.error ? null : r.length ?? null,
     label: (r.payloads ?? []).join(', '),
     source: 'intruder(each)',
   };
@@ -293,7 +331,23 @@ function takeLegacyRepeater() {
 
 /** Only name/target/raw are worth keeping; responses are re-sent on demand. */
 function repeaterSnapshot({ tabs, activeId, groupColors, collapsedGroups }) {
-  return { activeId, groupColors: { ...groupColors }, collapsedGroups: [...(collapsedGroups ?? [])], tabs: tabs.map(({ id, name, group, target, raw, note }) => ({ id, name, group, target, raw, note: note || '' })) };
+  return {
+    activeId,
+    groupColors: { ...groupColors },
+    collapsedGroups: [...(collapsedGroups ?? [])],
+    // A socket tab keeps its address and the frame you were about to send; the live
+    // connection is deliberately not persisted, because reopening a project must not
+    // quietly reconnect to a target.
+    tabs: tabs.map((t) => ({
+      id: t.id,
+      name: t.name,
+      group: t.group,
+      target: t.target,
+      raw: t.raw,
+      note: t.note || '',
+      ...(t.kind === 'ws' ? { kind: 'ws', url: t.url ?? '', payload: t.payload ?? '', frameKind: t.frameKind ?? 'text' } : {}),
+    })),
+  };
 }
 
 /**
@@ -369,6 +423,25 @@ function makeIntruderTab(id, fields = {}) {
 // worst-case memory instead of letting it grow unbounded.
 export const DETAIL_CACHE_MAX = 45;
 
+/** Default seconds before a waiting row is badged LATE. 0 disables the escalation. */
+export const LATE_AFTER_SEC = 60;
+
+/** Default seconds before Ngintip stops waiting for a response. 0 = never give up. */
+export const GIVE_UP_AFTER_SEC = 180;
+
+/** How long incoming flows are batched before History is rebuilt.
+ *
+ *  Was one animation frame. At 39K flows every rebuild costs several milliseconds per
+ *  link of the derived chain, so 60 Hz tailing spent most of a frame redrawing a table
+ *  that shows forty rows. 100 ms still reads as live and costs a sixth as much. */
+export const FLUSH_MS = 100;
+
+// Both live in the open project, like the MCP switch: how patient to be is a judgement
+// about the system under test, so it travels with the engagement rather than with the
+// machine. A project that has never been told keeps the defaults above.
+const WAIT_LATE_SETTING = 'waitLate';
+const GIVE_UP_SETTING = 'giveUp';
+
 class Store {
   view = $state('history');
   // Startup project chooser is shown until the user picks a project.
@@ -377,10 +450,20 @@ class Store {
   theme = $state(loadTheme());
   // Opened-flow detail cache ceiling (configurable in Settings > Project).
   detailCacheMax = $state(loadDetailCacheMax());
+  lateAfterSec = $state(LATE_AFTER_SEC);
+  // Its own field, not part of `config`. `config` is whatever the backend last handed
+  // over and is replaced wholesale by getConfig(), which would drop a project-owned
+  // value on the floor at launch; this one belongs to the open project.
+  giveUpAfterSec = $state(GIVE_UP_AFTER_SEC);
 
   project = $state({ name: '', path: '' });
   scope = $state.raw([]);
   scopeOnly = $state(false);
+  // Which half of History to show: 'all', 'http' (hide sockets) or 'ws' (sockets only).
+  // A WebSocket connection is one GET answered 101, and everything it carries arrives
+  // afterwards as frames, so mixing the two in one table buries the sockets among
+  // thousands of ordinary requests.
+  historyKind = $state('all');
   // Match & Replace rules of the open project.
   rules = $state.raw([]);
 
@@ -427,6 +510,8 @@ class Store {
   // `activeId` is where "Save to Organizer" lands (null = none active). Persisted in the
   // project (.ngintip) via ORGANIZER_SETTING and ORGANIZER_NOTES_SETTING.
   organizer = $state({ collections: [], activeId: null, viewId: null, notes: [] });
+  // Saved-requests table sort (persisted per project, like historySort). dir: 1 asc, -1 desc.
+  organizerSort = $state({ key: 'n', dir: 1 });
   // Credential vault (per project, PLAINTEXT by design): entries kept with the project.
   // Its UI lives in Settings, not the Organizer. Persisted via the VAULT_SETTING key.
   vault = $state({ entries: [] });
@@ -520,8 +605,11 @@ class Store {
   passiveDisabled = $state.raw([]);
   // Which resources to scan, by extension/content-type (['*'] = everything).
   passiveScope = $state.raw([...DEFAULT_PASSIVE_SCOPE]);
-  // Restrict the passive scan to flows whose host is in the project Scope.
-  passiveInScopeOnly = $state(false);
+  // Restrict the passive scan to flows whose host is in the project Scope. On by
+  // default: a capture holds everything the browser touched, and findings from a CDN
+  // or an analytics host are noise you did not ask about. An empty Scope matches
+  // everything (see inScope), so this costs nothing until a scope exists.
+  passiveInScopeOnly = $state(true);
   // Finding groups the user collapsed (by `${host}${path}` key). Persisted per
   // project so the expanded/collapsed layout survives view switches and restarts.
   passiveCollapsed = $state.raw([]);
@@ -567,7 +655,26 @@ class Store {
   // engagement wrote its findings into another engagement's file.
   #projectGen = 0;
 
+  /** History's scroll offset and tail-follow state, kept across tab switches.
+   *
+   *  Not persisted and not reactive: the table reads it when it mounts and writes it as
+   *  you scroll. It exists because leaving History destroys FlowTable, so `follow` came
+   *  back as `true` on every return and the table jumped to the newest end. An operator
+   *  who had scrolled to a row, stepped over to Repeater and came back lost their place.
+   *  It also meant the mount wrote `scrollTop = scrollHeight`, forcing a synchronous
+   *  layout of a spacer that is 28 px per flow (over a million pixels at 39K).
+   *
+   *  `height` is here for a second reason: it is bound to `clientHeight`, which is 0
+   *  until the browser has laid the viewport out, so the FIRST render of the table
+   *  always built the wrong (tiny) window of rows and was thrown away one frame later.
+   *  Seeding it with the height this viewport had last time makes that first render the
+   *  right one. A stale value after a window resize is corrected by the binding exactly
+   *  as it is today. */
+  historyScroll = { top: 0, follow: true, height: 0 };
+
   #pending = [];
+  #flushTimer = null;
+  #lastFlush = 0;
   #wsListeners = new Set();
   #repeaterSaved = '';
   #repeaterTimer = null;
@@ -591,6 +698,13 @@ class Store {
     (async () => {
       this.project = await api.projectInfo();
       await this.#loadRepeater();
+      // Sockets the backend still holds from a previous window (a dev reload, a crash).
+      // A tab never persists its connection, so nothing can own these any more: close
+      // them instead of leaving them recording frames into a flow nobody is watching.
+      api
+        .wsRepeaterOpenList()
+        .then((open) => open.forEach(([connId]) => api.wsRepeaterClose(connId, 1001, 'window reloaded').catch(() => {})))
+        .catch(() => {});
       await this.#loadIntruder();
       await this.#loadProjectSettings();
       window.addEventListener('beforeunload', () => {
@@ -606,11 +720,13 @@ class Store {
       this.browser = { ...this.browser, ...(await api.browserStatus().catch(() => ({}))) };
       this.scope = await api.getScope();
       this.rules = await api.getRules();
-      this.flows = await api.listFlows();
+      await this.#loadFlows();
       const unlistenFlow = await listen('flow', (e) => this.#enqueue(e.payload));
       const unlistenHeld = await listen('intercept', (e) => this.#onHeld(e.payload));
       const unlistenWs = await listen('ws', (e) => this.#wsListeners.forEach((fn) => fn(e.payload)));
       const unlistenWsHeld = await listen('ws-intercept', (e) => this.#onWsHeld(e.payload));
+      // A Repeater socket ending (the server closed it, or the connection dropped).
+      const unlistenWsRep = await listen('ws-repeater', (e) => this.#onWsRepeater(e.payload));
       const unlistenMenu = await listen('menu', (e) => this.#onMenu(e.payload));
       const unlistenLog = await listen('log', (e) => this.#onLog(e.payload));
       const unlistenDl = await listen('browser-download', (e) => this.#onBrowserDownload(e.payload));
@@ -618,18 +734,22 @@ class Store {
       const unlistenOrg = await listen('organizer', (e) => this.#onOrganizerChanged(e.payload));
       const unlistenPassive = await listen('passive', (e) => this.#onPassiveChanged(e.payload));
       const unlistenSetting = await listen('setting', (e) => this.#onSettingChanged(e.payload));
+      // MCP's history_image: the card is drawn here because the renderer needs a canvas.
+      const unlistenRender = await listen('render-flow', (e) => this.#onRenderFlow(e.payload));
       this.logs = await api.getLogs().catch(() => []);
       unlisten = () =>
         (unlistenFlow(),
         unlistenHeld(),
         unlistenWs(),
         unlistenWsHeld(),
+        unlistenWsRep(),
         unlistenMenu(),
         unlistenLog(),
         unlistenDl(),
         unlistenOrg(),
         unlistenPassive(),
-        unlistenSetting());
+        unlistenSetting(),
+        unlistenRender());
 
       const held = await api.interceptStatus();
       this.intercept.enabled = held.enabled;
@@ -651,9 +771,11 @@ class Store {
         this.listeners = await api.listListeners().catch(() => []);
       }
 
-      // Passive-scan any not-yet-scanned flows in the background (trackable via
-      // the progress bar + sidebar badge). Only new flows are processed.
-      setTimeout(() => this.scanPassive(), 800);
+      // Passive scan does NOT start by itself. It reads the body of every captured
+      // flow, which on a real engagement is thousands of round trips to the backend
+      // and a regex pass over each one, and it decides what the sidebar badge claims.
+      // Work that size, over someone else's traffic, waits to be asked for: Passive
+      // has a Scan button on its empty state and in its toolbar.
 
       // Ask GitHub whether a newer release exists. Not awaited: the answer only drives
       // a dialog, and a slow or unreachable GitHub must not delay startup.
@@ -662,14 +784,38 @@ class Store {
     return () => unlisten?.();
   }
 
-  // Batch flow events into one update per animation frame.
+  // Batch flow events into one update at a time.
+  //
+  // This used to be one flush per animation frame, i.e. up to 60 a second under load, and
+  // each flush gives `flows` a NEW array identity. Every link below it then rebuilds:
+  // History's scope filter (4.8 ms on 39K), its text filter (6.6 ms when a query is
+  // typed), FlowTable's sort (0.8-1.2 ms) and, with Settings open, the sitemap. Svelte's
+  // memoization cannot help, because each link hands the next a fresh array. The table
+  // shows about forty rows, so tailing at 10 Hz is indistinguishable from 60 Hz and costs
+  // a sixth as much.
   #enqueue(flow) {
     this.#pending.push(flow);
-    if (this.#pending.length === 1) requestAnimationFrame(() => this.#flush());
+    if (this.#flushTimer != null) return;
+    // Leading edge: a flow that arrives after a quiet moment is shown at once, so sending
+    // one request in Repeater and watching History still feels immediate. Only a BURST is
+    // throttled, which is the case that was costing whole frames.
+    const since = Date.now() - this.#lastFlush;
+    this.#flushTimer = setTimeout(() => this.#flush(), since >= FLUSH_MS ? 0 : FLUSH_MS - since);
+  }
+
+  /** Captured flows batched but not shown yet (see `FLUSH_MS`). */
+  get pendingFlows() {
+    return this.#pending.length;
   }
 
   // A flow can arrive twice (preview while streaming, then final): replace by id.
   #flush() {
+    this.#flushTimer = null;
+    this.#lastFlush = Date.now();
+    // `#resetSessionState` empties `#pending` while a flush is still scheduled, so
+    // without this an empty flush still copied 39,662 entries and reassigned `flows`,
+    // restarting the whole derived chain over data that had not changed.
+    if (!this.#pending.length) return;
     const incoming = new Map(this.#pending.map((f) => [f.id, f]));
     this.#pending = [];
     // A re-arrived flow (streaming preview -> final body) may have new content,
@@ -937,7 +1083,7 @@ class Store {
     // whichever project is open when it finishes. Stopping it is the fix; the generation
     // check in startAttack is the backstop for a run that ends mid-switch.
     for (const t of this.intruder.tabs) t.running = false;
-    for (const t of [this.#repeaterTimer, this.#intruderTimer, this.#historyFilterTimer, this.#notesTimer, this.#vaultTimer, this.#autoSaveTimer, this.#searchTimer]) {
+    for (const t of [this.#repeaterTimer, this.#intruderTimer, this.#historyFilterTimer, this.#notesTimer, this.#vaultTimer, this.#autoSaveTimer, this.#searchTimer, this.#flushTimer]) {
       clearTimeout(t);
     }
     this.#repeaterTimer = null;
@@ -947,6 +1093,8 @@ class Store {
     this.#vaultTimer = null;
     this.#autoSaveTimer = null;
     this.#searchTimer = null;
+    // A flush scheduled for the project being closed must not fire into the next one.
+    this.#flushTimer = null;
   }
 
   async blankProject() {
@@ -958,7 +1106,7 @@ class Store {
     await this.#flushVault();
     // Bumped before the call, because the backend swaps the store inside it: anything
     // in flight must see the new generation from the moment the swap can happen.
-    this.#projectGen++;
+    const gen = ++this.#projectGen;
     this.project = await api.blankProject();
     await this.#resetSessionState();
     await this.#loadRepeater();
@@ -974,7 +1122,8 @@ class Store {
     this.selectedIds = new Set();
     this.bodyHits = null;
     this.sitemapNode = null;
-    this.flows = await api.listFlows();
+    this.historyScroll = { top: 0, follow: true, height: 0 };
+    await this.#loadFlows(gen);
     this.logs = await api.getLogs().catch(() => []);
     this.logsUnread = 0;
     await this.#syncListeners();
@@ -1005,9 +1154,12 @@ class Store {
     // A .ngintip is compressed; show the overlay while it's expanded and opened.
     this.decompressing = true;
     try {
-      // Let the overlay paint before the (blocking) backend work runs.
+      // Let the overlay paint first. Expanding the project file no longer blocks the main
+      // thread, but the swap that follows it still does: `release_project`, the store
+      // switch and `adopt` (which starts the project's extension workers) all run on the
+      // IPC thread, so the overlay has to be on screen before any of that starts.
       await new Promise((r) => setTimeout(r, 60));
-      this.#projectGen++;
+      const gen = ++this.#projectGen;
       this.project = await api.openProject(path);
       await this.#resetSessionState();
       this.#rememberProjectDir(path);
@@ -1024,7 +1176,8 @@ class Store {
       this.selectedIds = new Set();
       this.bodyHits = null;
       this.sitemapNode = null;
-      this.flows = await api.listFlows();
+      this.historyScroll = { top: 0, follow: true, height: 0 };
+      await this.#loadFlows(gen);
       this.logs = await api.getLogs().catch(() => []);
       this.logsUnread = 0;
       await this.#syncListeners();
@@ -1195,6 +1348,38 @@ class Store {
 
   async saveUpstream(url) {
     this.config.upstream = await api.setUpstream(url);
+  }
+
+  /**
+   * Seconds Ngintip waits for a response before it stops waiting; 0 = never stop.
+   *
+   * Unlike the LATE badge this is a real deadline, not a label: the request is
+   * actually dropped at that point and the row records that Ngintip is the one who
+   * stopped. That is what makes a status change here honest, and it is also why the
+   * default is off. A proxy with a deadline of its own can hide the slow endpoint an
+   * operator is trying to measure.
+   */
+  async setGiveUpAfter(seconds) {
+    const n = Math.max(0, Math.min(86400, Math.round(Number(seconds) || 0)));
+    // Saved before it is applied, and the two failures are reported separately.
+    //
+    // This used to await the live push first and do everything else after it. One
+    // rejected invoke then threw the lot away at once: the state, the saved setting,
+    // and the rejection itself, which nothing was catching. What the operator saw was
+    // a form holding a number that had never reached the proxy or the project, with no
+    // error anywhere to say so. Persisting first means the worst case is a value that
+    // applies on the next project load instead of one that disappears.
+    this.giveUpAfterSec = n;
+    try {
+      await api.setSetting(GIVE_UP_SETTING, { seconds: n });
+    } catch (e) {
+      this.#notify(`Could not save the response deadline: ${e}`, true);
+    }
+    try {
+      await api.setGiveUpAfter(n);
+    } catch (e) {
+      this.#notify(`Saved, but the proxy kept its previous deadline: ${e}`, true);
+    }
   }
 
   async setInvisible(enabled) {
@@ -1418,7 +1603,7 @@ class Store {
       // A failure partway leaves an unknown number deleted, so re-read rather than guess
       // which rows survived. Guessing is how History starts disagreeing with the file.
       this.#notify(`Delete failed: ${e}`, true);
-      this.flows = await api.listFlows().catch(() => this.flows);
+      await this.#loadFlows(gen).catch(() => false);
       return 0;
     }
     // Move selection to the next remaining row so keyboard deletion can continue.
@@ -1449,6 +1634,24 @@ class Store {
   }
 
   /**
+   * Replace History with the open project's flow list, dropping a list that arrives
+   * after the project moved underneath.
+   *
+   * Every project mints flow ids from 1 (`next_id` seeds from its own MAX(id)), so the
+   * id ranges of two engagements overlap almost exactly. A list fetched under project A
+   * and assigned after B was opened therefore looks perfectly valid: the rows are
+   * numbered like B's, and clicking one asks B for that id and gets a DIFFERENT request
+   * back. A note or a highlight saved from such a row lands on an unrelated flow. This
+   * is the same reason `clear` and `deleteFlows` already carry the generation.
+   */
+  async #loadFlows(gen = this.#projectGen) {
+    const flows = await api.listFlows();
+    if (gen !== this.#projectGen) return false;
+    this.flows = flows;
+    return true;
+  }
+
+  /**
    * Flow detail (get_flow), served from cache when possible so re-opening a
    * request is instant. Concurrent calls for the same id share one request, and
    * the result is cached (LRU, capped at DETAIL_CACHE_MAX).
@@ -1464,10 +1667,15 @@ class Store {
     }
     const inflight = this.#detailInflight.get(id);
     if (inflight) return inflight;
+    // `#detailCache.clear()` on a swap cannot cancel a request that is already in the
+    // air, and the id it was issued for exists in the next project too. Without this the
+    // reply would be cached under the new project and shown as its flow.
+    const gen = this.#projectGen;
     const p = api
       .getFlow(id)
       .then((d) => {
         this.#detailInflight.delete(id);
+        if (gen !== this.#projectGen) return null;
         if (d) this.#cacheDetail(id, d);
         return d;
       })
@@ -1493,6 +1701,27 @@ class Store {
   }
 
   /** Change how many opened-flow details stay cached in memory (persisted per machine). */
+  /**
+   * Seconds a request may be out before History badges it LATE. 0 turns the
+   * escalation off and the row stays WAIT however long it takes.
+   *
+   * Changing this never touches a stored row: it is read at render time, so it
+   * applies to flows already captured as well as new ones, and turning it off puts
+   * every row straight back to WAIT.
+   */
+  async setLateAfterSec(n) {
+    const v = Math.max(0, Math.min(86400, Math.round(Number(n) || 0)));
+    this.lateAfterSec = v;
+    // Said out loud if it fails. A setting that silently does not persist is worse
+    // than one that refuses: the form keeps showing the number, so there is nothing
+    // to notice until the value is quietly gone on the next project load.
+    try {
+      await api.setSetting(WAIT_LATE_SETTING, { seconds: v });
+    } catch (e) {
+      this.#notify(`Could not save the late threshold: ${e}`, true);
+    }
+  }
+
   setDetailCacheMax(n) {
     const v = Math.max(5, Math.round(Number(n) || DETAIL_CACHE_MAX));
     this.detailCacheMax = v;
@@ -1539,11 +1768,46 @@ class Store {
     this.selectedId = id;
   }
 
+  /** Whether any of `ids` is highlighted.
+   *
+   *  One pass over History against a Set, not a `.find` per id. The old shape was
+   *  O(selection x history), and since `.some` only short-circuits when it finds a
+   *  colour, the WORST case is the common one: nothing highlighted. On a select-all of
+   *  39,662 rows that is ~1.5 billion comparisons, measured at 2.2 s, spent purely to
+   *  decide whether one context-menu item is greyed out. */
+  hasColor(ids) {
+    if (ids.length === 1) return !!this.flows.find((f) => f.id === ids[0])?.color;
+    const want = new Set(ids);
+    return this.flows.some((f) => want.has(f.id) && f.color);
+  }
+
+  /** Highlight (or clear) every flow in `ids`.
+   *
+   *  One command, not one per flow. This used to be `Promise.all(ids.map(...))` with a
+   *  `this.flows.find()` inside the map, which on a select-all of 39,662 rows meant a
+   *  2.1 s lookup loop AND 39,662 commands in flight, each taking the store mutex on the
+   *  IPC thread. The notes are no longer read here at all: the backend leaves them
+   *  alone, so there is nothing to look up. */
   async setColorMany(ids, color) {
-    await Promise.all(ids.map((id) => api.setFlowMeta(id, this.flows.find((f) => f.id === id)?.note ?? '', color)));
-    const set = new Set(ids);
+    if (!ids.length) return;
+    // These ids only mean something in the project they were selected from.
+    const gen = this.#projectGen;
+    let done;
+    try {
+      done = await api.setFlowColors(ids, color);
+    } catch (e) {
+      this.#notify(`Could not save the highlight: ${e}`, true);
+      return;
+    }
+    if (gen !== this.#projectGen) return;
+    // The backend stops at a project switch and reports how far it got, in id order.
+    const applied = Number.isInteger(done) && done < ids.length ? ids.slice(0, done) : ids;
+    const set = new Set(applied);
     this.flows = this.flows.map((f) => (set.has(f.id) ? { ...f, color } : f));
-    this.#invalidateDetails(ids);
+    this.#invalidateDetails(set);
+    if (applied.length < ids.length) {
+      this.#notify(`Highlighted ${applied.length} of ${ids.length}; the project changed before the rest`, true);
+    }
   }
 
   async setFlowMeta(id, { note, color }) {
@@ -1672,9 +1936,14 @@ class Store {
     this.chooser = true;
   }
 
+  #noticeTimer = null;
   #notify(text, error = false) {
     this.notice = { text, error };
-    setTimeout(() => (this.notice = null), 3500);
+    // One timer, replaced each time. Each toast used to leave its own behind, so a
+    // toast shown shortly after another was taken off screen by the OLDER one's timer
+    // - sometimes a few hundred milliseconds after it appeared.
+    clearTimeout(this.#noticeTimer);
+    this.#noticeTimer = setTimeout(() => (this.notice = null), 3500);
   }
 
   /** Public transient toast (thin wrapper over the internal notifier). */
@@ -1761,6 +2030,33 @@ class Store {
     return (await api.flowHex(id, side)) ?? '';
   }
 
+  /**
+   * The flows a scan would read right now: never scanned, inside the passive resource
+   * scope, and (when "In scope only") on a host in the project Scope. One definition,
+   * so the button's count and the scan itself cannot disagree.
+   *
+   * Out-of-scope flows are left unscanned rather than marked done, so widening the
+   * scope later and scanning again picks them up.
+   */
+  #passiveTodo() {
+    return this.flows.filter(
+      (f) =>
+        !this.#passiveScanned.has(f.id) &&
+        flowInScope(f, this.passiveScope) &&
+        (!this.passiveInScopeOnly || inScope(this.scope, f.host)),
+    );
+  }
+
+  /** How many flows a Scan would read now (what the Scan button offers to do). */
+  get passivePending() {
+    return this.#passiveTodo().length;
+  }
+
+  /** How many flows this project has already scanned (findings or not). */
+  get passiveScannedCount() {
+    return this.#passiveScanned.size;
+  }
+
   #resetPassive() {
     this.#passiveScanned = new Set();
     this.passiveFindings = [];
@@ -1804,7 +2100,10 @@ class Store {
     this.passiveRules = Array.isArray(rules) ? rules : [];
     this.passiveDisabled = Array.isArray(disabled) ? disabled : [];
     this.passiveScope = Array.isArray(scope) ? scope : [...DEFAULT_PASSIVE_SCOPE];
-    this.passiveInScopeOnly = inScopeOnly === true;
+    // `!== false`, not `=== true`: a project saved before this was the default has no
+    // stored value, and should get the default rather than the old behaviour. Only an
+    // explicit "off" turns it off.
+    this.passiveInScopeOnly = inScopeOnly !== false;
     this.passiveCollapsed = Array.isArray(collapsed) ? collapsed : [];
     // Findings and which flows were scanned are historical: kept in the .ngintip.
     this.passiveFindings = Array.isArray(findings) ? findings : [];
@@ -1961,15 +2260,7 @@ class Store {
   async scanPassive({ rescan = false } = {}) {
     if (this.passive.scanning) return;
     if (rescan) this.#resetPassive();
-    // Out-of-scope flows are left unscanned (not marked done), so widening the
-    // scope later and scanning again picks them up. "In scope only" additionally
-    // restricts to hosts in the project Scope (empty scope matches everything).
-    const todo = this.flows.filter(
-      (f) =>
-        !this.#passiveScanned.has(f.id) &&
-        flowInScope(f, this.passiveScope) &&
-        (!this.passiveInScopeOnly || inScope(this.scope, f.host)),
-    );
+    const todo = this.#passiveTodo();
     if (!todo.length) {
       this.passive = { ...this.passive, scanning: false };
       return;
@@ -2039,11 +2330,36 @@ class Store {
    * an agent's findings were silently erased. `key` is `flowId|type|where|match`, so
    * re-finding the same thing is idempotent.
    */
+  // The key index `#mergeFindings` works from, and the array it was built from. Keeping
+  // them is what makes a merge cost the size of the batch instead of the size of the
+  // project: a scan merges every 16 flows, so on a project with 10.000 findings the old
+  // code built a 10.000-entry Map a few hundred times to fold in a handful of rows.
+  // Identity is the test for staleness, which is correct here because every other writer
+  // (delete, project switch, an MCP `passive_scan`) assigns a NEW array rather than
+  // mutating this one.
+  #findingKeys = null;
+  #findingKeysFrom = null;
+
   #mergeFindings(found) {
     if (!found.length) return;
-    const byKey = new Map(this.passiveFindings.map((f) => [f.key, f]));
-    for (const f of found) byKey.set(f.key, f);
-    this.passiveFindings = [...byKey.values()];
+    if (this.#findingKeysFrom !== this.passiveFindings || !this.#findingKeys) {
+      this.#findingKeys = new Map(this.passiveFindings.map((f, i) => [f.key, i]));
+      this.#findingKeysFrom = this.passiveFindings;
+    }
+    // A fresh array because `passiveFindings` is `$state.raw`: the pane redraws on the
+    // new reference, not on a mutation of the old one.
+    const next = this.passiveFindings.slice();
+    for (const f of found) {
+      const at = this.#findingKeys.get(f.key);
+      if (at === undefined) {
+        this.#findingKeys.set(f.key, next.length);
+        next.push(f);
+      } else {
+        next[at] = f;
+      }
+    }
+    this.passiveFindings = next;
+    this.#findingKeysFrom = next;
   }
 
   // A finding whose match History should highlight once the flow's detail loads.
@@ -2075,6 +2391,7 @@ class Store {
     const f = this.flows.find((x) => x.id === flowId);
     if (!f) return false;
     if (this.scopeOnly && this.scope.length && !inScope(this.scope, f.host)) return false;
+    if (this.historyKind !== 'all' && isWebSocket(f) !== (this.historyKind === 'ws')) return false;
     return true;
   }
 
@@ -2287,11 +2604,19 @@ class Store {
   }
 
   sendToRepeater(detail) {
-    const { scheme, host } = detail.summary;
+    const { scheme, host, status, path } = detail.summary;
     // Seed with the decoded request when an extension produced one, so you edit
     // readable plaintext in Repeater; encode_* re-encrypts it on send. Falls back
     // to the real (wire) request when there is no decoded view.
     const raw = detail.variants?.reqExtension || detail.requestRaw;
+    // A handshake is the one request that cannot be replayed: the 101 is spent the
+    // moment it is answered, and a tab holding one can only ever answer "unsupported
+    // scheme ws". Whatever asked for this - the menu, Cmd+R, a button elsewhere -
+    // means the socket at that address, so that is what opens.
+    if (status === 101 || isHandshakeRequest(raw)) {
+      this.addWsRepeaterTab({ name: host, url: socketAddress(scheme, host, path || requestPath(raw)) });
+      return;
+    }
     this.addRepeaterTab({ name: host, target: `${scheme}://${host}`, raw });
   }
 
@@ -2315,10 +2640,155 @@ class Store {
     this.view = 'repeater';
   }
 
+  // ---- Repeater sockets ----------------------------------------------------------
+  //
+  // A socket tab is the same Repeater, with frames instead of a request. Opening one
+  // records a flow (see src-tauri/src/wsrepeater.rs), so the frame list below is the
+  // ordinary WebSocket viewer pointed at that flow id, and everything else in the app
+  // sees the traffic without being told about any of this.
+
+  /** Open a socket tab for `url` ("Open socket in Repeater" on a 101 flow lands here). */
+  addWsRepeaterTab({ name = '', url = '' } = {}) {
+    const address = String(url || '').replace(/^http/, 'ws');
+    this.addRepeaterTab({
+      kind: 'ws',
+      name: name || address.replace(/^wss?:\/\//, '').split('/')[0] || 'socket',
+      target: address,
+      url: address,
+      raw: '',
+      payload: '',
+    });
+  }
+
+  /**
+   * Turn an HTTP tab holding a handshake into a socket tab on the same address.
+   *
+   * The raw request is dropped on purpose: a handshake is generated fresh by whoever
+   * opens the socket (a new key every time), so keeping the old one would only invite
+   * editing bytes that are about to be overwritten.
+   */
+  openTabAsSocket(tab) {
+    if (!tab || tab.kind === 'ws') return;
+    const base = String(tab.target || '').trim().replace(/\/+$/, '').replace(/^http/i, 'ws');
+    const url = `${base}${requestPath(tab.raw)}`;
+    Object.assign(tab, {
+      kind: 'ws',
+      url,
+      target: url,
+      raw: '',
+      response: null,
+      error: null,
+      payload: '',
+      frameKind: 'text',
+      connId: null,
+      flowId: null,
+      handshake: '',
+      wsState: 'idle',
+      closedBy: '',
+      closeCode: 1000,
+    });
+  }
+
+  /** The socket tab holding `connId`, if any. */
+  #wsTabOf(connId) {
+    return this.repeater.tabs.find((t) => t.kind === 'ws' && t.connId === connId) ?? null;
+  }
+
+  /**
+   * The backend saying a socket ended on its own: the server closed it, or the
+   * connection dropped.
+   *
+   * Without this the tab kept claiming "open" after the far end hung up, Send stayed
+   * enabled, and the only way to find out was an error from a frame that never left.
+   */
+  #onWsRepeater(ev) {
+    if (!ev || ev.state !== 'closed') return;
+    const tab = this.#wsTabOf(ev.connId);
+    if (!tab) return;
+    tab.connId = null;
+    tab.wsState = 'closed';
+    tab.closedBy = 'server';
+  }
+
+  /** Connect the tab's socket. Errors land on the tab, where the operator is looking. */
+  async connectWsTab(tab) {
+    if (!tab || tab.connId || tab.wsState === 'connecting') return false;
+    tab.sending = true;
+    tab.wsState = 'connecting';
+    tab.error = null;
+    tab.closedBy = '';
+    try {
+      const open = await api.wsRepeaterOpen(tab.url);
+      tab.connId = open.connId;
+      tab.flowId = open.flowId;
+      tab.handshake = open.handshake ?? '';
+      tab.wsState = 'open';
+      this.#notify(`Socket open (${open.status}) - frames are recorded as flow #${open.flowId}`);
+      return true;
+    } catch (e) {
+      tab.error = String(e?.message ?? e);
+      tab.wsState = tab.flowId ? 'closed' : 'idle';
+      return false;
+    } finally {
+      tab.sending = false;
+    }
+  }
+
+  /**
+   * Send the tab's payload as one frame. `binary` reads the payload as hex.
+   *
+   * An unconnected tab connects first: typing a frame and pressing Send is the whole
+   * gesture, and making that two gestures is how the panel felt broken.
+   */
+  async sendWsFrame(tab, kind = null) {
+    if (!tab) return;
+    if (!tab.connId && !(await this.connectWsTab(tab))) return;
+    const frame = kind ?? tab.frameKind ?? 'text';
+    tab.error = null;
+    try {
+      if (frame === 'binary') {
+        const hex = String(tab.payload || '').replace(/[^0-9a-f]/gi, '');
+        if (hex.length % 2) throw new Error('a binary frame needs an even number of hex digits');
+        const bytes = Uint8Array.from(hex.match(/../g) ?? [], (h) => parseInt(h, 16));
+        await api.wsRepeaterSend(tab.connId, 'binary', null, btoa(String.fromCharCode(...bytes)));
+      } else {
+        await api.wsRepeaterSend(tab.connId, frame, frame === 'text' ? (tab.payload ?? '') : '');
+      }
+    } catch (e) {
+      tab.error = String(e?.message ?? e);
+      // The socket is gone: say so on the tab rather than leaving a dead Send button.
+      if (/not open|closed/i.test(String(e))) {
+        tab.connId = null;
+        tab.wsState = 'closed';
+        tab.closedBy = 'server';
+      }
+    }
+  }
+
+  /** Close the tab's socket, with the tab's own close code unless one is given. */
+  async closeWsTab(tab, code = null, reason = '') {
+    if (!tab?.connId) return;
+    const id = tab.connId;
+    // Optimistic: the button must stop saying "open" the moment it is pressed, and the
+    // backend forgets the socket whether or not the close frame reaches anyone.
+    tab.connId = null;
+    tab.wsState = 'closed';
+    tab.closedBy = 'you';
+    try {
+      await api.wsRepeaterClose(id, Number(code ?? tab.closeCode ?? 1000) || 1000, reason);
+    } catch (e) {
+      tab.error = String(e?.message ?? e);
+    }
+  }
+
   closeRepeaterTab(id) {
     const rep = this.repeater;
     const i = rep.tabs.findIndex((t) => t.id === id);
     if (i === -1) return;
+    // Closing the tab closes its socket: nothing else in the app can reach that
+    // connection once the tab is gone, and it would otherwise keep recording frames
+    // into a flow nobody is watching.
+    if (rep.tabs[i].connId) api.wsRepeaterClose(rep.tabs[i].connId, 1000, 'tab closed').catch(() => {});
     // Tab ids get reused, so a closed tab's history must go with it.
     api.clearRepeaterHistory(id).catch(() => {});
     rep.tabs.splice(i, 1);
@@ -2327,7 +2797,10 @@ class Store {
   }
 
   duplicateRepeaterTab(tab) {
-    this.addRepeaterTab({ name: `${tab.name} copy`, group: tab.group, target: tab.target, raw: tab.raw });
+    // A socket tab copies its address and the frame being composed, never the
+    // connection: two tabs sharing one socket would record each other's frames.
+    const ws = tab.kind === 'ws' ? { kind: 'ws', url: tab.url, payload: tab.payload, frameKind: tab.frameKind } : {};
+    this.addRepeaterTab({ name: `${tab.name} copy`, group: tab.group, target: tab.target, raw: tab.raw, ...ws });
   }
 
   // ---- Intruder ----
@@ -2503,6 +2976,7 @@ class Store {
     if (!detail) return;
     const { scheme, host, path, status, color, note } = detail.summary;
     const v = detail.variants ?? {};
+    const messages = await this.#savedWsFrames(id, status);
     return this.saveRequestToCollection(
       {
         name: `${host}${path ?? ''}`,
@@ -2514,6 +2988,13 @@ class Store {
         responseOriginal: v.resOriginal ?? '',
         responseExtension: v.resExtension ?? '',
         status: status || null,
+        // A socket's content is everything after the handshake, so without this the
+        // saved record of a WebSocket is a 101 and nothing else.
+        ...(messages ? { messages } : {}),
+        // Kept with the record so it still answers "how slow, how big" after History
+        // is cleared or the flow is gone. Only when there was a response to measure.
+        durationMs: status ? detail.summary.durationMs : null,
+        length: status ? detail.summary.length : null,
         color,
         note,
         source: 'history',
@@ -2521,6 +3002,33 @@ class Store {
       collectionId,
     );
   }
+  /** A WebSocket flow's frames, shaped for an Organizer record, or null for anything
+   *  else. 101 is the marker: it is the only status a socket's handshake answers. */
+  async #savedWsFrames(flowId, status) {
+    if (Number(status) !== 101) return null;
+    const all = await api.wsMessages(flowId).catch(() => []);
+    if (!Array.isArray(all) || !all.length) return null;
+    const items = [];
+    let budget = WS_SAVE_BYTES;
+    for (const m of all.slice(0, WS_SAVE_FRAMES)) {
+      if (budget <= 0) break;
+      const whole = typeof m.text === 'string' ? m.text : '';
+      const text = whole.slice(0, Math.min(WS_SAVE_TEXT, budget));
+      budget -= text.length;
+      items.push({
+        id: m.id,
+        ts: m.ts,
+        direction: m.direction,
+        opcode: m.opcode,
+        // `length` stays the real payload size even when the text above was cut, so a
+        // saved frame never claims to be smaller than it was.
+        length: m.length,
+        text,
+      });
+    }
+    return { total: all.length, items };
+  }
+
   saveRepeaterToOrganizer(tab, collectionId) {
     return this.saveRequestToCollection(
       { ...repeaterSaveFields(tab), note: tab.note ?? '', source: 'repeater' },
@@ -2556,6 +3064,10 @@ class Store {
         requestOriginal: first.requestOriginal ?? '',
         response: first.response ?? '',
         responseExtension: first.responseExtension ?? '',
+        // The record's own request/response are the first row's, so its numbers are too.
+        // Every row keeps its own in `results`.
+        durationMs: first.error ? null : first.timeMs ?? null,
+        length: first.error ? null : first.length ?? null,
         results: rows,
         status: tab.results.find((r) => r.status)?.status ?? null,
         label: `${n} result${n === 1 ? '' : 's'}`,
@@ -2986,6 +3498,16 @@ class Store {
 
   // Per-tab so switching tabs mid-flight doesn't mix up responses.
   async sendRepeater(tab) {
+    // A socket tab has no request: whatever asked for a send (the shortcut, a menu)
+    // means the frame in the composer.
+    if (tab.kind === 'ws') return this.sendWsFrame(tab);
+    // ws:// is not an address the HTTP client can dial, and the error it returns
+    // ("unsupported scheme ws") names the symptom rather than the way out.
+    if (isSocketUrl(tab.target)) {
+      tab.response = null;
+      tab.error = 'ws:// and wss:// are sockets, not requests. Use "Open as socket" in the toolbar to open this address as one.';
+      return;
+    }
     if (tab.sending) return;
     tab.sending = true;
     tab.error = null;
@@ -3229,7 +3751,25 @@ class Store {
   }
 
   // Load all per-project view settings (columns, hide filter, passive rules).
+  /** The two patience settings, read back from the open project.
+   *
+   *  The badge threshold is the UI's alone, but the give-up deadline is the proxy's, so
+   *  it has to be pushed to the backend here: opening another project must not leave the
+   *  previous one's deadline running against this one's targets. */
+  async #loadWaitSettings() {
+    const seconds = (v, fallback) => (Number.isFinite(Number(v?.seconds)) ? Math.max(0, Math.round(Number(v.seconds))) : fallback);
+    this.lateAfterSec = seconds(await api.getSetting(WAIT_LATE_SETTING).catch(() => null), LATE_AFTER_SEC);
+    const giveUp = seconds(await api.getSetting(GIVE_UP_SETTING).catch(() => null), GIVE_UP_AFTER_SEC);
+    this.giveUpAfterSec = giveUp;
+    try {
+      await api.setGiveUpAfter(giveUp);
+    } catch (e) {
+      this.#notify(`The response deadline could not be applied to the proxy: ${e}`, true);
+    }
+  }
+
   async #loadProjectSettings() {
+    await this.#loadWaitSettings();
     await this.#loadHistoryColumns();
     await this.#loadHistorySort();
     await this.#loadHistoryHide();
@@ -3240,6 +3780,7 @@ class Store {
     await this.#loadCdp();
     await this.#loadProfiles();
     await this.#loadOrganizer();
+    await this.#loadOrganizerSort();
     await this.#loadVault();
     // Extensions are per-project: the backend loads the open project's set, so
     // refresh the UI list here too (runs on init, blankProject and switchProject).
@@ -3365,13 +3906,14 @@ class Store {
     };
     this.scopeOnly = saved?.scopeOnly === true;
     // Record what we loaded so the first autosave pass doesn't rewrite it.
-    this.#historyFilterSaved = JSON.stringify({ scopeOnly: this.scopeOnly, adv: this.adv });
+    this.historyKind = ['all', 'http', 'ws'].includes(saved?.kind) ? saved.kind : 'all';
+    this.#historyFilterSaved = JSON.stringify({ scopeOnly: this.scopeOnly, adv: this.adv, kind: this.historyKind });
   }
 
   /** Save the scope + advanced filter to the project, debounced. Reads state
    *  synchronously so an $effect in HistoryView tracks every field. */
   saveHistoryFilter() {
-    const json = JSON.stringify({ scopeOnly: this.scopeOnly, adv: this.adv });
+    const json = JSON.stringify({ scopeOnly: this.scopeOnly, adv: this.adv, kind: this.historyKind });
     if (json === this.#historyFilterSaved) return;
     clearTimeout(this.#historyFilterTimer);
     this.#historyFilterTimer = setTimeout(() => this.#flushHistoryFilter(), 400);
@@ -3380,7 +3922,7 @@ class Store {
   async #flushHistoryFilter() {
     clearTimeout(this.#historyFilterTimer);
     this.#historyFilterTimer = null;
-    const snapshot = { scopeOnly: this.scopeOnly, adv: this.adv };
+    const snapshot = { scopeOnly: this.scopeOnly, adv: this.adv, kind: this.historyKind };
     const json = JSON.stringify(snapshot);
     if (json === this.#historyFilterSaved) return;
     try {
@@ -3446,6 +3988,46 @@ class Store {
     api.setSetting(HISTORY_SORT_SETTING, this.historySort).catch(() => {});
   }
 
+  /** Draw the evidence card MCP asked for (see src-tauri/src/render.rs).
+   *
+   *  It runs here rather than in the backend because the renderer is a Canvas 2D one and
+   *  the window is the only place a canvas exists. The reply always goes back, success or
+   *  failure: a caller that gets nothing can only time out, and a timeout says "the
+   *  window is stuck" when the truth might be "that flow has no response yet". */
+  async #onRenderFlow(req) {
+    const reqId = Number(req?.reqId);
+    if (!reqId) return;
+    let data = null;
+    let error = null;
+    try {
+      const detail = await api.getFlow(req.flowId);
+      if (!detail) throw new Error(`no flow ${req.flowId}`);
+      data = renderPng(detail, req).data;
+    } catch (e) {
+      error = String(e?.message ?? e);
+    }
+    await api.renderResult(reqId, data, error).catch(() => {
+      // Nobody is waiting any more. The drawing was wasted; there is nothing to report.
+    });
+  }
+
+  async #loadOrganizerSort() {
+    const s = await api.getSetting(ORGANIZER_SORT_SETTING).catch(() => null);
+    // A key that is not a column any more (renamed or dropped) would sort by nothing
+    // and leave no header marked, so fall back to "#" rather than trusting it.
+    const known = s && SAVED_COLUMNS.some((c) => c.key === s.key);
+    this.organizerSort = known && (s.dir === 1 || s.dir === -1) ? { key: s.key, dir: s.dir } : { key: 'n', dir: 1 };
+  }
+
+  /** Sort the Organizer's saved-requests table by a column; clicking the active column
+   *  flips direction. Same contract as setHistorySort: kept across view switches and
+   *  persisted per project. */
+  setOrganizerSort(key) {
+    const cur = this.organizerSort;
+    this.organizerSort = cur.key === key ? { key, dir: -cur.dir } : { key, dir: 1 };
+    api.setSetting(ORGANIZER_SORT_SETTING, this.organizerSort).catch(() => {});
+  }
+
   async #loadHistoryHide() {
     const saved = await api.getSetting(HISTORY_HIDE_SETTING).catch(() => null);
     this.historyHide = saved && Array.isArray(saved.cats) ? { cats: saved.cats, ext: saved.ext ?? '', exclude: saved.exclude !== false } : emptyHide();
@@ -3502,13 +4084,14 @@ class Store {
 
   /** Any History filter that could hide rows is active. */
   get filtersActive() {
-    return !!(this.filter.trim() || this.scopeOnly || this.bodyHits || this.sitemapNode || advActive(this.adv));
+    return !!(this.filter.trim() || this.scopeOnly || this.historyKind !== 'all' || this.bodyHits || this.sitemapNode || advActive(this.adv));
   }
 
   /** Reset every History filter so all captured requests show again. */
   clearAllFilters() {
     this.filter = '';
     this.scopeOnly = false;
+    this.historyKind = 'all';
     this.bodyHits = null;
     this.sitemapNode = null;
     this.resetAdvanced();

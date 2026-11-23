@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Built-in browser - Ngintip docs</title>
+    <meta name="description" content="Launch a Chromium already wired to the proxy, with its own profile, downloaded if you do not have one." />
+    <meta name="theme-color" id="tc" content="#f5f6f9" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="Built-in browser - Ngintip docs" />
+    <meta property="og:description" content="Launch a Chromium already wired to the proxy, with its own profile, downloaded if you do not have one." />
+    <meta property="og:url" content="https://seclab-id.github.io/ngintip/browser.html" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="style.css" />
+    <script>
+      try {
+        var t = localStorage.getItem('ngintip.site.theme');
+        if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+      } catch (e) {}
+      try {
+        var dark =
+          document.documentElement.dataset.theme === 'dark' ||
+          (!document.documentElement.dataset.theme && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        if (dark) document.getElementById('tc').content = '#0d0f14';
+      } catch (e) {}
+    </script>
+  </head>
+  <body class="doc">
+    <div class="peek" aria-hidden="true">
+      <svg class="eye" viewBox="0 0 120 64" aria-hidden="true">
+        <path class="eye-shape" d="M5 32s19-25 55-25 55 25 55 25-19 25-55 25S5 32 5 32z" />
+        <circle class="eye-iris" cx="60" cy="32" r="12" />
+        <circle class="eye-spark" cx="64.5" cy="27.5" r="3.4" />
+      </svg>
+      <span class="lid top"></span>
+      <span class="lid bottom"></span>
+    </div>
+    <a class="skip" href="#main">Skip to content</a>
+
+    <header class="topbar">
+      <a class="brand" href="./" aria-label="Ngintip home">
+        <span class="badge" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" /><circle cx="12" cy="12" r="3" /></svg>
+        </span>
+        <span class="brand-name">Ngintip</span>
+      </a>
+      <nav aria-label="Sections">
+        <a href="./">Home</a>
+        <a href="https://github.com/seclab-id/ngintip/releases/latest">Download</a>
+        <a href="https://github.com/seclab-id/ngintip">GitHub</a>
+      </nav>
+      <button id="theme" class="icon-btn" type="button" aria-label="Switch theme" title="Switch theme">
+        <svg viewBox="0 0 24 24" aria-hidden="true" class="sun"><circle cx="12" cy="12" r="4.2" /><path d="M12 2.5v2M12 19.5v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M2.5 12h2M19.5 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4" /></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true" class="moon"><path d="M20 14.2A8 8 0 0 1 9.8 4 8.1 8.1 0 1 0 20 14.2z" /></svg>
+      </button>
+    </header>
+
+    <div class="doc-wrap">
+      <aside class="toc">
+        <nav aria-label="Documentation">
+          <p class="toc-title">Ngintip docs</p>
+          <a href="docs.html">Overview</a>
+          <a href="performance.html">Performance</a>
+          <p class="toc-title">Getting started</p>
+          <a href="install.html">Install</a>
+          <a href="start.html">First run and the CA</a>
+          <a href="browser.html" aria-current="page">Built-in browser</a>
+          <p class="toc-title">Capture</p>
+          <a href="history.html">History</a>
+          <a href="intercept.html">Intercept</a>
+          <p class="toc-title">Replay</p>
+          <a href="repeater.html">Repeater</a>
+          <a href="intruder.html">Intruder</a>
+          <a href="organizer.html">Organizer</a>
+          <p class="toc-title">Automation</p>
+          <a href="automation.html">Rules and Passive Scan</a>
+          <a href="extensions.html">Extensions</a>
+          <a href="mcp.html">MCP server</a>
+          <p class="toc-title">Reference</p>
+          <a href="tools.html">Decoder and Comparer</a>
+          <a href="projects.html">Projects and Footprint</a>
+          <a href="about.html">About</a>
+        </nav>
+      </aside>
+
+      <article class="prose" id="main">
+        <h1>Built-in browser</h1>
+        <p class="section-lead">
+  It uses the browser already on your computer. Nothing is bundled, and nothing is downloaded unless you have none.
+</p>
+
+<h2 id="launch">Open browser</h2>
+<p>
+  Setting a proxy by hand, trusting a CA, then remembering to undo both is the dull part of starting. Ngintip launches
+  a Chromium you already have with the proxy set and a profile of its own, so your everyday browser, its logins and
+  its extensions are left alone.
+</p>
+<p>
+  On first use it looks through the standard install locations for your platform and takes the first one that exists.
+  Chrome, Chromium, Edge and Brave all qualify: they are the same engine, and the proxy flags are identical.
+</p>
+
+<h2 id="where">Where it looks</h2>
+<table class="specs wide">
+  <thead><tr><th scope="col">Platform</th><th scope="col">Checked, in this order</th></tr></thead>
+  <tbody>
+    <tr>
+      <th scope="row">macOS</th>
+      <td>
+        <code>/Applications/Google Chrome.app</code>, the same under your home folder,
+        <code>/Applications/Chromium.app</code>, <code>Google Chrome for Testing.app</code>,
+        <code>Microsoft Edge.app</code>, <code>Brave Browser.app</code>
+      </td>
+    </tr>
+    <tr>
+      <th scope="row">Windows</th>
+      <td>
+        <code>%ProgramFiles%\Google\Chrome\Application\chrome.exe</code>, the same under
+        <code>%ProgramFiles(x86)%</code> and <code>%LOCALAPPDATA%</code>, then
+        <code>%ProgramFiles%\Microsoft\Edge\Application\msedge.exe</code> and its x86 twin
+      </td>
+    </tr>
+    <tr>
+      <th scope="row">Linux</th>
+      <td>
+        <code>/usr/bin/google-chrome</code>, <code>google-chrome-stable</code>, <code>chromium</code>,
+        <code>chromium-browser</code>, <code>/snap/bin/chromium</code>, <code>microsoft-edge</code>,
+        <code>brave-browser</code>
+      </td>
+    </tr>
+  </tbody>
+</table>
+<p>
+  Settings shows what it found, as a full path, so you always know which binary will start. If the list misses yours,
+  set the path yourself: that is the next section, and on a locked-down or unusual machine it is the part that
+  matters.
+</p>
+
+<h2 id="manual">Setting the path by hand</h2>
+<p>
+  Settings has a <strong>Browser path</strong> field. Put an absolute path to the executable in it and press Save.
+  There is an <strong>Extra flags</strong> field beside it for anything a target needs, for example
+  <code>--incognito</code> or <code>--lang=en</code>.
+</p>
+
+<h3>macOS</h3>
+<p>
+  You can give it either the bundle or the binary inside it. A path ending in <code>.app</code> is resolved to
+  <code>Contents/MacOS/&lt;name&gt;</code> for you, which is why dragging an app into the field works.
+</p>
+<pre class="code"><code>/Applications/Brave Browser.app
+/Applications/Brave Browser.app/Contents/MacOS/Brave Browser
+/Users/you/Applications/Chromium.app</code></pre>
+<p class="note">
+  Finding the binary of any installed app: right-click it in Finder, Show Package Contents, then
+  <code>Contents/MacOS</code>. The file with no extension is the one.
+</p>
+
+<h3>Windows</h3>
+<p>
+  Give the full path to the <code>.exe</code>. No quotes are needed even when the path has spaces, because the field
+  is a path and not a command line.
+</p>
+<pre class="code"><code>C:\Program Files\Google\Chrome\Application\chrome.exe
+C:\Users\you\AppData\Local\Chromium\Application\chrome.exe
+C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe</code></pre>
+<p class="note">
+  To find it: right-click the shortcut, Properties, and read the Target field. Or run
+  <code>where chrome</code> in a terminal.
+</p>
+
+<h3>Linux</h3>
+<p>Point it at the real executable, not a desktop entry.</p>
+<pre class="code"><code>/usr/bin/chromium
+/usr/bin/google-chrome-stable
+/snap/bin/chromium
+/opt/brave.com/brave/brave</code></pre>
+<p class="note">
+  <code>which chromium</code> or <code>readlink -f $(which google-chrome)</code> will tell you. A Flatpak browser is
+  not a plain binary: it runs through <code>flatpak run</code>, so point the field at a small wrapper script that
+  passes its arguments on, and mark the script executable.
+</p>
+
+<h2 id="download">If you have none</h2>
+<p>
+  Only then does it offer a download: Chrome for Testing, Google's plain .zip build made for automation. It is
+  unpacked with the system's own tool, <code>ditto</code>, <code>unzip</code> or <code>Expand-Archive</code>, so app
+  bundles, symlinks and executable bits survive. Builds exist for macOS on Apple Silicon and Intel, Linux x86-64 and
+  Windows x64.
+</p>
+
+<h2 id="profile">Profiles</h2>
+<p>
+  Every launched browser gets its own <code>--user-data-dir</code>, which keeps its cookies, history and extensions
+  away from your daily profile. There are two kinds, and the difference matters on a long engagement.
+</p>
+<table class="specs wide">
+  <thead><tr><th scope="col">Kind</th><th scope="col">Lives</th><th scope="col">Use it for</th></tr></thead>
+  <tbody>
+    <tr>
+      <th scope="row">Throwaway</th>
+      <td>A temporary directory, scoped to this app instance, swept when you quit.</td>
+      <td>The default. A clean browser every time, nothing left behind.</td>
+    </tr>
+    <tr>
+      <th scope="row">Saved with the project</th>
+      <td>
+        <code>ngintip_browser/&lt;project&gt;_default/</code>, next to your <code>.ngintip</code> file.
+      </td>
+      <td>Staying logged in between sessions, so day three does not start at the login page.</td>
+    </tr>
+  </tbody>
+</table>
+<p>
+  The switch is in Settings: <em>Save browser profile (cookies and history) with this project</em>. Because the
+  directory sits next to the project file, moving the project moves the session with it.
+</p>
+
+<h3>Several browsers at once</h3>
+<p>
+  Turn on <em>Multiple profiles</em> and you can name as many as you need, then spawn each one separately. Each gets
+  its own directory, <code>&lt;project&gt;_&lt;name&gt;</code>, so they share nothing: separate cookies, separate
+  storage, separate sessions.
+</p>
+<p>
+  That is the setup for the test nobody enjoys doing by hand: admin in one window, a normal user in the second,
+  an unauthenticated visitor in the third, all three recorded into the same capture at the same time. Take the admin's
+  request, replay it as the user, and the two sessions never contaminate each other because they were never in the
+  same profile.
+</p>
+<p class="note">
+  Chrome locks a profile directory, so two browsers cannot share one. That is why each profile is its own directory,
+  and why a throwaway profile is scoped to the running instance: two copies of Ngintip never sweep each other's
+  browsers.
+</p>
+
+<h3>Remote debugging</h3>
+<p>
+  A profile can also expose the Chrome DevTools Protocol, bound to <code>127.0.0.1</code> on a port you choose. It is
+  opt-in per project and off otherwise, for when you want to drive the browser from a script while its traffic is
+  being recorded.
+</p>
+<p>
+  Closing Ngintip closes the browsers it started, including their helper processes, rather than leaving one running
+  with a proxy set.
+</p>
+<p class="callout">
+  Certificate errors are ignored inside that profile, which is what lets you read HTTPS without installing the CA
+  first. It is the same flag browser automation uses, and it applies only to the throwaway profile Ngintip launched,
+  never to your own browser.
+</p>
+        <nav class="pager" aria-label="Page">
+          <a class="prev" href="start.html"><span>Previous</span>First run and the CA</a>
+          <a class="next" href="history.html"><span>Next</span>History</a>
+        </nav>
+      </article>
+    </div>
+
+    <footer>
+      <div class="foot-row">
+        <a class="brand small" href="./">
+          <span class="badge" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" /><circle cx="12" cy="12" r="3" /></svg>
+          </span>
+          <span class="brand-name">Ngintip</span>
+        </a>
+        <nav aria-label="Links">
+          <a href="docs.html">Docs</a>
+          <a href="https://github.com/seclab-id/ngintip">Repository</a>
+          <a href="https://github.com/seclab-id/ngintip/releases">Releases</a>
+          <a href="https://github.com/seclab-id/ngintip/issues">Issues</a>
+        </nav>
+      </div>
+    </footer>
+
+    <script src="app.js" defer></script>
+  </body>
+</html>

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { advActive, BASIC_EXCLUDE_FILTERS, emptyAdvanced, matchAdvanced, newFilter, statusKey, urlExtension } from './histfilter.js';
+import { advActive, BASIC_EXCLUDE_FILTERS, emptyAdvanced, filterKind, isWebSocket, matchAdvanced, newFilter, statusKey, urlExtension } from './histfilter.js';
 
 const flow = (o) => ({ method: 'GET', status: 200, host: 'api.example.com', path: '/v1/users?id=1', mime: 'application/json', reqLength: 0, length: 42, durationMs: 12, ...o });
 
@@ -176,5 +176,30 @@ describe('histfilter', () => {
     const a = { ...emptyAdvanced(), methods: ['GET'], status: ['2'], mime: 'json' };
     expect(matchAdvanced(flow(), a)).toBe(true);
     expect(matchAdvanced(flow({ status: 404 }), a)).toBe(false);
+  });
+});
+
+describe('the HTTP / WebSocket switch', () => {
+  const http = [{ id: 1, status: 200 }, { id: 2, status: 404 }, { id: 3, status: 0 }];
+  const ws = { id: 4, status: 101 };
+  const all = [...http, ws];
+
+  it('calls a flow a socket when, and only when, it answered 101', () => {
+    // 101 is the whole handshake: a WebSocket is opened by an ordinary GET and the
+    // answer is Switching Protocols. Nothing else in HTTP answers 101, and the path
+    // proves nothing (an app can serve /socket over plain HTTP).
+    expect(isWebSocket(ws)).toBe(true);
+    expect(isWebSocket({ status: '101' })).toBe(true);
+    expect(http.some(isWebSocket)).toBe(false);
+    expect(isWebSocket({ path: '/ws/chat', status: 200 })).toBe(false);
+    expect(isWebSocket(undefined)).toBe(false);
+  });
+
+  it('splits the capture in two, and leaves it alone for "all"', () => {
+    expect(filterKind(all, 'ws')).toEqual([ws]);
+    expect(filterKind(all, 'http')).toEqual(http);
+    expect(filterKind(all, 'all')).toBe(all);
+    // An unknown value must not silently empty the table.
+    expect(filterKind(all, 'nonsense')).toBe(all);
   });
 });

@@ -1,0 +1,1282 @@
+/* Ngintip site - the app's own tokens (src/app.css), nothing else.
+   Dark is the default; light follows the system unless the visitor picks one. */
+
+:root {
+  /* Light is the base so a machine that states no preference gets the lighter page;
+     dark arrives from the system, or from the switch in the header. */
+  --bg: #f5f6f9;
+  --bg-elev: #ffffff;
+  --border: #e1e4ec;
+  --text: #1b1f2a;
+  --dim: #5a6273;
+  --faint: #848c9c;
+  --accent: #5b4bff;
+  --accent-strong: #4a39f0;
+  --accent-soft: rgb(91 75 255 / 0.1);
+  --logo-from: #8b7bff;
+  --logo-to: #4f46e5;
+  --shadow: 0 10px 30px rgb(27 31 42 / 0.08);
+  --radius: 14px;
+  --gutter: 16px;
+  --max: 1060px;
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  /* The dictionary block is set in the system serif: a second voice, nothing to download. */
+  --serif: Iowan Old Style, Palatino, Georgia, 'Times New Roman', serif;
+  /* Syntax tokens: one hue each, readable on the elevated surface in both themes. */
+  --code-key: #8250df;
+  --code-str: #0a7b55;
+  --code-num: #b2531a;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --bg: #0d0f14;
+    --bg-elev: #13161d;
+    --border: #232836;
+    --text: #e4e7ef;
+    --dim: #9aa3b8;
+    --faint: #6b7489;
+    --accent: #8b7bff;
+    --accent-strong: #6f5cff;
+    --accent-soft: rgb(139 123 255 / 0.14);
+    --shadow: 0 10px 30px rgb(0 0 0 / 0.35);
+    --code-key: #c3a0ff;
+    --code-str: #6fd3a4;
+    --code-num: #f0a26a;
+  }
+}
+
+:root[data-theme='dark'] {
+  --bg: #0d0f14;
+  --bg-elev: #13161d;
+  --border: #232836;
+  --text: #e4e7ef;
+  --dim: #9aa3b8;
+  --faint: #6b7489;
+  --accent: #8b7bff;
+  --accent-strong: #6f5cff;
+  --accent-soft: rgb(139 123 255 / 0.14);
+  --shadow: 0 10px 30px rgb(0 0 0 / 0.35);
+    --code-key: #c3a0ff;
+    --code-str: #6fd3a4;
+    --code-num: #f0a26a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.65 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  /* A single soft wash behind the hero, painted by the background instead of an image. */
+  background-image: radial-gradient(70rem 32rem at 50% -14rem, var(--accent-soft), transparent 70%);
+  background-repeat: no-repeat;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  * {
+    transition: none !important;
+  }
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+code {
+  font: 0.9em var(--mono);
+  padding: 0.12em 0.4em;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elev);
+  white-space: nowrap;
+}
+
+.skip {
+  position: absolute;
+  left: -9999px;
+}
+.skip:focus {
+  left: var(--gutter);
+  top: 10px;
+  z-index: 10;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+}
+
+/* ---- the peek: an eye opens, then the lids do ----
+   The whole intro is one 1550 ms timeline shared by four elements, so it reads as a
+   single gesture: an eye opens in the dark, glances left and right, closes, and the
+   eyelids it was drawn on part to a slit, hold there for a beat, then lift.
+
+   CSS only. Nothing is hidden when a script does not run, the overlay never takes a
+   click, reduced motion skips all of it, and every page after the first in a session
+   gets the short open with no eye and no pause. */
+.peek {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  pointer-events: none;
+  animation: peek-end 1550ms steps(1, end) forwards;
+}
+.lid {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 50vh;
+  background: var(--bg);
+}
+.lid.top {
+  top: 0;
+  box-shadow: 0 10px 24px -12px rgb(0 0 0 / 0.5);
+  animation: lid-top 1550ms cubic-bezier(0.66, 0, 0.26, 1) forwards;
+}
+.lid.bottom {
+  bottom: 0;
+  box-shadow: 0 -10px 24px -12px rgb(0 0 0 / 0.5);
+  animation: lid-bottom 1550ms cubic-bezier(0.66, 0, 0.26, 1) forwards;
+}
+/* The lit edge of the slit: what you see through before the eye opens. */
+.lid::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  width: min(220px, 40vw);
+  height: 1px;
+  translate: -50% 0;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  opacity: 0;
+  animation: slit 1550ms ease-out forwards;
+}
+.lid.top::after {
+  bottom: 0;
+}
+.lid.bottom::after {
+  top: 0;
+}
+
+/* The eye is painted on top of the closed lids and is gone before they part. */
+.eye {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 1;
+  width: clamp(150px, 26vw, 240px);
+  translate: -50% -50%;
+  overflow: visible;
+}
+.eye-shape {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transform-origin: 60px 32px;
+  animation: eye-open 1550ms cubic-bezier(0.33, 0, 0.2, 1) forwards;
+}
+.eye-iris {
+  fill: var(--accent);
+  transform-origin: 60px 32px;
+  animation: eye-iris 1550ms cubic-bezier(0.4, 0, 0.3, 1) forwards;
+}
+.eye-spark {
+  fill: var(--bg);
+  animation: eye-iris 1550ms cubic-bezier(0.4, 0, 0.3, 1) forwards;
+}
+
+@keyframes eye-open {
+  0% {
+    opacity: 0;
+    transform: scaleY(0.04);
+  }
+  7% {
+    opacity: 1;
+    transform: scaleY(0.04);
+  }
+  /* the lid lifts off the eye */
+  28% {
+    transform: scaleY(1);
+  }
+  52% {
+    opacity: 1;
+    transform: scaleY(1);
+  }
+  /* and shuts again, which is what hands the moment over to the lids */
+  60% {
+    opacity: 1;
+    transform: scaleY(0.04);
+  }
+  64%,
+  100% {
+    opacity: 0;
+    transform: scaleY(0.04);
+  }
+}
+@keyframes eye-iris {
+  0%,
+  22% {
+    opacity: 0;
+    transform: translateX(0) scale(0.6);
+  }
+  32% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+  /* the glance: left, right, back - this is the part that looks alive */
+  40% {
+    transform: translateX(-13px) scale(1);
+  }
+  48% {
+    transform: translateX(13px) scale(1);
+  }
+  54% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+  60%,
+  100% {
+    opacity: 0;
+    transform: translateX(0) scale(1);
+  }
+}
+@keyframes lid-top {
+  0%,
+  62% {
+    transform: translateY(0);
+  }
+  73%,
+  80% {
+    transform: translateY(-15px);
+  }
+  100% {
+    transform: translateY(-51vh);
+  }
+}
+@keyframes lid-bottom {
+  0%,
+  62% {
+    transform: translateY(0);
+  }
+  73%,
+  80% {
+    transform: translateY(15px);
+  }
+  100% {
+    transform: translateY(51vh);
+  }
+}
+@keyframes slit {
+  0%,
+  64% {
+    opacity: 0;
+  }
+  74%,
+  80% {
+    opacity: 0.9;
+  }
+  92%,
+  100% {
+    opacity: 0;
+  }
+}
+@keyframes peek-end {
+  to {
+    visibility: hidden;
+  }
+}
+
+/* What the lids reveal, arriving a beat behind them. */
+.hero,
+.doc-wrap {
+  animation: rise 620ms cubic-bezier(0.22, 0.61, 0.36, 1) 1180ms both;
+}
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .peek {
+    display: none;
+  }
+  .btn.primary::after,
+  .chart .fill,
+  .seg {
+    animation: none;
+  }
+  .hero,
+  .doc-wrap {
+    animation: none;
+  }
+}
+
+/* ---- top bar ---- */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  max-width: var(--max);
+  margin: 0 auto;
+  padding: 14px var(--gutter);
+  backdrop-filter: blur(10px);
+}
+.topbar nav {
+  display: flex;
+  gap: 20px;
+  margin-left: auto;
+  font-size: 14.5px;
+}
+.topbar nav a {
+  color: var(--dim);
+}
+.topbar nav a:hover {
+  color: var(--text);
+  text-decoration: none;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text);
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+.brand:hover {
+  text-decoration: none;
+}
+.brand-name {
+  letter-spacing: -0.015em;
+}
+.badge {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  background: linear-gradient(135deg, var(--logo-from), var(--logo-to));
+  box-shadow: 0 4px 14px rgb(99 88 255 / 0.35);
+}
+.badge svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: #fff;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.brand.small .badge {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+}
+.brand.small .badge svg {
+  width: 15px;
+  height: 15px;
+}
+
+.icon-btn {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-elev);
+  color: var(--dim);
+  cursor: pointer;
+}
+.icon-btn:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+.icon-btn svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+}
+.icon-btn .moon {
+  display: none;
+}
+:root[data-theme='light'] .icon-btn .sun,
+:root[data-theme='dark'] .icon-btn .moon {
+  display: none;
+}
+:root[data-theme='light'] .icon-btn .moon,
+:root[data-theme='dark'] .icon-btn .sun {
+  display: block;
+}
+
+/* ---- the home page is one screen ----
+   A landing page that scrolls to nothing is just a tall page. This one is exactly the
+   viewport: header, the entry centred in what is left, footer. Below 560px of height
+   (a phone in landscape, a short window) it goes back to scrolling, because clipping
+   the definition would be worse than a scrollbar. */
+body.home {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  overflow: hidden;
+}
+body.home main {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  min-height: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+body.home .topbar {
+  max-width: none;
+  padding-left: 28px;
+  padding-right: 28px;
+}
+body.home .hero {
+  width: 100%;
+  padding: 0;
+}
+body.home footer {
+  padding-top: 20px;
+  padding-bottom: 22px;
+  border-top: 0;
+}
+body.home .fine {
+  margin-top: 14px;
+}
+
+@media (max-height: 560px) {
+  body.home {
+    height: auto;
+    overflow: visible;
+  }
+  body.home main {
+    padding: 24px 0 8px;
+  }
+}
+
+/* ---- sections ---- */
+main {
+  max-width: var(--max);
+  margin: 0 auto;
+  padding: 0 var(--gutter);
+}
+
+section {
+  padding: 72px 0;
+}
+section + section {
+  border-top: 1px solid var(--border);
+}
+
+h1,
+h2,
+h3 {
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  margin: 0 0 14px;
+}
+h1.word {
+  font-size: clamp(42px, 9vw, 78px);
+  font-weight: 680;
+  letter-spacing: -0.035em;
+  margin: 0 0 22px;
+}
+h2 {
+  font-size: clamp(24px, 4vw, 32px);
+}
+h3 {
+  font-size: 17px;
+  letter-spacing: -0.01em;
+}
+
+.hero {
+  padding: 56px 0 72px;
+}
+.lead {
+  max-width: 62ch;
+  margin: 0;
+  color: var(--dim);
+  font-size: clamp(16px, 2.2vw, 18.5px);
+}
+.section-lead {
+  max-width: 62ch;
+  margin: 0 0 32px;
+  color: var(--dim);
+}
+
+.cta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 34px;
+}
+.btn {
+  display: inline-flex;
+  align-items: center;
+  height: 44px;
+  padding: 0 22px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--bg-elev);
+  color: var(--text);
+  font-weight: 560;
+  font-size: 15px;
+}
+.btn:hover {
+  border-color: var(--accent);
+  text-decoration: none;
+}
+.btn.primary {
+  border-color: transparent;
+  background: var(--accent);
+  color: #fff;
+  box-shadow: var(--shadow);
+}
+.btn.primary:hover {
+  background: var(--accent-strong);
+}
+
+.note {
+  color: var(--faint) !important;
+  font-size: 13.5px !important;
+}
+
+.code {
+  margin: 0 0 12px;
+  padding: 16px 18px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+  font: 13.5px/1.8 var(--mono);
+}
+.code code {
+  padding: 0;
+  border: 0;
+  background: none;
+  white-space: pre;
+}
+.code .c {
+  color: var(--faint);
+}
+
+/* ---- dictionary entry ---- */
+.entry {
+  max-width: 60ch;
+  margin: 0 0 34px;
+  padding: 0 0 0 20px;
+  border-left: 2px solid var(--accent);
+  font-family: var(--serif);
+}
+.headword {
+  margin: 0 0 10px;
+  font-size: 21px;
+  letter-spacing: 0.01em;
+}
+.pos {
+  margin-left: 6px;
+  color: var(--accent);
+  font-style: italic;
+}
+.variant {
+  margin-left: 10px;
+  color: var(--faint);
+  font: 13.5px var(--sans);
+}
+.senses {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--text);
+  font-size: 16.5px;
+}
+.senses li {
+  margin-bottom: 10px;
+}
+/* The primary sense is the one that explains the name; the figurative one supports it. */
+.senses strong {
+  font-weight: 650;
+}
+.senses li:last-child {
+  color: var(--dim);
+}
+.senses li::marker {
+  color: var(--faint);
+}
+.gloss {
+  display: block;
+  margin-top: 2px;
+  color: var(--dim);
+  font: 13.5px/1.55 var(--sans);
+}
+.tag {
+  margin-right: 4px;
+  color: var(--accent);
+  font-style: italic;
+}
+.cite {
+  margin: 14px 0 0;
+  color: var(--faint);
+  font: 12.5px var(--sans);
+}
+.cite b {
+  font-weight: 600;
+  color: var(--dim);
+}
+
+/* ---- spec table ---- */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+.specs {
+  width: 100%;
+  margin: 0 0 40px;
+  border-collapse: collapse;
+  font-size: 14.5px;
+}
+.specs th,
+.specs td {
+  padding: 12px 14px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.specs thead th {
+  color: var(--faint);
+  font: 600 11.5px/1 var(--sans);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  border-bottom-color: var(--border);
+}
+.specs tbody th {
+  font-weight: 560;
+}
+.specs td:last-child {
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+.specs tbody tr:hover {
+  background: var(--accent-soft);
+}
+.specs .why {
+  display: block;
+  color: var(--faint);
+  font: 12px var(--sans);
+}
+
+/* ---- reasons ---- */
+.reasons {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+  gap: 26px;
+  margin: 0;
+}
+.reasons dt {
+  margin-bottom: 8px;
+  font-weight: 620;
+  letter-spacing: -0.01em;
+}
+.reasons dd {
+  margin: 0;
+  color: var(--dim);
+  font-size: 14.5px;
+}
+
+/* ---- docs page ---- */
+.doc-wrap {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 48px;
+  max-width: var(--max);
+  margin: 0 auto;
+  padding: 24px var(--gutter) 40px;
+}
+.toc {
+  position: sticky;
+  top: 72px;
+  align-self: start;
+  max-height: calc(100vh - 96px);
+  overflow-y: auto;
+}
+.toc nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 14px;
+}
+.toc a {
+  padding: 4px 10px;
+  border-left: 2px solid var(--border);
+  color: var(--dim);
+}
+.toc a:hover {
+  border-left-color: var(--accent);
+  color: var(--text);
+  text-decoration: none;
+}
+.toc-title {
+  margin: 20px 0 6px;
+  color: var(--faint);
+  font: 600 11px/1 var(--sans);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.toc-title:first-child {
+  margin-top: 0;
+}
+
+.prose {
+  max-width: 72ch;
+  padding-bottom: 24px;
+}
+.prose h1 {
+  font-size: clamp(30px, 5vw, 40px);
+  margin-bottom: 10px;
+}
+.prose h2 {
+  margin: 52px 0 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  /* clear the sticky header when an anchor is jumped to */
+  scroll-margin-top: 74px;
+}
+.prose h3 {
+  margin: 28px 0 10px;
+  scroll-margin-top: 74px;
+}
+.prose p {
+  margin: 0 0 14px;
+  color: var(--dim);
+}
+.prose p strong,
+.prose li strong {
+  color: var(--text);
+  font-weight: 600;
+}
+.prose ul {
+  margin: 0 0 16px;
+  padding-left: 20px;
+  color: var(--dim);
+}
+.prose li {
+  margin-bottom: 7px;
+}
+.prose li::marker {
+  color: var(--faint);
+}
+.prose sup {
+  font-size: 0.7em;
+}
+.callout {
+  margin: 0 0 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  background: var(--bg-elev);
+  font-size: 14.5px;
+}
+.specs.wide th[scope='row'] {
+  width: 12.5rem;
+  font: 13px/1.7 var(--mono);
+  font-weight: 500;
+}
+.specs.wide td {
+  font-family: var(--sans);
+  white-space: normal;
+}
+
+/* Docs pages get the same gesture, trimmed: no eye, no pause, 600 ms. The intro is a
+   greeting, and you only greet someone once per visit, not on every page of a manual. */
+body.doc .eye {
+  display: none;
+}
+body.doc .peek,
+body.doc .lid,
+body.doc .lid::after {
+  animation-duration: 600ms;
+}
+body.doc .lid.top {
+  animation-name: lid-top-quick;
+}
+body.doc .lid.bottom {
+  animation-name: lid-bottom-quick;
+}
+body.doc .doc-wrap {
+  animation-delay: 150ms;
+}
+@keyframes lid-top-quick {
+  from {
+    transform: translateY(-15px);
+  }
+  to {
+    transform: translateY(-51vh);
+  }
+}
+@keyframes lid-bottom-quick {
+  from {
+    transform: translateY(15px);
+  }
+  to {
+    transform: translateY(51vh);
+  }
+}
+
+/* A manual is read, not admired: the sidebar sits in the corner and the text gets the
+   room the centred 1060px column was giving away on both sides. */
+body.doc .topbar,
+body.doc .doc-wrap,
+body.doc footer {
+  max-width: none;
+}
+body.doc .doc-wrap {
+  grid-template-columns: 228px minmax(0, 1fr);
+  gap: 44px;
+  padding-left: 22px;
+  /* A fifth of the width stays empty on the right: the text reaches far enough to fill
+     the page, and stops far enough from the edge to still look like a page. Capped so a
+     very wide monitor does not turn it into a margin of its own. */
+  padding-right: min(20%, 460px);
+}
+body.doc .topbar,
+body.doc footer {
+  padding-left: 22px;
+  padding-right: 22px;
+}
+body.doc .prose {
+  /* Everything uses the column: paragraphs run to its edge instead of stopping short
+     and looking cramped beside full-width tables. */
+  max-width: none;
+}
+body.doc .prose p,
+body.doc .prose ul,
+body.doc .section-lead {
+  max-width: none;
+}
+/* The sidebar scrolls on a short window; make that scrollbar quiet. */
+.toc {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.toc::-webkit-scrollbar {
+  width: 6px;
+}
+.toc::-webkit-scrollbar-thumb {
+  border-radius: 3px;
+  background: var(--border);
+}
+
+/* ---- docs: cards, figures, pager ---- */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+  margin: 0 0 14px;
+}
+a.card {
+  display: block;
+  padding: 18px 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+  color: var(--text);
+}
+a.card:hover {
+  border-color: var(--accent);
+  text-decoration: none;
+}
+a.card h3 {
+  margin: 0 0 6px;
+  font-size: 15.5px;
+}
+a.card p {
+  margin: 0;
+  color: var(--dim);
+  font-size: 14px;
+}
+
+/* A screenshot: full width of the prose column, framed like the app's own surfaces. */
+.shot {
+  margin: 0 0 18px;
+}
+.shot img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+}
+.shot figcaption {
+  margin-top: 10px;
+  color: var(--faint);
+  font-size: 13px;
+}
+
+.toc a[aria-current='page'] {
+  border-left-color: var(--accent);
+  color: var(--text);
+  font-weight: 560;
+}
+
+.pager {
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  margin-top: 44px;
+  padding-top: 22px;
+  border-top: 1px solid var(--border);
+}
+.pager a {
+  max-width: 48%;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 14.5px;
+}
+.pager a:hover {
+  border-color: var(--accent);
+  text-decoration: none;
+}
+.pager a span {
+  display: block;
+  color: var(--faint);
+  font-size: 12px;
+}
+.pager .prev {
+  margin-right: auto;
+}
+.pager .next {
+  margin-left: auto;
+  text-align: right;
+}
+.prose .btn {
+  margin-bottom: 6px;
+}
+
+/* ---- code: colours, and a way to take it ---- */
+.code {
+  position: relative;
+}
+.code .k {
+  color: var(--code-key);
+}
+.code .s {
+  color: var(--code-str);
+}
+.code .n {
+  color: var(--code-num);
+}
+.copy {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--dim);
+  font: 11.5px var(--sans);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.code:hover .copy,
+.copy:focus-visible {
+  opacity: 1;
+}
+.copy:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.copy.done {
+  border-color: var(--code-str);
+  color: var(--code-str);
+  opacity: 1;
+}
+/* On a touch screen there is no hover, so the button is always there. */
+@media (hover: none) {
+  .copy {
+    opacity: 1;
+  }
+}
+
+/* ---- performance charts ----
+   Bars drawn with two elements and a width percentage. No chart library: a number this
+   simple does not need 90 KB of JavaScript to be read. */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  margin: 0 0 32px;
+}
+.stat {
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+}
+.stat strong {
+  display: block;
+  font: 650 26px/1.15 var(--sans);
+  letter-spacing: -0.03em;
+}
+.stat span {
+  color: var(--faint);
+  font-size: 12.5px;
+}
+
+.chart {
+  margin: 0 0 22px;
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+}
+.chart .row {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr) 84px;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+  font-size: 13.5px;
+}
+.chart .label {
+  color: var(--dim);
+}
+.chart .value {
+  font-family: var(--mono);
+  text-align: right;
+}
+.chart .track {
+  height: 20px;
+  border-radius: 6px;
+  background: var(--accent-soft);
+}
+.chart .fill {
+  display: block;
+  height: 100%;
+  border-radius: 6px;
+  background: var(--border);
+  animation: grow 900ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+.chart .fill.accent {
+  background: linear-gradient(90deg, var(--logo-from), var(--logo-to));
+}
+.chart-note {
+  margin: 4px 0 0;
+  color: var(--faint);
+  font-size: 13px;
+}
+
+/* The stacked share bar, with its segments labelled inside when they fit. */
+.stack {
+  display: flex;
+  height: 34px;
+  overflow: hidden;
+  border-radius: 8px;
+}
+.seg {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  color: #fff;
+  font: 600 12px var(--mono);
+  animation: grow 900ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+.seg.a {
+  background: linear-gradient(90deg, var(--logo-from), var(--logo-to));
+}
+.seg.b {
+  background: var(--accent-strong);
+  opacity: 0.55;
+}
+.seg.c {
+  background: var(--faint);
+}
+.legend {
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 13.5px;
+  color: var(--dim);
+}
+.legend li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.legend b {
+  margin-left: auto;
+  color: var(--text);
+  font-family: var(--mono);
+  font-weight: 500;
+}
+.key {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.key.a {
+  background: var(--logo-to);
+}
+.key.b {
+  background: var(--accent-strong);
+  opacity: 0.55;
+}
+.key.c {
+  background: var(--faint);
+}
+@keyframes grow {
+  from {
+    transform: scaleX(0);
+    transform-origin: left;
+  }
+  to {
+    transform: scaleX(1);
+    transform-origin: left;
+  }
+}
+
+/* ---- the download button asks for the click ---- */
+.btn.primary {
+  position: relative;
+  overflow: hidden;
+  transition: transform 140ms ease, box-shadow 140ms ease;
+}
+.btn.primary::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-130%) skewX(-18deg);
+  background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.33), transparent);
+  animation: sheen 4.5s ease-in-out 2s infinite;
+}
+.btn.primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 12px 26px rgb(99 88 255 / 0.4);
+}
+.btn.primary:active {
+  transform: translateY(0);
+}
+@keyframes sheen {
+  0% {
+    transform: translateX(-130%) skewX(-18deg);
+  }
+  22%,
+  100% {
+    transform: translateX(230%) skewX(-18deg);
+  }
+}
+
+/* ---- footer ---- */
+footer {
+  max-width: var(--max);
+  margin: 0 auto;
+  padding: 36px var(--gutter) 56px;
+  border-top: 1px solid var(--border);
+}
+.foot-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 18px;
+}
+.foot-row nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin-left: auto;
+  font-size: 14.5px;
+}
+.foot-row nav a {
+  color: var(--dim);
+}
+.fine {
+  max-width: 68ch;
+  margin: 22px 0 0;
+  color: var(--faint);
+  font-size: 13px;
+}
+
+@media (max-width: 860px) {
+  .doc-wrap {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 24px;
+  }
+  .toc {
+    position: static;
+    max-height: none;
+    padding-bottom: 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  .toc nav {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  }
+  .toc-title {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 640px) {
+  .topbar nav {
+    display: none;
+  }
+  section {
+    padding: 52px 0;
+  }
+  .hero {
+    padding: 36px 0 52px;
+  }
+  .entry {
+    padding-left: 14px;
+  }
+  .specs th,
+  .specs td {
+    padding: 10px 8px;
+  }
+  .specs thead th:nth-child(2),
+  .specs tbody td:nth-child(2) {
+    display: none;
+  }
+}

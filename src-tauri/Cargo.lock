@@ -2261,7 +2261,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "ngintip"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2278,6 +2278,7 @@ dependencies = [
  "hyper-util",
  "if-addrs",
  "libc",
+ "objc2-app-kit",
  "rcgen",
  "regex",
  "rusqlite",
@@ -2390,6 +2391,7 @@ checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
 dependencies = [
  "bitflags 2.13.2",
  "block2",
+ "libc",
  "objc2",
  "objc2-core-foundation",
  "objc2-core-graphics",

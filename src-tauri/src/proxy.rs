@@ -9,7 +9,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
-    sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc, Mutex, OnceLock, RwLock},
+    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, mpsc, Arc, Mutex, OnceLock, RwLock},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -56,6 +56,36 @@ pub const FLOW_EVENT: &str = "flow";
 
 /// A response still streaming after this long shows up in History early.
 const STREAMING_PREVIEW: Duration = Duration::from_secs(1);
+/// How long a request may be out, with no response yet, before History shows it on its
+/// own. Same reasoning as the streaming preview above: short enough that a request in
+/// flight is visible, long enough that an ordinary fast exchange is still one write.
+pub(crate) const PENDING_ROW: Duration = Duration::from_secs(1);
+
+/// Said of a flow once Ngintip has stopped waiting for its answer and none was ever
+/// filed. It states a fact about Ngintip's record and nothing about the target, which
+/// may well have answered an operator who was no longer listening.
+///
+/// A request that is merely still in flight must NOT carry this, or anything else, in
+/// `error`: that column names a failing party, and while the wait is still running
+/// there is no party to name. An in-flight row is `status = 0` with `error` empty and
+/// the session-only `pending` flag set, which is the whole difference between "no news
+/// yet" and "no news ever". Rows written by builds before that distinction existed say
+/// this from one second in, so reading code still has to treat it as either.
+pub(crate) const NO_RESPONSE: &str = "no response recorded";
+
+/// The error recorded when Ngintip stops waiting at a deadline the operator set.
+///
+/// Worded to name Ngintip rather than the target. The target was never observed to
+/// fail: it was still being waited for when the configured patience ran out, and it may
+/// well have answered a moment later. This is the one case where a clock may end a row,
+/// because the clock did not merely pass, it was acted on: the request really was
+/// dropped at that instant, so the row describes something that happened.
+fn gave_up(after: Option<Duration>) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Ngintip stopped waiting after {}s (Settings > Project > Performance). The target was not shown to have failed.",
+        after.map_or(0, |d| d.as_secs())
+    )
+}
 
 /// h2 request bodies up to this size are buffered so a peer stream reset can be
 /// replayed over HTTP/1.1 (see `forward`). Larger bodies keep streaming and are
@@ -149,10 +179,20 @@ pub struct Ctx {
     /// Invisible proxying: accept direct (non-proxy-aware) connections and use
     /// the SNI / Host header as the destination.
     invisible: AtomicBool,
+    /// Milliseconds to wait for a response before giving up; 0 = wait forever.
+    /// Live, so a change applies to the next request with no restart.
+    give_up_ms: AtomicU64,
     /// Background writer that batches flow inserts; started on first use.
     /// Flows queued for the writer thread, each tagged with the store generation it
     /// was captured under (see Store::generation).
     writer: OnceLock<mpsc::Sender<(u64, Flow)>>,
+    /// The waiting room for "please draw this" requests sent to the window (see
+    /// render.rs). Not proxy business, but Ctx is what an MCP handler holds, and a
+    /// Tauri command can reach it through `state.ctx` to deliver the answer.
+    pub render: crate::render::Bridge,
+    /// Sockets the Repeater has open. Behind an Arc because the task that owns a socket
+    /// outlives the call that created it and has to forget itself when the socket ends.
+    pub ws_repeater: std::sync::Arc<crate::wsrepeater::Sockets>,
     /// Hosts whose HTTP/2 upstream reset the stream (e.g. strict servers that send
     /// GOAWAY): we speak HTTP/1.1 to them directly for a while instead of failing
     /// an h2 attempt on every request. Re-probed after the TTL (self-healing).
@@ -179,7 +219,10 @@ impl Ctx {
             host_overrides,
             auth: RwLock::new(None),
             invisible: AtomicBool::new(false),
+            give_up_ms: AtomicU64::new(0),
             writer: OnceLock::new(),
+            render: crate::render::Bridge::default(),
+            ws_repeater: std::sync::Arc::new(crate::wsrepeater::Sockets::default()),
             h2_broken: RwLock::new(HashMap::new()),
         })
     }
@@ -295,6 +338,28 @@ impl Ctx {
     }
     pub fn invisible(&self) -> bool {
         self.invisible.load(Ordering::Relaxed)
+    }
+    /// Seconds to wait for a response before giving up; 0 = wait as long as it takes.
+    pub fn set_give_up_after(&self, secs: u64) {
+        self.set_give_up_ms(secs.saturating_mul(1000));
+    }
+    /// The same deadline in milliseconds. The setting is in seconds because that is the
+    /// unit an operator thinks in; tests need a deadline they do not have to wait out.
+    pub(crate) fn set_give_up_ms(&self, ms: u64) {
+        self.give_up_ms.store(ms, Ordering::Relaxed);
+    }
+    /// Seconds currently allowed for one exchange; 0 = no deadline. Exposed so the
+    /// live value can be read back, because a setting that only the UI can see is a
+    /// setting nobody can tell apart from one that never arrived.
+    pub fn give_up_after(&self) -> u64 {
+        self.give_up_ms.load(Ordering::Relaxed) / 1000
+    }
+    /// The deadline for one upstream exchange, or None when there is none.
+    fn give_up(&self) -> Option<Duration> {
+        match self.give_up_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        }
     }
 
     /// Checks `Proxy-Authorization: Basic …` when proxy auth is on.
@@ -647,8 +712,8 @@ async fn forward(
     // go straight to HTTP/1.1 instead of failing an h2 attempt every time).
     let will_prefer_h2 = client_h2 && !websocket && !ctx.h2_is_broken(&target_host);
 
-    // Read the body up front when the user or a body rule needs all of it, or —
-    // for h2 requests — so a peer stream reset can be replayed over HTTP/1.1.
+    // Read the body up front when the user or a body rule needs all of it, or -
+    // for h2 requests - so a peer stream reset can be replayed over HTTP/1.1.
     // Bodies past the limit keep streaming (and can't be retried).
     let mut payload = if hold || ext_active || ctx.rules.has(Target::RequestBody) {
         match body::buffer(body, CAPTURE_LIMIT).await {
@@ -693,10 +758,15 @@ async fn forward(
             tauri::async_runtime::spawn_blocking(move || {
                 let processed = ext
                     .extensions
-                    .transform(crate::extensions::Phase::Request, processing.as_bytes(), crate::extensions::Surface::Interceptor)
+                    .transform(
+                        crate::extensions::Phase::Request,
+                        processing.as_bytes(),
+                        crate::extensions::Surface::Interceptor,
+                        &crate::extensions::HookCtx { host: h.clone(), path: p.clone(), flow_id: Some(id), ..Default::default() },
+                    )
                     .map(|o| String::from_utf8_lossy(&o).replace("\r\n", "\n"));
                 let base = processed.clone().unwrap_or(processing);
-                let hc = crate::extensions::HookCtx { host: h, path: p, ..Default::default() };
+                let hc = crate::extensions::HookCtx { host: h, path: p, flow_id: Some(id), ..Default::default() };
                 let display = ext
                     .extensions
                     .decode(crate::extensions::Phase::Request, base.as_bytes(), crate::extensions::Surface::Interceptor, &hc)
@@ -722,7 +792,7 @@ async fn forward(
                         let (h, p) = (host.clone(), path.clone());
                         Some(
                             tauri::async_runtime::spawn_blocking(move || {
-                                let hc = crate::extensions::HookCtx { host: h, path: p, edited: true, ..Default::default() };
+                                let hc = crate::extensions::HookCtx { host: h, path: p, flow_id: Some(id), edited: true, ..Default::default() };
                                 ext.extensions
                                     .encode(crate::extensions::Phase::Request, user_edit.as_bytes(), crate::extensions::Surface::Interceptor, &hc)
                                     .map(|o| String::from_utf8_lossy(&o).replace("\r\n", "\n"))
@@ -740,7 +810,16 @@ async fn forward(
                     req_original = Some(arrived);
                     match apply_edit(&mut parts, &edited, bytes) {
                         Ok(body) => *bytes = body,
-                        Err(e) => return text(StatusCode::BAD_REQUEST, &format!("{}: edited request invalid: {e:#}", brand::NAME)),
+                        // Forward was pressed, so as far as the operator is concerned the
+                        // request left. It did not: Ngintip answered 400 itself. The row
+                        // keeps the request as it arrived, which is the only version of
+                        // it that exists, and says why nothing was sent.
+                        Err(e) => {
+                            let mut flow = held;
+                            flow.set_error(format!("edited request invalid: {e:#}"));
+                            ctx.record_flow(flow);
+                            return text(StatusCode::BAD_REQUEST, &format!("{}: edited request invalid: {e:#}", brand::NAME));
+                        }
                     }
                 }
             }
@@ -755,8 +834,25 @@ async fn forward(
 
     // Timing starts after any intercept pause.
     let started = Instant::now();
+
+    // The row as the request arrived, and the guard that files it if this handler dies
+    // before the exchange reaches an outcome. Both are set up HERE, in front of the
+    // extension transform below, because that transform is a subprocess round trip that
+    // this task awaits: a client that gives up inside that window used to take the whole
+    // handler with it and leave no record that the request was ever made. The guard
+    // knows the request has not gone upstream yet (`sent`), so the row it files says
+    // that rather than implying the target received something it never did.
+    let req_capture = SharedCapture::default();
+    let recorded = Recorded::new();
     let mut flow = Flow::request(id, &parts.method, &parts.uri, parts.version, &parts.headers, Bytes::new()).at(gen);
-    flow.variants.req_original = req_original;
+    flow.variants.req_original = req_original.clone();
+    let mut abandoned = AbandonGuard {
+        ctx: ctx.clone(),
+        recorded: recorded.clone(),
+        capture: req_capture.clone(),
+        flow: Some(flow.clone()),
+        sent: false,
+    };
 
     // Extension transform of the outgoing request (buffered bodies only, in scope):
     // e.g. encrypt an edited plaintext body before it goes upstream. Skipped for
@@ -770,7 +866,15 @@ async fn forward(
             let out = {
                 let ext = ctx.clone();
                 let cur = current.clone();
-                tauri::async_runtime::spawn_blocking(move || ext.extensions.transform(crate::extensions::Phase::Request, cur.as_bytes(), crate::extensions::Surface::Proxy))
+                let hc = crate::extensions::HookCtx {
+                    host: held.summary.host.clone(),
+                    path: held.summary.path.clone(),
+                    flow_id: Some(id),
+                    ..Default::default()
+                };
+                tauri::async_runtime::spawn_blocking(move || {
+                    ext.extensions.transform(crate::extensions::Phase::Request, cur.as_bytes(), crate::extensions::Surface::Proxy, &hc)
+                })
                     .await
                     .unwrap_or(None)
             };
@@ -778,8 +882,8 @@ async fn forward(
                 let edited = String::from_utf8_lossy(&out).into_owned();
                 match apply_edit(&mut parts, &edited, bytes) {
                     Ok(body) => {
-                        if flow.variants.req_original.is_none() {
-                            flow.variants.req_original = Some(current);
+                        if req_original.is_none() {
+                            req_original = Some(current);
                         }
                         *bytes = body;
                     }
@@ -788,7 +892,18 @@ async fn forward(
             }
         }
     }
-    let req_capture = SharedCapture::default();
+
+    // Both editors have had their turn and `apply_edit` rewrote `parts` in place, so the
+    // record is re-read from them. Leaving it as built above would keep the request line
+    // and headers as they arrived while something else went upstream, and then the
+    // version that actually crossed the wire would exist nowhere: the row would show the
+    // arrived message and call it Final.
+    flow.set_request(&parts.method, &parts.uri, parts.version, &parts.headers);
+    flow.variants.req_original = req_original;
+    // The guard's copy is the one filed if this handler dies, so it has to be the same
+    // request. Until this point it deliberately was not: nothing had been sent, and the
+    // arrived message was the only version that existed.
+    abandoned.flow = Some(flow.clone());
 
     // A body we can replay if the peer resets the h2 stream and we retry over
     // HTTP/1.1: buffered bodies replay verbatim, bodyless requests replay empty.
@@ -824,7 +939,53 @@ async fn forward(
     // connection. Only replayable bodies (buffered or bodyless) get a snapshot.
     let retry = retry_body.map(|body| (parts.method.clone(), parts.uri.clone(), parts.headers.clone(), body));
 
-    let mut sent = ctx.send(Request::from_parts(parts, upstream_body), proto).await;
+    // The request is about to go on the wire, and everything that writes it to History
+    // sits after the await below. That await is where the client's patience runs out: an
+    // app at its read timeout closes the connection, hyper drops this whole future, and a
+    // request that really was sent leaves no trace at all. So the request is also written
+    // on its own, from a task that does not belong to the client's connection and is
+    // therefore not dropped with it. For a response that is buffered rather than streamed
+    // (an extension is active, or a body rule is set) this is the only interim write
+    // there is, which is exactly the case where a slow endpoint used to vanish.
+    //
+    // Spawned here rather than beside the guard above, so the row it writes a second in
+    // is the request as it goes upstream, not the one that arrived.
+    tokio::spawn({
+        let (ctx, recorded, req_capture) = (ctx.clone(), recorded.clone(), req_capture.clone());
+        let mut pending = flow.clone();
+        async move {
+            tokio::time::sleep(PENDING_ROW).await;
+            fill_request_body(&mut pending, &req_capture);
+            // Deliberately no error. `error` is the column that names a failing party,
+            // and a request still out at the target has not identified one; writing a
+            // neutral sentence there anyway is what made a healthy request show up red.
+            // Empty is the honest value and it keeps the row out of every failure
+            // filter, out of an agent's failure heuristic, and out of the red.
+            pending.summary.pending = true;
+            // Not a round trip, so there is no duration to report, and any number here
+            // would be read as one. This row used to claim 1002 ms for requests that
+            // went on to take 60 and 100 seconds. The clock the UI should show is the
+            // one still running, counted from `ts`.
+            pending.summary.duration_ms = 0;
+            recorded.write(&ctx, STAGE_REQUEST, pending);
+        }
+    });
+
+    // The operator's own deadline, if they set one, read once so the response head and
+    // the buffered body below are both measured against the same clock rather than
+    // getting a fresh full deadline each. 0 (the default) means no deadline at all.
+    let give_up = ctx.give_up();
+    let give_up_at = give_up.map(|d| tokio::time::Instant::now() + d);
+    // From here the target has the request, so an abandoned row stops saying it never
+    // left. Set before the await, not after: the await is exactly where this task dies.
+    abandoned.sent = true;
+    let upstream = ctx.send(Request::from_parts(parts, upstream_body), proto);
+    let mut sent = match give_up_at {
+        None => upstream.await,
+        // A give-up is not a connect error and not an h2 reset, so the retry below
+        // leaves it alone: the point was to stop waiting, not to wait again.
+        Some(at) => tokio::time::timeout_at(at, upstream).await.unwrap_or_else(|_| Err(gave_up(give_up))),
+    };
     if let (Err(e), Some((method, uri, headers, body))) = (&sent, &retry) {
         let rebuild = || {
             let mut r = Request::new(body::full(body.clone()));
@@ -849,7 +1010,7 @@ async fn forward(
             }
         } else if is_connect_error(e) {
             // The connection never completed (e.g. "tls handshake eof": the server
-            // closed mid-handshake), so nothing was sent — retry once on a fresh
+            // closed mid-handshake), so nothing was sent - retry once on a fresh
             // connection with the same protocol before surfacing an error.
             let err_desc = short_error(e);
             sent = ctx.send(rebuild(), proto).await;
@@ -866,7 +1027,7 @@ async fn forward(
             fill_request_body(&mut flow, &req_capture);
             flow.set_error(msg.clone());
             flow.summary.duration_ms = started.elapsed().as_millis() as u64;
-            ctx.record_flow(flow);
+            recorded.write(&ctx, STAGE_FINAL, flow);
             return text(StatusCode::BAD_GATEWAY, &format!("{} upstream error: {msg}", brand::NAME));
         }
     };
@@ -879,7 +1040,7 @@ async fn forward(
         fill_request_body(&mut flow, &req_capture);
         flow.summary.duration_ms = started.elapsed().as_millis() as u64;
         let ws_host = flow.summary.host.clone();
-        ctx.record_flow(flow);
+        recorded.write(&ctx, STAGE_FINAL, flow);
         if let (Some(client), Some(server)) = (client_upgrade, head.extensions.remove::<OnUpgrade>()) {
             tokio::spawn(ws::relay(client, server, id, ws_host, ctx.clone()));
         }
@@ -895,10 +1056,17 @@ async fn forward(
         ctx.intercept.is_enabled() && in_scope && (wants_response || (ctx.intercept.holds_responses() && passes_filter));
     // Also buffer when an extension is active, so respond() can transform the body.
     let res_body = if hold_response || ext_active || ctx.rules.has(Target::ResponseBody) {
-        match body::buffer(res_body, CAPTURE_LIMIT).await {
+        // Same deadline, still counting from before the request went out: a response
+        // whose head arrives in time but whose body never ends is just as stuck.
+        let buffered = match give_up_at {
+            None => body::buffer(res_body, CAPTURE_LIMIT).await,
+            // body::buffer reports a boxed std error, not anyhow's.
+            Some(at) => tokio::time::timeout_at(at, body::buffer(res_body, CAPTURE_LIMIT)).await.unwrap_or_else(|_| Err(gave_up(give_up).into())),
+        };
+        match buffered {
             Ok(body::Buffered::Complete(bytes)) => {
                 let bytes = ctx.rules.apply_body(Target::ResponseBody, &mut head.headers, bytes);
-                let done = Buffered { head, bytes, flow, started };
+                let done = Buffered { head, bytes, flow, started, recorded };
                 return done.respond(hold_response, &req_capture, &ctx).await;
             }
             // Too large to edit or rewrite: stream it like any other.
@@ -908,7 +1076,7 @@ async fn forward(
                 fill_request_body(&mut flow, &req_capture);
                 flow.set_error(format!("response body: {msg}"));
                 flow.summary.duration_ms = started.elapsed().as_millis() as u64;
-                ctx.record_flow(flow);
+                recorded.write(&ctx, STAGE_FINAL, flow);
                 return text(StatusCode::BAD_GATEWAY, &format!("{} upstream error: {msg}", brand::NAME));
             }
         }
@@ -917,7 +1085,11 @@ async fn forward(
     };
 
     strip_hop_headers(&mut head.headers);
-    let body = stream_and_record(res_body, flow, req_capture, started, ctx);
+    // From here the body is the Tee's to finish, and its own Drop reports a transfer cut
+    // short with the part that did arrive. That is strictly better than this guard's
+    // request-only row, so the guard stands down rather than racing it.
+    abandoned.disarm();
+    let body = stream_and_record(res_body, flow, req_capture, started, ctx, recorded);
     Response::from_parts(head, body)
 }
 
@@ -927,13 +1099,14 @@ struct Buffered {
     bytes: Bytes,
     flow: Flow,
     started: Instant,
+    recorded: Recorded,
 }
 
 impl Buffered {
     /// Optionally show it in the intercept queue first (to forward, edit or
     /// drop), then record it and send it on.
     async fn respond(self, hold: bool, req_capture: &SharedCapture, ctx: &Arc<Ctx>) -> Response<Body> {
-        let Buffered { mut head, bytes, mut flow, started } = self;
+        let Buffered { mut head, bytes, mut flow, started, recorded } = self;
         fill_request_body(&mut flow, req_capture);
         flow.set_response(head.status, head.version, &head.headers, bytes.clone());
         // Time on the wire, not time spent waiting for the user.
@@ -950,6 +1123,9 @@ impl Buffered {
             // editing without changing the wire. The editor shows the decoded view,
             // keeping the arrived response as Original. A response has no Host header,
             // so the host is passed in ctx for the extension's scope.
+            // Every hook on this message names the same flow: process, decode and the
+            // encode of an edit are three views of one recorded exchange.
+            let fid = flow.summary.id;
             let (processed, display) = if ext_on {
                 let processing = crate::raw::response_text_for_processing(&flow);
                 let ext = ctx.clone();
@@ -957,10 +1133,15 @@ impl Buffered {
                 tauri::async_runtime::spawn_blocking(move || {
                     let processed = ext
                         .extensions
-                        .transform(crate::extensions::Phase::Response, processing.as_bytes(), crate::extensions::Surface::Interceptor)
+                        .transform(
+                            crate::extensions::Phase::Response,
+                            processing.as_bytes(),
+                            crate::extensions::Surface::Interceptor,
+                            &crate::extensions::HookCtx { host: h.clone(), path: p.clone(), flow_id: Some(fid), ..Default::default() },
+                        )
                         .map(|o| String::from_utf8_lossy(&o).replace("\r\n", "\n"));
                     let base = processed.clone().unwrap_or(processing);
-                    let hc = crate::extensions::HookCtx { host: h, path: p, ..Default::default() };
+                    let hc = crate::extensions::HookCtx { host: h, path: p, flow_id: Some(fid), ..Default::default() };
                     let display = ext
                         .extensions
                         .decode(crate::extensions::Phase::Response, base.as_bytes(), crate::extensions::Surface::Interceptor, &hc)
@@ -985,7 +1166,7 @@ impl Buffered {
                             let (h, p) = (host.clone(), path.clone());
                             Some(
                                 tauri::async_runtime::spawn_blocking(move || {
-                                    let hc = crate::extensions::HookCtx { host: h, path: p, edited: true, ..Default::default() };
+                                    let hc = crate::extensions::HookCtx { host: h, path: p, flow_id: Some(fid), edited: true, ..Default::default() };
                                     ext.extensions
                                         .encode(crate::extensions::Phase::Response, user_edit.as_bytes(), crate::extensions::Surface::Interceptor, &hc)
                                         .map(|o| String::from_utf8_lossy(&o).replace("\r\n", "\n"))
@@ -1010,7 +1191,11 @@ impl Buffered {
                                 }
                                 Err(e) => {
                                     flow.set_error(format!("edited response invalid: {e:#}"));
-                                    ctx.record_flow(flow);
+                                    // Through the guard, not around it. This row is final, and
+                                    // the interim writer is still armed: a write that does not
+                                    // claim a stage leaves that writer free to replace a
+                                    // truthful row with "no response recorded" a moment later.
+                                    recorded.write(ctx, STAGE_FINAL, flow);
                                     return text(StatusCode::BAD_GATEWAY, &format!("{}: edited response invalid: {e:#}", brand::NAME));
                                 }
                             }
@@ -1019,7 +1204,9 @@ impl Buffered {
                 }
                 Decision::Drop => {
                     flow.set_error("response dropped (intercept)".into());
-                    ctx.record_flow(flow);
+                    // Through the guard: see the note above. Dropping a held response is
+                    // the operator's own act and the record has to keep saying so.
+                    recorded.write(ctx, STAGE_FINAL, flow);
                     return text(StatusCode::BAD_GATEWAY, &format!("Response dropped by {}", brand::NAME));
                 }
             }
@@ -1034,7 +1221,15 @@ impl Buffered {
             let out = {
                 let ext = ctx.clone();
                 let cur = current.clone();
-                tauri::async_runtime::spawn_blocking(move || ext.extensions.transform(crate::extensions::Phase::Response, cur.as_bytes(), crate::extensions::Surface::Proxy))
+                let hc = crate::extensions::HookCtx {
+                    host: flow.summary.host.clone(),
+                    path: flow.summary.path.clone(),
+                    flow_id: Some(flow.summary.id),
+                    ..Default::default()
+                };
+                tauri::async_runtime::spawn_blocking(move || {
+                    ext.extensions.transform(crate::extensions::Phase::Response, cur.as_bytes(), crate::extensions::Surface::Proxy, &hc)
+                })
                     .await
                     .unwrap_or(None)
             };
@@ -1058,35 +1253,152 @@ impl Buffered {
             bytes
         };
 
-        ctx.record_flow(flow);
+        recorded.write(ctx, STAGE_FINAL, flow);
         strip_hop_headers(&mut head.headers);
         Response::from_parts(head, body::full(bytes))
     }
 }
 
+/// Guards the single History row a flow owns.
+///
+/// Several writers can produce a version of that row: the request on its own, a preview
+/// of a response still streaming, and the finished exchange. They run on different tasks
+/// and in no fixed order, so every write says how complete it is and a row is never
+/// replaced by a less complete version of itself.
+#[derive(Clone)]
+struct Recorded(Arc<Mutex<u8>>);
+
+/// Request only: it went upstream and no response for it has been recorded.
+const STAGE_REQUEST: u8 = 1;
+/// Response head known, body still arriving.
+const STAGE_PREVIEW: u8 = 2;
+/// The exchange as it ended. Nothing may follow it.
+const STAGE_FINAL: u8 = 3;
+
+impl Recorded {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(0)))
+    }
+
+    /// Write this version of the row unless one at least as complete is already in.
+    /// The lock is held across the queueing, which is a channel send, so two writers
+    /// cannot interleave and land out of order.
+    fn write(&self, ctx: &Arc<Ctx>, stage: u8, flow: Flow) {
+        let mut at = self.0.lock().unwrap();
+        if *at >= stage {
+            return;
+        }
+        *at = stage;
+        ctx.record_flow(flow);
+    }
+
+    /// The stage already recorded. For a cheap look before doing any work.
+    fn stage(&self) -> u8 {
+        *self.0.lock().unwrap()
+    }
+
+    /// The exchange ended with no answer on file. Replaces a request-only row, and
+    /// nothing above it: a preview or a finished exchange knows strictly more.
+    ///
+    /// Unlike `write` this is allowed to replace a row at its own stage, because it is
+    /// not a competing version of the row. It is the same row saying something new
+    /// about itself, that nothing is waiting for it any more.
+    fn abandon(&self, ctx: &Arc<Ctx>, flow: Flow) {
+        let mut at = self.0.lock().unwrap();
+        if *at > STAGE_REQUEST {
+            return;
+        }
+        *at = STAGE_REQUEST;
+        ctx.record_flow(flow);
+    }
+
+    /// Hand a stage to another writer without writing anything. A write at that stage is
+    /// then skipped, because the writer that claimed it produces a more complete version
+    /// of the same row and would only be queued behind a worse one.
+    fn supersede(&self, stage: u8) {
+        let mut at = self.0.lock().unwrap();
+        *at = (*at).max(stage);
+    }
+}
+
 /// Pass the response body to the client, then record the flow with whatever
 /// was captured. Slow streams get an early preview in History.
+/// Writes a row off as unanswered if the request handler is dropped before the exchange
+/// reaches an outcome of its own.
+///
+/// The handler future belongs to the client's connection. A client that gives up and
+/// hangs up takes that future with it, at whatever await it was parked on, and nothing
+/// below that await ever runs again. Without this the interim row written a second in
+/// stays `pending` for as long as the window stays open: a badge counting upward for an
+/// exchange that ended minutes ago. It is not a rare case either. Chrome's omnibox
+/// abandons a suggestion request on every keystroke.
+///
+/// Rust cannot tell a cancellation from an ordinary return, so arming this means every
+/// other way out has to out-rank it. They do, at no cost: each writes `STAGE_FINAL`,
+/// which `abandon` refuses to overwrite. The streaming path is the one exception, since
+/// it hands the exchange to a `Tee` that outlives this function and carries a `Drop` of
+/// its own, so it disarms explicitly.
+struct AbandonGuard {
+    ctx: Arc<Ctx>,
+    recorded: Recorded,
+    capture: SharedCapture,
+    flow: Option<Flow>,
+    /// Whether the request had been handed to the upstream connection when this guard
+    /// fired. The two outcomes read as completely different findings: a target that was
+    /// asked and whose answer arrived with nobody left holding the question, versus a
+    /// request that never left Ngintip at all.
+    sent: bool,
+}
+
+impl AbandonGuard {
+    /// Give up the outcome to a writer that takes over from here and would otherwise
+    /// be pre-empted by this one.
+    fn disarm(&mut self) {
+        self.flow = None;
+    }
+}
+
+impl Drop for AbandonGuard {
+    fn drop(&mut self) {
+        // The ordinary response lands here too, on its way out of the function, and it
+        // must not pay for a request body copy only to discover it has nothing to do.
+        if self.flow.is_none() || self.recorded.stage() > STAGE_REQUEST {
+            return;
+        }
+        let Some(mut flow) = self.flow.take() else { return };
+        fill_request_body(&mut flow, &self.capture);
+        // `error` stays empty, deliberately. Nothing was observed about the target, and
+        // this cannot tell a client hanging up from Ngintip itself being shut down. What
+        // it does know is that nobody is waiting any more, and clearing `pending` says
+        // exactly that: the row stops claiming to be waiting and starts reading as what
+        // it is, a request no answer was ever filed for.
+        flow.summary.pending = false;
+        flow.summary.unsent = !self.sent;
+        self.recorded.abandon(&self.ctx, flow);
+    }
+}
+
 fn stream_and_record(
     body: Body,
     flow: Flow,
     req_capture: SharedCapture,
     started: Instant,
     ctx: Arc<Ctx>,
+    recorded: Recorded,
 ) -> Body {
-    // Held while saving, so a late preview can't overwrite the final version.
-    let finished = Arc::new(Mutex::new(false));
+    // This response streams, so its interim row comes from the preview below, which
+    // knows the status and is therefore strictly more complete than the request on its
+    // own. The request-only write is handed over rather than landing just before it.
+    recorded.supersede(STAGE_REQUEST);
 
     tokio::spawn({
-        let (ctx, finished, req_capture) = (ctx.clone(), finished.clone(), req_capture.clone());
+        let (ctx, recorded, req_capture) = (ctx.clone(), recorded.clone(), req_capture.clone());
         let mut preview = flow.clone();
         async move {
             tokio::time::sleep(STREAMING_PREVIEW).await;
-            let finished = finished.lock().unwrap();
-            if !*finished {
-                fill_request_body(&mut preview, &req_capture);
-                preview.summary.streaming = true;
-                ctx.record_flow(preview);
-            }
+            fill_request_body(&mut preview, &req_capture);
+            preview.summary.streaming = true;
+            recorded.write(&ctx, STAGE_PREVIEW, preview);
         }
     });
 
@@ -1106,8 +1418,7 @@ fn stream_and_record(
                 }
             }
             flow.summary.duration_ms = started.elapsed().as_millis() as u64;
-            *finished.lock().unwrap() = true;
-            ctx.record_flow(flow);
+            recorded.write(&ctx, STAGE_FINAL, flow);
         }
     };
     body::boxed(Tee::new(body, capture, Some(Box::new(done))))
@@ -1319,7 +1630,7 @@ fn is_h2_stream_error(e: &anyhow::Error) -> bool {
     s.contains("http2") || s.contains("sendrequest")
 }
 
-/// A connection-establishment failure (TLS handshake / TCP connect) — the request
+/// A connection-establishment failure (TLS handshake / TCP connect) - the request
 /// was never sent, so it is safe to retry once on a fresh connection. Covers the
 /// common transient "client error (Connect): tls handshake eof".
 fn is_connect_error(e: &anyhow::Error) -> bool {

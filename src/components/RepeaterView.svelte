@@ -6,11 +6,13 @@
   import SplitPane from './SplitPane.svelte';
   import CaptureEditor from './CaptureEditor.svelte';
   import ContextMenu from './ContextMenu.svelte';
+  import WsView from './WsView.svelte';
   import Modal from './Modal.svelte';
   import { store } from '../lib/store.svelte.js';
   import { fmtSize, fmtDateTime, statusClass } from '../lib/format.js';
   import { brandKey } from '../lib/brand.js';
-  import { prettyBody, splitMessage } from '../lib/message.js';
+  import { prettyBody, splitMessage, prettyJsonText } from '../lib/message.js';
+  import { isHandshakeRequest, isSocketUrl } from '../lib/wsframe.js';
   import { headerMenuItems, bodyMenuItems } from '../lib/editormenu.js';
   import { setHeader } from '../lib/httpmsg.js';
   import { redirectInfo } from '../lib/redirect.js';
@@ -128,6 +130,10 @@
         { label: 'Copy as cURL', run: () => store.copyText(toCurl(tab.raw || '', tab.target), 'cURL command') },
         { label: 'Copy request body', disabled: !body, run: () => store.copyText(body, 'Request body') },
         { label: 'Copy raw request', run: () => store.copyText(tab.raw || '', 'Request') },
+        // Same label and the same place in the menu as History's, and the same action as
+        // the camera button in the toolbar above: one capture of the request AND the
+        // response, taken from where each pane is scrolled to.
+        { label: 'Capture image', run: openCapture },
       ],
     };
   }
@@ -152,6 +158,7 @@
         { label: 'Send request to Intruder', run: () => store.sendToIntruder({ target: tab.target, raw: tab.raw }) },
         { label: 'Copy URL', run: () => store.copyText(requestUrl(), 'URL') },
         { label: 'Copy as cURL', run: () => store.copyText(toCurl(tab.raw || '', tab.target), 'cURL command') },
+        { label: 'Capture image', run: openCapture },
       ],
     };
   }
@@ -294,8 +301,8 @@
       items: [
         { label: 'Send this tab', hint: '⌘↵', run: () => store.sendRepeater(tab) },
         'separator',
-        { label: `Sync send — one by one (${count})`, hint: '1·2·3', run: () => store.sendGroup(name, 'sequential') },
-        { label: `Send multi — all at once (${count})`, hint: '⇉', run: () => store.sendGroup(name, 'parallel') },
+        { label: `Sync send - one by one (${count})`, hint: '1·2·3', run: () => store.sendGroup(name, 'sequential') },
+        { label: `Send multi - all at once (${count})`, hint: '⇉', run: () => store.sendGroup(name, 'parallel') },
       ],
     };
   }
@@ -309,8 +316,8 @@
       x: r.left,
       y: r.bottom + 4,
       items: [
-        { label: `Sync send — one by one (${count})`, hint: '1·2·3', run: () => store.sendGroup(name, 'sequential') },
-        { label: `Send multi — all at once (${count})`, hint: '⇉', run: () => store.sendGroup(name, 'parallel') },
+        { label: `Sync send - one by one (${count})`, hint: '1·2·3', run: () => store.sendGroup(name, 'sequential') },
+        { label: `Send multi - all at once (${count})`, hint: '⇉', run: () => store.sendGroup(name, 'parallel') },
       ],
     };
   }
@@ -496,7 +503,90 @@
       : 'No requests sent from this tab yet',
   );
 
+  // ---- socket tabs ---------------------------------------------------------------
+  //
+  // A socket tab is not a request, so it gets its own toolbar rather than borrowing the
+  // one above a request editor. Sharing it is what made the panel feel broken: the big
+  // primary button said Send, pressing it answered "request is empty", and the real
+  // Connect was a secondary button further down the page.
+  let isWs = $derived(tab?.kind === 'ws');
+
+  // An HTTP tab that is really a socket. It happens the moment a handshake reaches the
+  // Repeater by some route that did not know better, and the tab it makes cannot work:
+  // ws:// is not an address the HTTP client can dial, and a 101 cannot be replayed
+  // anyway. Offered, not forced - sending an `Upgrade: websocket` header over plain
+  // HTTP to see what a server does with it is a real test.
+  let socketish = $derived(!isWs && (isSocketUrl(tab?.target) || isHandshakeRequest(tab?.raw)));
+
+  // Totals come from the frame list, tagged with the flow they were counted for, so
+  // switching tabs can never show the previous socket's numbers.
+  let counted = $state(null);
+  let stats = $derived(counted?.flowId === tab?.flowId ? counted : { total: 0, up: 0, down: 0, bytes: 0 });
+
+  let wsState = $derived(tab?.connId ? 'open' : tab?.wsState === 'connecting' ? 'connecting' : (tab?.wsState ?? 'idle'));
+  let wsStateText = $derived(
+    {
+      open: 'open',
+      connecting: 'connecting…',
+      closed: tab?.closedBy === 'server' ? 'closed by the server' : tab?.closedBy === 'you' ? 'closed' : 'closed',
+      idle: 'not connected',
+    }[wsState] ?? 'not connected',
+  );
+
+  const FRAME_KINDS = [
+    { id: 'text', label: 'Text', hint: 'UTF-8, sent exactly as typed' },
+    { id: 'binary', label: 'Binary', hint: 'hex bytes: 89 50 4e 47' },
+    { id: 'ping', label: 'Ping', hint: 'a control frame; payload optional, 125 bytes max' },
+    { id: 'pong', label: 'Pong', hint: 'a control frame; payload optional, 125 bytes max' },
+  ];
+  let payloadEl = $state();
+  let frameKind = $derived(tab?.frameKind ?? 'text');
+  let payloadBytes = $derived(new TextEncoder().encode(tab?.payload ?? '').length);
+  let hexDigits = $derived(String(tab?.payload ?? '').replace(/[^0-9a-f]/gi, '').length);
+  // What the composer says about what you typed, before you send it. A control frame
+  // over 125 bytes and an odd number of hex digits are both rejected by the socket, so
+  // they are called out here instead of coming back as an error afterwards.
+  let composeNote = $derived.by(() => {
+    if (!isWs) return null;
+    if (frameKind === 'binary') {
+      if (hexDigits % 2) return { bad: true, text: 'odd number of hex digits' };
+      return { bad: false, text: `${hexDigits / 2} bytes` };
+    }
+    if (frameKind === 'ping' || frameKind === 'pong') {
+      return { bad: payloadBytes > 125, text: `${payloadBytes}/125 bytes` };
+    }
+    return { bad: false, text: `${payloadBytes} bytes` };
+  });
+  let canFormat = $derived.by(() => {
+    if (!isWs || frameKind !== 'text') return false;
+    const t = (tab?.payload ?? '').trim();
+    if (!t.startsWith('{') && !t.startsWith('[')) return false;
+    try {
+      JSON.parse(t);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+
+  /** Re-indent the composed JSON (never re-serialised: see prettyJsonText). */
+  function formatPayload() {
+    tab.payload = prettyJsonText(tab.payload) ?? tab.payload;
+  }
+
+  /** "Edit & resend" from the frame list: load that frame into the composer. */
+  function loadFrame({ kind, payload }) {
+    tab.frameKind = kind;
+    tab.payload = payload;
+    payloadEl?.focus();
+  }
+
   function onKey(e) {
+    // One handler, on the window, for the whole view - including the socket composer.
+    // The composer used to carry its own Cmd+Enter as well, so the shortcut fired twice:
+    // once as a frame and once here as an HTTP send, which is where the red
+    // "request is empty" under a socket tab came from. `sendRepeater` now routes a
+    // socket tab to its composer, so there is one path and one frame.
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
       e.preventDefault();
       store.sendRepeater(tab);
@@ -521,7 +611,7 @@
     return '';
   }
 
-  // Editing the target reflects into the Host header (one way only — editing the
+  // Editing the target reflects into the Host header (one way only - editing the
   // Host header in the request does NOT change the target). Fires on manual edits.
   function reflectHostFromTarget(e) {
     const host = hostOf(e.currentTarget.value);
@@ -568,7 +658,7 @@
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <button
             class="group-label"
-            title="Group {g.name} — click to collapse, right-click to edit, drop a tab here to add it"
+            title="Group {g.name} - click to collapse, right-click to edit, drop a tab here to add it"
             oncontextmenu={(e) => openGroupMenu(e, g.name)}
             onclick={() => toggleCollapse(g.name)}
           >
@@ -638,6 +728,50 @@
     <button class="add" title="New tab" aria-label="New tab" onclick={() => store.addRepeaterTab()}>+</button>
   </div>
 
+  {#if isWs}
+    <!-- A socket's toolbar: the address, one button that changes what it is, and the
+         state of the connection. Nothing here is borrowed from the request toolbar. -->
+    <div class="toolbar wstoolbar">
+      <input
+        class="input mono target"
+        bind:value={tab.url}
+        placeholder="ws://127.0.0.1:6677/ws/notify"
+        spellcheck="false"
+        disabled={!!tab.connId}
+        title="The socket to open. ws:// or wss:// - an http(s):// address is read as its socket equivalent, so a URL pasted out of History works."
+        onkeydown={(e) => e.key === 'Enter' && !tab.connId && store.connectWsTab(tab)}
+      />
+      {#if tab.connId}
+        <button class="btn disconnect" title="Send a close frame and hang up" onclick={() => store.closeWsTab(tab)}>Disconnect</button>
+        <label class="codefield" title="The close code sent when you disconnect. 1000 is a normal close; 4000-4999 are yours to use.">
+          code
+          <input class="input mono code" type="number" min="1000" max="4999" bind:value={tab.closeCode} />
+        </label>
+      {:else}
+        <button class="btn primary connect" disabled={tab.sending || !tab.url.trim()} onclick={() => store.connectWsTab(tab)}>
+          {tab.sending ? 'Connecting…' : 'Connect'}
+          <kbd>↵</kbd>
+        </button>
+      {/if}
+
+      <span class="wsstate {wsState}" title={tab.flowId ? `Recorded as flow #${tab.flowId}` : 'No socket has been opened from this tab yet'}>
+        <span class="statedot"></span>{wsStateText}
+      </span>
+      {#if tab.flowId}
+        <span class="dim meta" title="Frames sent and received on this socket, and the payload bytes they carry">
+          #{tab.flowId} · ↑{stats.up} ↓{stats.down} · {fmtSize(stats.bytes)}
+        </span>
+      {/if}
+
+      <div class="spacer"></div>
+      <button class="btn ghost sm icbtn note-btn" class:has={!!tab.note} title="Note for this tab, its group, or all tabs (double-click a tab to rename)" aria-label="Note" onclick={openNotes}>
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" /></svg>
+      </button>
+      <button class="btn ghost sm icbtn" title="Duplicate this tab (the address and the frame, not the connection)" aria-label="Duplicate tab" onclick={() => store.duplicateRepeaterTab(tab)}>
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+      </button>
+    </div>
+  {:else}
   <div class="toolbar">
     <input class="input mono target" bind:value={tab.target} placeholder="https://example.com" spellcheck="false"
       title="The destination. Editing it updates the Host header; the Host header can still be changed on its own."
@@ -653,6 +787,15 @@
     </div>
     {#if tab.sending}
       <button class="btn ghost sm cancel-send" title="Cancel this send (if it's taking too long)" onclick={() => store.cancelRepeater(tab)}>Cancel</button>
+    {/if}
+    {#if socketish}
+      <button
+        class="btn ghost sm tosocket"
+        title="This request is a WebSocket handshake. Open the same address as a socket instead: frames, not one request."
+        onclick={() => store.openTabAsSocket(tab)}
+      >
+        ⇅ Open as socket
+      </button>
     {/if}
     {#if canFollow}
       <button class="btn ghost sm" title="Follow the redirect (Location) and send it" onclick={() => store.followRedirect(tab)} disabled={tab.sending}>Follow redirect →</button>
@@ -701,10 +844,92 @@
     </button>
   </div>
 
-  <div class="grid">
-    <div class="rpanes">
-      <SplitPane storeKey="repeater" left={reqPane} right={resPane} />
-    </div>
+  {/if}
+
+  <div class="grid" class:with-decoder={miniDecode}>
+    {#if isWs}
+      <!-- A socket tab: the frames fill the panel and the composer sits under them,
+           which is the shape of every chat-like thing people already know. The list is
+           the ordinary WebSocket viewer pointed at the flow this socket was recorded
+           as, so nothing here had to learn how to render a frame. -->
+      <div class="rpanes wsrep">
+        {#if tab.error}
+          <div class="wserr">
+            <span>{tab.error}</span>
+            <button class="wserr-x" aria-label="Dismiss" onclick={() => (tab.error = null)}>×</button>
+          </div>
+        {/if}
+
+        <div class="wsframes">
+          {#if tab.flowId}
+            <WsView
+              flowId={tab.flowId}
+              handshake={tab.handshake}
+              onstats={(s) => (counted = { ...s, flowId: tab.flowId })}
+              onreuse={loadFrame}
+              empty={tab.connId ? 'Connected. Nothing has come through yet - send a frame below, or wait for the server.' : 'This socket is closed. Its frames are kept.'}
+            />
+          {:else}
+            <div class="panel wsblank">
+              <div class="blank-in">
+                <h3>Open a socket</h3>
+                <p>
+                  Type a <code>ws://</code> or <code>wss://</code> address above and press
+                  <strong>Connect</strong>, or send a frame and it will connect first.
+                </p>
+                <p class="dim">
+                  The socket is recorded as a flow, so its frames show up in History, can be saved to
+                  the Organizer and are readable over MCP - the same as traffic the proxy saw.
+                </p>
+                <p class="dim">Already captured one? Right-click a 101 row in History → Open socket in Repeater.</p>
+              </div>
+            </div>
+          {/if}
+        </div>
+
+        <div class="wscompose">
+          <div class="kinds" role="group" aria-label="Frame kind">
+            {#each FRAME_KINDS as k (k.id)}
+              <button class="seg" class:on={frameKind === k.id} title={k.hint} onclick={() => (tab.frameKind = k.id)}>{k.label}</button>
+            {/each}
+            {#if composeNote}
+              <span class="note mono" class:bad={composeNote.bad}>{composeNote.text}</span>
+            {/if}
+            <div class="spacer"></div>
+            <button class="btn ghost sm" disabled={!canFormat} title="Re-indent the JSON you are composing" onclick={formatPayload}>{'{ }'} Format</button>
+            {#if tab.payload}
+              <button class="btn ghost sm" title="Clear the composer" onclick={() => (tab.payload = '')}>Clear</button>
+            {/if}
+          </div>
+          <div class="composerow">
+            <textarea
+              class="input mono payload"
+              bind:this={payloadEl}
+              bind:value={tab.payload}
+              placeholder={frameKind === 'binary'
+                ? '89 50 4e 47 0d 0a 1a 0a'
+                : frameKind === 'text'
+                ? '{"subscribe":"payments"}'
+                : 'optional payload'}
+              spellcheck="false"
+            ></textarea>
+            <button
+              class="btn primary sendframe"
+              disabled={tab.sending || composeNote?.bad || !tab.url.trim()}
+              title={tab.connId ? 'Send one frame (Cmd/Ctrl+Enter)' : 'Connect this socket and send the frame (Cmd/Ctrl+Enter)'}
+              onclick={() => store.sendWsFrame(tab)}
+            >
+              {tab.connId ? 'Send' : tab.sending ? 'Connecting…' : 'Connect & send'}
+              <kbd>⌘↵</kbd>
+            </button>
+          </div>
+        </div>
+      </div>
+    {:else}
+      <div class="rpanes">
+        <SplitPane storeKey="repeater" left={reqPane} right={resPane} />
+      </div>
+    {/if}
     {#if miniDecode}
       <aside class="decoder-dock"><MiniDecoder text={miniDecode.text} onclose={() => (miniDecode = null)} /></aside>
     {/if}
@@ -772,11 +997,19 @@
     {/snippet}
   </div>
   <div class="foot">
+    {#if isWs}
+      <span class="foot-hint">Cmd/Ctrl+Enter sends · click a frame to read it, ↻ to send it again</span>
+      <div class="spacer"></div>
+      {#if stats.total}
+        <span class="foot-stat" title="Frames on this socket">{stats.total} frames</span>
+      {/if}
+    {:else}
     <button class="btn ghost sm" title="Find in the active pane (Cmd/Ctrl+F)" onclick={openFind}>⌕ Find</button>
     <span class="foot-hint">{activePane === 'req' ? 'Request' : 'Response'} · Cmd/Ctrl+F</span>
     <div class="spacer"></div>
     {#if tab.response && !tab.error}
       <span class="foot-stat" title="When sent, response time and size">{#if currentTs}{fmtDateTime(currentTs)} · {/if}{tab.response.durationMs} ms · {fmtSize(tab.response.length)}</span>
+    {/if}
     {/if}
   </div>
 </div>
@@ -845,6 +1078,14 @@
   .foot-hint {
     color: var(--text-faint);
     font: 11px var(--mono);
+  }
+  .tosocket {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    white-space: nowrap;
+  }
+  .tosocket:hover {
+    background: var(--accent-soft);
   }
   .cancel-send {
     color: var(--red);
@@ -1192,6 +1433,193 @@
     min-height: 0;
     padding: 10px;
   }
+  /* The decoder takes a column of its own, sized to its (draggable) width, so the panes
+     shrink to make room instead of being covered. It used to be `position: absolute`
+     over the panes, which hid the response exactly when you wanted to read it next to
+     the decoded value. Same shape as History and Organizer. */
+  .grid.with-decoder {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  /* ---- socket tab ----
+     The panel is a flex column: the frame list takes everything left over and the
+     composer keeps its own height. The dead white rectangle this replaced came from a
+     layout where the list only appeared once a flow existed, so before connecting the
+     pane had nothing in it at all. */
+  .wsrep {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .wsframes {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+  }
+  .wsframes > :global(.panel) {
+    flex: 1;
+    min-height: 0;
+  }
+  /* The address is the whole subject of this toolbar, so it gets more of the row than
+     a request's target does (that row also carries Send, history and status). */
+  .wstoolbar .target {
+    width: min(620px, 52%);
+  }
+  .wstoolbar .target:disabled {
+    color: var(--text-dim);
+    cursor: default;
+  }
+  .connect kbd,
+  .sendframe kbd {
+    margin-left: 6px;
+  }
+  .disconnect {
+    color: var(--red);
+    border-color: color-mix(in srgb, var(--red) 45%, var(--border));
+  }
+  .disconnect:hover {
+    background: color-mix(in srgb, var(--red) 14%, transparent);
+  }
+  .codefield {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--text-faint);
+    font-size: 11px;
+  }
+  .codefield .code {
+    width: 72px;
+    padding: 0 6px;
+    text-align: center;
+  }
+  /* The connection, in one chip: colour for the state, words for what it means. */
+  .wsstate {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 9px;
+    height: 24px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text-dim);
+    font-size: 11.5px;
+    white-space: nowrap;
+  }
+  .statedot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--text-faint);
+  }
+  .wsstate.open {
+    color: var(--green, #35c08a);
+    border-color: color-mix(in srgb, var(--green, #35c08a) 45%, var(--border));
+  }
+  .wsstate.open .statedot {
+    background: var(--green, #35c08a);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--green, #35c08a) 22%, transparent);
+  }
+  .wsstate.connecting .statedot {
+    background: var(--accent);
+    animation: pulse 1s ease-in-out infinite;
+  }
+  .wsstate.closed .statedot {
+    background: var(--red);
+  }
+  @keyframes pulse {
+    50% {
+      opacity: 0.25;
+    }
+  }
+  .wstoolbar .meta {
+    font: 11.5px var(--mono);
+    white-space: nowrap;
+  }
+  .wserr {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    border-bottom: 1px solid color-mix(in srgb, var(--red) 35%, var(--border));
+    background: color-mix(in srgb, var(--red) 10%, transparent);
+    color: var(--red);
+    font-size: 12.5px;
+  }
+  .wserr span {
+    flex: 1;
+  }
+  .wserr-x {
+    border: 0;
+    background: none;
+    color: inherit;
+    font-size: 15px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  /* Before the first connection: the panel says what this tab is for instead of
+     showing an empty box. */
+  .wsblank {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+  }
+  .blank-in {
+    max-width: 440px;
+    padding: 24px;
+  }
+  .blank-in h3 {
+    margin: 0 0 8px;
+    font: 600 14px var(--sans);
+  }
+  .blank-in p {
+    margin: 0 0 8px;
+    font-size: 12.5px;
+    line-height: 1.6;
+  }
+  .blank-in code {
+    padding: 1px 4px;
+    border-radius: 4px;
+    background: var(--bg-hover);
+    font: 11.5px var(--mono);
+  }
+  /* The composer. Its height is its own; the list above absorbs the rest. */
+  .wscompose {
+    flex-shrink: 0;
+    border-top: 1px solid var(--border);
+    background: var(--bg-elev);
+    padding: 8px 10px 10px;
+  }
+  .kinds {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 7px;
+  }
+  .kinds .note {
+    color: var(--text-faint);
+    font-size: 11px;
+  }
+  .kinds .note.bad {
+    color: var(--red);
+  }
+  .composerow {
+    display: flex;
+    gap: 8px;
+    align-items: stretch;
+  }
+  .payload {
+    flex: 1;
+    min-height: 62px;
+    max-height: 180px;
+    resize: vertical;
+    padding: 7px 9px;
+    line-height: 1.5;
+  }
+  .sendframe {
+    min-width: 128px;
+  }
+
   .rpanes {
     display: grid;
     grid-template-rows: minmax(0, 1fr);
@@ -1203,16 +1631,8 @@
      Resizing the editor under the caret is what made placing the cursor go wrong
      after the decoder closed. */
   .decoder-dock {
-    position: absolute;
-    top: 10px;
-    right: 10px;
-    bottom: 10px;
-    z-index: 6;
     min-width: 0;
     min-height: 0;
-    border-radius: var(--radius);
-    overflow: hidden;
-    box-shadow: -10px 0 28px rgb(0 0 0 / 0.28);
   }
   .error {
     padding: 14px;
