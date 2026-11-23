@@ -82,7 +82,21 @@ jobs:
       # the CLI infers it from the certificate that was just imported.
       - name: Build (macOS, universal)
         if: runner.os == 'macOS'
-        run: npm run tauri build -- --target universal-apple-darwin
+        run: |
+          # A secret that does not exist still arrives here as a SET variable holding an
+          # empty string, and the Tauri CLI reads presence rather than emptiness. With
+          # APPLE_ID="" it tried to notarize with no credentials and killed the whole
+          # build on a 401, AFTER signing had already succeeded. So anything empty is
+          # removed, and the notarization trio is all three or none.
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                   APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            [ -n "${!v}" ] || unset "$v"
+          done
+          if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_PASSWORD:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ]; then
+            echo "::notice::no notarization credentials; this build is signed but not notarized"
+            unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          fi
+          npm run tauri build -- --target universal-apple-darwin
 
       - name: Build (Linux, Windows)
         if: runner.os != 'macOS'
