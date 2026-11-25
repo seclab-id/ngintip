@@ -4,11 +4,11 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Performance - Ngintip docs</title>
-    <meta name="description" content="What one real engagement costs on disk: 41,692 requests, 123 hosts, nine days, one 412 MB file." />
+    <meta name="description" content="What one real engagement costs: 41,692 requests in a 412 MB file, and the app holding it open on 155 MB of memory and a fifteenth of one percent of a core." />
     <meta name="theme-color" id="tc" content="#f5f6f9" />
     <meta property="og:type" content="article" />
     <meta property="og:title" content="Performance - Ngintip docs" />
-    <meta property="og:description" content="What one real engagement costs on disk: 41,692 requests, 123 hosts, nine days, one 412 MB file." />
+    <meta property="og:description" content="What one real engagement costs: 41,692 requests in a 412 MB file, and the app holding it open on 155 MB of memory and a fifteenth of one percent of a core." />
     <meta property="og:url" content="https://seclab-id.github.io/ngintip/performance.html" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="style.css" />
@@ -87,8 +87,8 @@
       <article class="prose" id="main">
         <h1>Performance</h1>
         <p class="section-lead">
-  Numbers from one real engagement, measured from its saved project file. Aggregates only: no host, no path and no
-  payload from it appears on this site.
+  Numbers from one real engagement: what the capture costs on disk, and what the app costs in memory and CPU with
+  that capture open. Aggregates only: no host, no path and no payload from it appears on this site.
 </p>
 
 <div class="stats">
@@ -133,8 +133,8 @@
 </div>
 <p>
   Two thirds of the database is the full-text index, not the traffic. That is what makes a search across 41,692
-  decoded bodies answer immediately instead of walking the table, and it is derived data: it compresses hard, which is
-  most of why the saved file is a quarter of the size.
+  decoded bodies <a href="#open">answer in half a second</a> instead of walking the table, and it is derived data: it
+  compresses hard, which is most of why the saved file is a quarter of the size.
 </p>
 
 <h2 id="engagement">What that engagement held</h2>
@@ -151,6 +151,100 @@
     <tr><th scope="row">WebSocket messages</th><td>436</td></tr>
   </tbody>
 </table>
+
+<h2 id="open">What it costs while it is open</h2>
+<p>
+  Everything above was read off the file. The rest of this page is the running app with that same project open:
+  Ngintip 0.4.0, the installed build, on a ten core Apple M5 with 16 GB of memory and macOS 26.4. Memory is the
+  figure Activity Monitor shows, and each CPU figure is process CPU time over a measured wall clock window rather
+  than whatever instant a sampler happened to land on.
+</p>
+
+<div class="stats">
+  <div class="stat"><strong>155 MB</strong><span>memory, idle, everything</span></div>
+  <div class="stat"><strong>0.07%</strong><span>of one core, idle</span></div>
+  <div class="stat"><strong>0.3 ms</strong><span>to open one flow</span></div>
+</div>
+
+<p>
+  A 1.55 GB database and a sixth of a gigabyte of memory: the capture is not in RAM, and never was. Each flow goes
+  from the proxy down a channel to a single writer thread and into SQLite, then it is dropped; the window asks for
+  the rows it is actually showing and caches a few dozen. So this is a figure for the app, not a figure for the
+  project, and it hardly moves as a capture grows.
+</p>
+
+<div class="chart">
+  <div class="row">
+    <span class="label">Window</span>
+    <span class="track"><span class="fill" style="width: 100%"></span></span>
+    <span class="value">91 MB</span>
+  </div>
+  <div class="row">
+    <span class="label">Core</span>
+    <span class="track"><span class="fill accent" style="width: 43%"></span></span>
+    <span class="value">39 MB</span>
+  </div>
+  <div class="row">
+    <span class="label">GPU</span>
+    <span class="track"><span class="fill" style="width: 19%"></span></span>
+    <span class="value">17 MB</span>
+  </div>
+  <div class="row">
+    <span class="label">Networking</span>
+    <span class="track"><span class="fill" style="width: 8%"></span></span>
+    <span class="value">7.5 MB</span>
+  </div>
+  <p class="chart-note">
+    155 MB in total, idle. Three of those four processes are the system webview drawing the window; the core is the
+    part Ngintip ships, and it is the smallest of them.
+  </p>
+</div>
+
+<p>
+  Idle really is idle. Over a minute with the project open and the listener off, the four processes together used
+  <strong>0.07% of one core</strong>, which on a ten core machine is seven thousandths of one percent of the
+  machine. There is no timer redrawing a table nobody is looking at: the window's polls stop when it is hidden.
+</p>
+
+<h3>Under an agent reading hard</h3>
+<p>
+  The other end of the range is an agent on the <a href="mcp.html">MCP server</a> with no pauses in it: twenty four
+  seconds of back to back queries, several hundred of them, pages of History, full text searches, filters and flow
+  reads. The core ran at <strong>89% of one core</strong> and its memory climbed from 41 MB to 275 MB, then fell
+  back to 41 MB within a minute of the queries stopping. That rise is SQLite's page cache over a 1.55 GB file doing
+  exactly what a cache is for, and it is returned.
+</p>
+<p>
+  The window used <strong>no measurable CPU at all</strong> during that, and its memory did not move. Nothing an
+  agent asks for is routed through the UI, so a long agent session does not fight the operator for the window.
+</p>
+
+<h3>How long each thing takes</h3>
+<p>On the same 41,692 flow project, measured over the MCP server so the figures include encoding the reply:</p>
+<table class="specs">
+  <caption class="sr-only">Query time on a project of 41,692 flows</caption>
+  <tbody>
+    <tr><th scope="row">Open one flow, request and response<span class="why">history_get</span></th><td>0.3 ms</td></tr>
+    <tr><th scope="row">One flow's headers alone<span class="why">history_get, part=headers</span></th><td>0.4 ms</td></tr>
+    <tr><th scope="row">A 50 row page of History<span class="why">history_list</span></th><td>190 ms</td></tr>
+    <tr><th scope="row">A 50 row page from the oldest end of the capture</th><td>155 ms</td></tr>
+    <tr><th scope="row">Filter by method, by status, or by a substring of the URL</th><td>75 to 160 ms</td></tr>
+    <tr><th scope="row">Full text search across every decoded body<span class="why">history_search</span></th><td>440 to 780 ms</td></tr>
+  </tbody>
+</table>
+<p>
+  Two of those rows matter more than their numbers. <strong>A page from the far end of a 41,692 row capture costs
+  what the first page costs</strong>, because paging is done with a cursor and not an offset; an offset would make
+  the last page the slowest, and over a capture that is still growing it would also silently skip rows. And
+  <strong>a search costs the same whatever it finds</strong>: the term <code>json</code> matched 36,041 of the
+  41,692 flows and answered in half a second, a term present in none of them took the same half second, and asking
+  for 100 hits instead of 20 cost nothing extra. The work is the index lookup, not the size of the answer.
+</p>
+<p class="note">
+  Not measured here: what capture itself costs per request, which needs live traffic running through the listener.
+  These numbers come from a finished engagement, and the honest way to get that one is a project of its own rather
+  than writing test requests into somebody's real capture.
+</p>
 
 <h2 id="format">What the file actually is</h2>
 <p>
