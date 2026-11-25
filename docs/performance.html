@@ -155,9 +155,9 @@
 <h2 id="open">What it costs while it is open</h2>
 <p>
   Everything above was read off the file. The rest of this page is the running app with that same project open:
-  Ngintip 0.4.0, the installed build, on a ten core Apple M5 with 16 GB of memory and macOS 26.4. Memory is the
-  figure Activity Monitor shows, and each CPU figure is process CPU time over a measured wall clock window rather
-  than whatever instant a sampler happened to land on.
+  Ngintip 0.4.0, the installed build, on a ten core Apple M5 with 16 GB of memory and macOS 26.4, sitting on History
+  with the proxy listener off. Memory is the figure Activity Monitor shows, and each CPU figure is process CPU time
+  over a measured wall clock window rather than whatever instant a sampler happened to land on.
 </p>
 
 <div class="stats">
@@ -201,9 +201,11 @@
 </div>
 
 <p>
-  Idle really is idle. Over a minute with the project open and the listener off, the four processes together used
-  <strong>0.07% of one core</strong>, which on a ten core machine is seven thousandths of one percent of the
-  machine. There is no timer redrawing a table nobody is looking at: the window's polls stop when it is hidden.
+  Idle really is idle. Over a minute, the four processes together used <strong>0.07% of one core</strong>, which on
+  a ten core machine is seven thousandths of one percent of it. Nothing is polling: every poll in the window is
+  gated on there being something to poll for, a browser it launched still running, or the Extensions or Settings
+  view actually open, and is paused on top of that while the window is hidden. Sitting on History with a capture
+  loaded starts no timer at all.
 </p>
 
 <h3>Under an agent reading hard</h3>
